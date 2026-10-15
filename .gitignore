@@ -62,6 +62,16 @@ patches/
 /issues/
 /plan/
 
+# sqlite / sessions / private keys that may sit outside data/
+**/*.sqlite
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/panel-sessions.json
+**/*.pem
+**/id_rsa
+**/id_ed25519
+
 # local-only; not part of the published tree
 /pnpm-lock.yaml
 /pnpm-workspace.yaml
