@@ -100,6 +100,7 @@ const USER_EXACT_GET = new Set([
   '/api/panel/request-logs/stats',
   '/api/panel/billing',
   '/api/panel/test-schedule/default',
+  '/api/panel/test-models',
 ])
 
 const USER_EXACT_POST = new Set([
@@ -201,7 +202,7 @@ function userVmPathAllowed(method, path) {
     )
   }
   if (method === 'PUT') return rest === 'test-schedule' || rest === 'oauth/credential'
-  if (method === 'DELETE') return !rest || rest === 'test-schedule'
+  if (method === 'DELETE') return rest === 'test-schedule'
   return false
 }
 
@@ -260,6 +261,7 @@ export function authorizePanelRoute(method, path, role) {
       p === '/api/panel/pool/stream' ||
       p === '/api/panel/cluster/nodes' ||
       p === '/api/panel/cluster/local' ||
+      p === '/api/panel/test-models' ||
       isRequestLogPath(p) ||
       LOG_STATS_GET.has(p))
   ) {

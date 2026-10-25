@@ -2,6 +2,7 @@ package telemetry
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"os"
 	"path/filepath"
@@ -13,12 +14,22 @@ import (
 )
 
 const (
-	sessionTTL         = 10 * time.Minute
-	eventBatchInterval = 10 * time.Second
-	growthbookInterval = 6 * time.Hour
-	tickInterval       = time.Second
-	touchName          = "telemetry.touch"
+	sessionTTL           = 10 * time.Minute
+	defaultBatchInterval = 10 * time.Minute
+	minBatchInterval     = 60 * time.Second
+	maxBatchInterval     = 24 * time.Hour
+	growthbookInterval   = 6 * time.Hour
+	tickInterval         = time.Second
+	touchName            = "telemetry.touch"
 )
+
+func batchInterval(tel config.TelemetryConfig) time.Duration {
+	d := time.Duration(tel.UploadIntervalSecs) * time.Second
+	if d < minBatchInterval || d > maxBatchInterval {
+		return defaultBatchInterval
+	}
+	return d
+}
 
 type Deps struct {
 	HTTP       *Client
@@ -69,10 +80,10 @@ func lastActivity(path string, fallback time.Time) time.Time {
 
 // Run mirrors cc-bridge telemetry_loop:
 // /v1 (or worker start) activates a 10-minute session.
-// Every 10s: event_logging/v2/batch tengu_api_success.
+// tengu_api_success batches at upload_interval_seconds (60s–24h, default 10 min).
 // Every 6h (first immediate): GrowthBook /api/eval.
 // worker.json telemetry is re-read when the file mtime moves, so identity,
-// betas, headers, env, and enabled flip without bouncing the process.
+// betas, headers, env, enabled, and upload interval flip without bouncing the process.
 // A disabled config with no file still returns immediately.
 func Run(ctx context.Context, cfg config.Config, deps Deps) error {
 	if deps.Now == nil {
@@ -176,7 +187,7 @@ func Run(ctx context.Context, cfg config.Config, deps Deps) error {
 			}
 		}
 
-		if batchOK && (lastBatch.IsZero() || now.Sub(lastBatch) >= eventBatchInterval) {
+		if batchOK && (lastBatch.IsZero() || now.Sub(lastBatch) >= batchInterval(tel)) {
 			uptime := now.Sub(started).Seconds()
 			ev := SuccessEvent(identity, now, uptime, "")
 			if err := postBatch(ctx, deps, live, token, ev); err != nil {
@@ -244,10 +255,7 @@ func postBatch(ctx context.Context, deps Deps, cfg config.Config, token string, 
 		return nil
 	}
 	err := deps.HTTP.PostBatch(ctx, token, cfg.Telemetry.Headers, []Event{ev})
-	if err != nil {
-		class, status := ClassifyBatchErr(err)
-		log.Printf("telemetry sidecar: batch failed class=%s status=%d", class, status)
-	}
+	recordUpload(cfg, "batch", ev.EventData["event_name"], err, BatchRequest{Events: []Event{ev}})
 	return err
 }
 
@@ -256,11 +264,94 @@ func postEval(ctx context.Context, deps Deps, cfg config.Config, token string, b
 		return nil
 	}
 	err := deps.HTTP.PostEval(ctx, token, cfg.Telemetry.Headers, body)
+	recordUpload(cfg, "eval", "growthbook", err, body)
+	return err
+}
+
+const uploadLogLines = 40
+
+var redactedUploadKeys = map[string]struct{}{
+	"email": {}, "account_uuid": {}, "accountuuid": {},
+	"organization_uuid": {}, "organizationuuid": {},
+	"device_id": {}, "deviceid": {}, "session_id": {}, "sessionid": {},
+	"user_id": {}, "userid": {}, "id": {},
+}
+
+func recordUpload(cfg config.Config, kind string, name any, err error, payload any) {
+	if strings.TrimSpace(cfg.ConfigPath) == "" {
+		return
+	}
+	body, marshalErr := json.Marshal(redactUpload(payload))
+	if marshalErr != nil {
+		body = []byte("{}")
+	}
+	state := "ok"
 	if err != nil {
 		class, status := ClassifyBatchErr(err)
-		log.Printf("telemetry sidecar: eval failed class=%s status=%d", class, status)
+		state = class
+		log.Printf("telemetry sidecar: %s failed class=%s status=%d", kind, class, status)
+		_ = status
 	}
-	return err
+	line := time.Now().UTC().Format(time.RFC3339) + " " + kind + " " + strings.TrimSpace(fmtName(name)) + " " + state + " " + string(body)
+	path := filepath.Join(filepath.Dir(cfg.ConfigPath), "telemetry-upload.log")
+	_ = rewriteUploadLog(path, line)
+}
+
+func redactUpload(value any) any {
+	switch item := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(item))
+		for key, child := range item {
+			if _, drop := redactedUploadKeys[strings.ToLower(key)]; drop {
+				continue
+			}
+			out[key] = redactUpload(child)
+		}
+		return out
+	case []any:
+		out := make([]any, len(item))
+		for i, child := range item {
+			out[i] = redactUpload(child)
+		}
+		return out
+	case []Event:
+		out := make([]any, len(item))
+		for i, child := range item {
+			out[i] = redactUpload(child)
+		}
+		return out
+	case BatchRequest:
+		return map[string]any{"events": redactUpload(item.Events)}
+	case Event:
+		return redactUpload(map[string]any{"event_type": item.EventType, "event_data": item.EventData})
+	default:
+		return value
+	}
+}
+
+func rewriteUploadLog(path, line string) error {
+	previous, _ := os.ReadFile(path)
+	lines := strings.Split(strings.TrimRight(string(previous), "\n"), "\n")
+	if len(previous) == 0 {
+		lines = nil
+	}
+	lines = append(lines, line)
+	if len(lines) > uploadLogLines {
+		lines = lines[len(lines)-uploadLogLines:]
+	}
+	next := path + ".next"
+	if err := os.WriteFile(next, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		return err
+	}
+	return os.Rename(next, path)
+}
+
+func fmtName(name any) string {
+	text, _ := name.(string)
+	if text == "" {
+		return "-"
+	}
+	return text
 }
 
 func stopOn4xx(err error) bool {

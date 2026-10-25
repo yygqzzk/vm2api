@@ -3,6 +3,9 @@
 export type ClusterLinkState =
   'idle' | 'connecting' | 'ready' | 'backoff' | 'error'
 
+/** linux：槽位是 Docker 容器；darwin：Apple Silicon Mac，槽位是 launchd 服务、不用 Docker。 */
+export type ClusterNodePlatform = 'linux' | 'darwin'
+
 export type ClusterApiNode = {
   id: string
   label: string
@@ -15,6 +18,8 @@ export type ClusterApiNode = {
   jump_node_id: string | null
   created_at: string
   updated_at: string
+  /** 连上后按 `uname -s` 识别；老服务端没有该字段时按 linux。 */
+  platform?: ClusterNodePlatform
   link: {
     state: ClusterLinkState
     error?: { code: string; message: string } | null
@@ -28,6 +33,8 @@ export type ClusterApiNode = {
     docker: { ok: boolean; error: string | null }
     /** Docker `/info` 计数；Docker 不可用时为 null。 */
     containers: { total: number | null; running: number | null } | null
+    /** 节点宿主负载，口径同本机宿主列；远端读不到时为 null。 */
+    host?: NodeHostStats | null
     checked_at: string
   } | null
   bridge: {
@@ -37,6 +44,32 @@ export type ClusterApiNode = {
     active: number
   } | null
   install: DockerInstallJob | null
+  /** 直连通道（kin-slot-gate，TLS）；未配置为 null。令牌与证书指纹从不返回。 */
+  direct_link?: ClusterDirectLink | null
+}
+
+export type ClusterDirectLink = {
+  address: string
+  port: number
+  /** ok 直连；down 已退回 SSH；pending 尚未检查。 */
+  state: 'ok' | 'down' | 'pending'
+  latency_ms: number | null
+  error: string | null
+  gate_error: string | null
+  checked_at: string | null
+}
+
+export type NodeHostStats = {
+  cpu_count: number
+  load1: number
+  load5: number | null
+  load15: number | null
+  cpu_pct: number
+  mem_total: number
+  mem_used: number
+  mem_pct: number
+  /** 全部 Docker 容器内存合计（扣除 inactive_file）；读不到 cgroup 时为 null。 */
+  containers_mem: number | null
 }
 
 export type DockerInstallJob = {
@@ -69,6 +102,12 @@ export type PreflightCheckId =
   | 'hostd'
   | 'relay'
   | 'kvm'
+  | 'runtime'
+  | 'macos'
+  | 'launchd'
+  | 'sleep'
+  | 'socket_path'
+  | 'payload'
 
 /** `ok:false` + `level:'error'` 阻断创建；`warn` 只提示。 */
 export type PreflightCheck = {
@@ -104,7 +143,29 @@ export type ClusterProbeResult = {
   host_key: { alg: string; sha256: string }
   docker: { ok: boolean; error: string | null }
   uname: string | null
+  platform?: ClusterNodePlatform
   existing_id: string | null
+}
+
+/** Existing-node edits preserve the node id, jump node and pinned host key. */
+export type ClusterNodePatch = {
+  expected_updated_at: string
+  label?: string
+  host?: string
+  port?: number
+  username?: string
+  auth_type?: 'key' | 'password'
+  private_key?: string
+  passphrase?: string
+  password?: string
+}
+
+export type ClusterNodeUpdateProbe = {
+  host_key: { alg: string; sha256: string }
+  docker: { ok: boolean; error: string | null }
+  platform?: ClusterNodePlatform
+  vm_count: number
+  dependent_count: number
 }
 
 export type DockerInfo = {

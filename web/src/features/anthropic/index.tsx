@@ -23,33 +23,20 @@ import { PageHeader } from '@/components/page-header'
 import { apiEndpointsQueryOptions } from '@/features/api-endpoints/queries'
 import { proxyLabel } from '@/features/proxies/proxy-sort'
 import { proxiesQueryOptions } from '@/features/proxies/queries'
-
-const DEFAULT_URL = 'https://api.anthropic.com'
-const DIRECT = '__direct__'
-
-type AuthScheme = 'x_api_key' | 'authorization_bearer'
-
-type EndpointDraft = {
-  id: string
-  storedId?: string
-  keyId?: string
-  baseUrl: string
-  authScheme: AuthScheme
-  apiKey: string
-  proxyId: string
-}
-
-type KeyResult = {
-  ok?: boolean
-  status?: number
-  text?: string
-  error?: string
-  proxy?: boolean
-}
-
-type ConsoleResult = KeyResult & {
-  items?: KeyResult[]
-}
+import {
+  applyConsoleResults,
+  type ConsoleResult,
+  type KeyResult,
+  endpointHasTestableKey,
+} from './console-results'
+import {
+  type AuthScheme,
+  DEFAULT_URL,
+  DIRECT,
+  type EndpointDraft,
+  draftFromStored,
+  endpointSaveRequest,
+} from './endpoint-save'
 
 type ModelList = {
   models?: { id?: string; name?: string; alias?: string }[]
@@ -83,18 +70,7 @@ export function AnthropicConsolePage() {
     if (loaded || !stored.data) return
     const rows = (stored.data.items || [])
       .filter((item) => item.protocol !== 'openai')
-      .map((item) => ({
-        id: item.id,
-        storedId: item.id,
-        baseUrl: item.base_url || DEFAULT_URL,
-        authScheme:
-          item.auth_scheme === 'authorization_bearer'
-            ? ('authorization_bearer' as const)
-            : ('x_api_key' as const),
-        apiKey: '',
-        proxyId: DIRECT,
-        keyId: item.api_key_entries?.[0]?.id || '',
-      }))
+      .map(draftFromStored)
     if (rows.length) setEndpoints(rows)
     setLoaded(true)
   }, [loaded, stored.data])
@@ -111,16 +87,15 @@ export function AnthropicConsolePage() {
   }
 
   function storeResults(data: ConsoleResult, index: number | null) {
-    const incoming = data.items?.length ? data.items : [data]
-    setResults((current) => {
-      const next = { ...current }
-      const targets =
-        index == null ? endpoints : [endpoints[index]].filter(Boolean)
-      targets.forEach((endpoint, offset) => {
-        if (incoming[offset]) next[endpoint.id] = incoming[offset]
-      })
-      return next
-    })
+    setResults((current) =>
+      applyConsoleResults(
+        endpoints,
+        (row) => endpointHasTestableKey(endpoints[row]),
+        current,
+        data,
+        index
+      )
+    )
   }
 
   const send = useMutation({
@@ -190,35 +165,13 @@ export function AnthropicConsolePage() {
 
   const save = useMutation({
     mutationFn: async (item: EndpointDraft) => {
-      const body: Record<string, unknown> = {
-        kind: item.baseUrl.trim() === DEFAULT_URL ? 'claude' : 'custom',
-        protocol: 'anthropic',
-        name: item.baseUrl.trim() || DEFAULT_URL,
-        base_url: item.baseUrl.trim() || DEFAULT_URL,
-        auth_scheme: item.authScheme,
-        proxy_id: item.proxyId === DIRECT ? '' : item.proxyId,
-        key_id: item.keyId || '',
-        api_key: item.apiKey.trim(),
-        models: [
-          {
-            name: model.trim() || 'claude-sonnet-4-5',
-            alias: model.trim() || 'claude-sonnet-4-5',
-          },
-        ],
-      }
-      if (!item.storedId)
-        body.api_key_entries = item.apiKey.trim()
-          ? [{ api_key: item.apiKey.trim() }]
-          : []
-      const path = item.storedId
-        ? `/api/panel/api-endpoints/${encodeURIComponent(item.storedId)}`
-        : '/api/panel/api-endpoints'
+      const request = endpointSaveRequest(item, model)
       return api<{
         item?: { id?: string; api_key_entries?: { id?: string }[] }
-      }>(path, {
-        method: item.storedId ? 'PATCH' : 'POST',
+      }>(request.path, {
+        method: request.method,
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(body),
+        body: JSON.stringify(request.body),
       })
     },
     onSuccess: async (data, item) => {
@@ -232,6 +185,11 @@ export function AnthropicConsolePage() {
                   storedId: saved.id,
                   keyId: saved.api_key_entries?.[0]?.id || row.keyId,
                   apiKey: '',
+                  stored: {
+                    baseUrl: item.baseUrl.trim() || DEFAULT_URL,
+                    authScheme: item.authScheme,
+                    proxyId: item.proxyId,
+                  },
                 }
               : row
           )
@@ -249,12 +207,11 @@ export function AnthropicConsolePage() {
     <PageHeader title={VIEW_TITLES.anthropic}>
       <div className='mx-auto grid max-w-5xl gap-6'>
         <div>
-          <div className='mb-2 hidden grid-cols-[minmax(14rem,1.1fr)_8rem_minmax(0,1.4fr)_8rem_4.5rem_3rem] gap-2 px-1 text-xs text-muted-foreground sm:grid'>
+          <div className='mb-2 hidden grid-cols-[minmax(10rem,1.1fr)_8rem_minmax(0,1.4fr)_8rem_auto] gap-2 px-1 text-xs text-muted-foreground @2xl/content:grid'>
             <span>地址</span>
             <span>认证</span>
             <span>密钥</span>
             <span>代理</span>
-            <span />
             <span />
           </div>
           <div className='divide-y rounded-md border'>
@@ -263,7 +220,7 @@ export function AnthropicConsolePage() {
               const custom = item.baseUrl.trim() !== DEFAULT_URL
               return (
                 <div key={item.id} className='px-2 py-2'>
-                  <div className='grid items-center gap-2 sm:grid-cols-[minmax(14rem,1.1fr)_8rem_minmax(0,1.4fr)_8rem_4.5rem_3rem]'>
+                  <div className='grid items-center gap-2 @2xl/content:grid-cols-[minmax(10rem,1.1fr)_8rem_minmax(0,1.4fr)_8rem_auto]'>
                     <Input
                       value={item.baseUrl}
                       onChange={(event) =>
@@ -362,41 +319,45 @@ export function AnthropicConsolePage() {
                         ))}
                       </PopoverContent>
                     </Popover>
-                    <Button
-                      type='button'
-                      variant='outline'
-                      disabled={testing !== null}
-                      onClick={() => send.mutate(index)}
-                    >
-                      {testing === index ? '…' : '测试'}
-                    </Button>
-                    <Button
-                      type='button'
-                      variant='outline'
-                      disabled={
-                        save.isPending || (!item.apiKey.trim() && !item.keyId)
-                      }
-                      onClick={() => save.mutate(item)}
-                    >
-                      保存
-                    </Button>
-                    <Button
-                      type='button'
-                      variant='ghost'
-                      disabled={endpoints.length === 1}
-                      onClick={() => {
-                        setEndpoints((current) =>
-                          current.filter((endpoint) => endpoint.id !== item.id)
-                        )
-                        setResults((current) => {
-                          const next = { ...current }
-                          delete next[item.id]
-                          return next
-                        })
-                      }}
-                    >
-                      删除
-                    </Button>
+                    <div className='grid grid-cols-3 gap-1'>
+                      <Button
+                        type='button'
+                        variant='outline'
+                        disabled={testing !== null}
+                        onClick={() => send.mutate(index)}
+                      >
+                        {testing === index ? '…' : '测试'}
+                      </Button>
+                      <Button
+                        type='button'
+                        variant='outline'
+                        disabled={
+                          save.isPending || (!item.apiKey.trim() && !item.keyId)
+                        }
+                        onClick={() => save.mutate(item)}
+                      >
+                        保存
+                      </Button>
+                      <Button
+                        type='button'
+                        variant='ghost'
+                        disabled={endpoints.length === 1}
+                        onClick={() => {
+                          setEndpoints((current) =>
+                            current.filter(
+                              (endpoint) => endpoint.id !== item.id
+                            )
+                          )
+                          setResults((current) => {
+                            const next = { ...current }
+                            delete next[item.id]
+                            return next
+                          })
+                        }}
+                      >
+                        删除
+                      </Button>
+                    </div>
                   </div>
                   {result ? (
                     <p

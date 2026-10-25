@@ -8,8 +8,73 @@ import { runtimeKind } from './runtime-kind.mjs'
 import { reloadSlotReady, slotExec } from './slot-runtime.mjs'
 import { collectSlotIdentity } from './guest-identity.mjs'
 import { rustKernelHealth } from '../transport/rust-kernel-client.mjs'
+import { restartTelemetrySidecar } from './slot-process-status.mjs'
+import { isNativeNodeVm, vmNodeId } from '../cluster/placement.mjs'
+import { slotHost } from './slot-host.mjs'
+import { restartRemoteServices } from '../cluster/remote-slot.mjs'
+import { isMissingContainerMessage, logTelemetryContainerSkip, telemetryContainerSkip } from './docker-container.mjs'
+import {
+  drainEgressForProxyConfig,
+  egressPidsForProxyConfig,
+  inspectEgressProcess,
+  isLocalEgressProxy,
+  readEgressListenTcp,
+  runExclusiveProxyEgress,
+  startProxyEgress,
+  stopEgressProcess,
+  waitEgressExit,
+  waitPortReleased,
+} from './egress.mjs'
 
-const ACTIONS = new Set(['collect', 'reload', 'roll'])
+const ACTIONS = new Set(['collect', 'reload', 'roll', 'telemetry'])
+
+export async function restartLocalEgress(projectRoot, vm, opts = {}) {
+  if (isLocalEgressProxy(vm.proxy)) return { ok: true, egress: 'local' }
+  const proxyId = vm.proxy?.id
+  return runExclusiveProxyEgress(projectRoot, proxyId, async () => {
+    const running = inspectEgressProcess(projectRoot, proxyId)
+    const stopped = stopEgressProcess(projectRoot, proxyId)
+    if (!stopped.ok) return { ok: false, action: 'egress_stop_failed', error: stopped.error }
+    const pending = new Set(stopped.pending || [])
+    for (const pid of egressPidsForProxyConfig(projectRoot, proxyId)) pending.add(pid)
+    if (running.ok && running.pid) pending.add(running.pid)
+    for (const pid of pending) {
+      const exited = await waitEgressExit(pid)
+      if (!exited.ok) return { ok: false, action: 'egress_stop_failed', error: exited.error, pid }
+    }
+    const drained = await drainEgressForProxyConfig(projectRoot, proxyId)
+    if (!drained.ok) return { ok: false, action: 'egress_stop_failed', error: drained.error, pid: drained.pid }
+    const spec = running.ok ? String(running.listen_tcp || '') : readEgressListenTcp(projectRoot, proxyId)
+    const colon = spec.lastIndexOf(':')
+    const host = colon > 0 ? spec.slice(0, colon) : ''
+    const port = colon > 0 ? Number(spec.slice(colon + 1)) : 0
+    if (host && Number.isFinite(port) && port > 0) {
+      const portFree = await waitPortReleased(host, port)
+      if (!portFree.ok) return { ok: false, action: 'egress_stop_failed', error: portFree.error }
+    }
+    const started = await startProxyEgress(projectRoot, vm.proxy, opts)
+    if (!started?.ok) return { ok: false, action: 'egress_start_failed', error: started?.error || 'kin-egress failed' }
+    return { ok: true, egress: 'restarted', pid: started.pid }
+  })
+}
+
+async function restartLocalServices({ projectRoot, vm, enabled, egressOpts = {} }) {
+  const telemetry = await restartTelemetrySidecar({ projectRoot, vm, enabled })
+  if (!telemetry.ok) return telemetry
+  const egress = await restartLocalEgress(projectRoot, vm, egressOpts)
+  if (!egress.ok) return egress
+  return { ...telemetry, egress: egress.egress ?? (telemetry.skipped ? 'unchanged' : undefined) }
+}
+
+function normalizeTelemetryRefresh(changed, vm) {
+  if (changed?.ok || changed?.skipped) return changed
+  const message = String(changed?.error || changed?.code || '')
+  if (!isMissingContainerMessage(message)) return changed
+  const container =
+    String(vm?.runtime?.container || '').trim() || (vm?.id ? `kin-${String(vm.id).replace(/^vm-/, '')}` : '')
+  logTelemetryContainerSkip('fleet', vm.id, container, message)
+  return telemetryContainerSkip(container, message)
+}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
@@ -64,6 +129,8 @@ export async function updateOneSlot(
     reloadFn = reloadSlotReady,
     collectFn = collectSlotIdentity,
     healthFn = rustKernelHealth,
+    telemetryFn,
+    telemetryEnabled,
     readyTimeoutMs = 15000,
   } = {},
 ) {
@@ -89,6 +156,33 @@ export async function updateOneSlot(
         return result
       }
     }
+    if (action === 'telemetry') {
+      const enabled =
+        telemetryEnabled === undefined ? vm.seed_policy?.telemetry_disabled === false : telemetryEnabled === true
+      const vmRef = getVm(projectRoot, id) || vm
+      const changed = normalizeTelemetryRefresh(
+        telemetryFn
+          ? await telemetryFn({ projectRoot, vm: vmRef, telemetryEnabled: enabled, enabled })
+          : isNativeNodeVm(vmRef)
+            ? await slotHost(vmRef).restartTelemetry(vmRef, { enabled })
+            : vmNodeId(vm)
+              ? await restartRemoteServices(vmRef, projectRoot, { telemetryEnabled: enabled })
+              : await restartLocalServices({ projectRoot, vm: vmRef, enabled }),
+        vmRef,
+      )
+      result.telemetry = changed
+      if (changed?.skipped) {
+        result.skipped = true
+        result.skip_reason = changed.reason || 'container_unavailable'
+        result.ok = true
+        return result
+      }
+      if (!changed?.ok) {
+        result.error = changed?.error || 'telemetry service update failed'
+        result.code = changed?.code || 'telemetry_update_failed'
+        return result
+      }
+    }
     if (action === 'collect' || action === 'roll') {
       const collected = await collectFn(projectRoot, getVm(projectRoot, id) || vm)
       result.collect = collected
@@ -108,7 +202,18 @@ export async function updateOneSlot(
 
 export async function runFleetUpdate(
   projectRoot,
-  { action = 'roll', ids = null, concurrency = 4, routing = {}, reloadFn, collectFn, healthFn, readyTimeoutMs } = {},
+  {
+    action = 'roll',
+    ids = null,
+    concurrency = 4,
+    routing = {},
+    reloadFn,
+    collectFn,
+    healthFn,
+    telemetryFn,
+    telemetryEnabled,
+    readyTimeoutMs,
+  } = {},
 ) {
   const nextAction = ACTIONS.has(action) ? action : 'roll'
   const conc = Math.max(1, Math.min(8, Number(concurrency) || 4))
@@ -120,15 +225,19 @@ export async function runFleetUpdate(
       reloadFn,
       collectFn,
       healthFn,
+      telemetryFn,
+      telemetryEnabled,
       readyTimeoutMs,
     }),
   )
   const okCount = items.filter((row) => row.ok).length
+  const skippedCount = items.filter((row) => row.skipped).length
   return {
     action: nextAction,
     concurrency: conc,
     total: items.length,
     ok_count: okCount,
+    skipped_count: skippedCount,
     failed_count: items.length - okCount,
     items,
   }

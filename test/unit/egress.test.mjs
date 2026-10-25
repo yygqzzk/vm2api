@@ -29,18 +29,31 @@ import {
   slotNetworkForVm,
   startEgressProcess,
   stopEgressProcess,
+  waitEgressExit,
+  egressPidActive,
+  ensureProxyEgress,
+  runExclusiveProxyEgress,
+  waitPortReleased,
 } from '../../src/lib/vm/egress.mjs'
 import { hostProxyUrlForVm } from '../../src/lib/vm/slot-host.mjs'
 
 // Process-ownership tests need the native helper so /proc/<pid>/exe identifies it.
 const egressBin = process.env.KIN_EGRESS_BIN || path.resolve(import.meta.dirname, '../../bin/kin-egress')
 
-async function waitForProcess(predicate) {
-  for (let i = 0; i < 100; i++) {
+async function waitForProcess(predicate, attempts = 100) {
+  for (let i = 0; i < attempts; i++) {
     if (predicate()) return
-    await new Promise((resolve) => setTimeout(resolve, 10))
+    await new Promise((resolve) => setTimeout(resolve, 50))
   }
   assert.fail('process state did not converge')
+}
+
+async function reservePort() {
+  const listener = net.createServer()
+  await new Promise((resolve) => listener.listen(0, '127.0.0.1', resolve))
+  const port = listener.address().port
+  await new Promise((resolve) => listener.close(resolve))
+  return port
 }
 
 function egressFixture(t, proxyId = 'px-process') {
@@ -59,8 +72,8 @@ function egressFixture(t, proxyId = 'px-process') {
   }
   const pidFile = path.join(dir, 'egress.pid')
   const configPath = path.join(dir, 'egress.json')
-  const start = (opts = {}) => {
-    const result = startEgressProcess({ ...base, ...opts })
+  const start = async (opts = {}) => {
+    const result = await startEgressProcess({ ...base, ...opts })
     if (result.pid)
       t.after(() => {
         try {
@@ -96,7 +109,7 @@ for (const sameConfig of [true, false]) {
       }),
     )
     const stale = inspectEgressProcess(fx.root, fx.base.proxyId)
-    const started = fx.start()
+    const started = await fx.start()
     assert.equal(started.ok, true)
     assert.equal(started.reused, false)
     assert.notEqual(started.pid, sleeper.pid)
@@ -134,11 +147,11 @@ test('stop discards a recycled PID without signaling its new owner', {
   assert.equal(sleeper.exitCode, null)
 })
 
-test('an egress helper can be reused, replaced and stopped only by its own proxy', {
+test('egress reload waits for the previous process to exit before spawning', {
   skip: process.platform !== 'linux',
 }, async (t) => {
   const fx = egressFixture(t)
-  const original = fx.start()
+  const original = await fx.start()
   await waitForProcess(() => {
     try {
       return path.basename(fs.readlinkSync(`/proc/${original.pid}/exe`)) === 'kin-egress'
@@ -146,7 +159,62 @@ test('an egress helper can be reused, replaced and stopped only by its own proxy
       return false
     }
   })
-  const reused = fx.start()
+  const replacement = await fx.start({ proxyUrl: 'socks5h://192.0.2.2:1080' })
+  assert.equal(replacement.ok, true)
+  assert.notEqual(replacement.pid, original.pid)
+  assert.equal(egressPidActive(original.pid), false, 'old egress must exit before spawn returns')
+  assert.equal(stopEgressProcess(fx.root, fx.base.proxyId).ok, true)
+  await waitForProcess(() => !fs.existsSync(`/proc/${replacement.pid}`))
+})
+
+test('egress reload surfaces spawn failure after stopping the old helper', {
+  skip: process.platform !== 'linux',
+}, async (t) => {
+  const fx = egressFixture(t)
+  const original = await fx.start()
+  await waitForProcess(() => {
+    try {
+      return path.basename(fs.readlinkSync(`/proc/${original.pid}/exe`)) === 'kin-egress'
+    } catch {
+      return false
+    }
+  })
+  const missing = path.join(fx.root, 'missing-kin-egress')
+  const failed = await fx.start({ bin: missing, proxyUrl: 'socks5h://192.0.2.3:1080' })
+  assert.equal(failed.ok, false)
+  assert.match(failed.error, /not found|spawn/i)
+  assert.equal(egressPidActive(original.pid), false)
+})
+
+test('waitEgressExit escalates SIGTERM to SIGKILL', { skip: process.platform !== 'linux' }, async (t) => {
+  const sleeper = spawn('sleep', ['120'])
+  const closed = once(sleeper, 'close')
+  t.after(async () => {
+    try {
+      sleeper.kill('SIGKILL')
+    } catch {}
+    await closed
+  })
+  await once(sleeper, 'spawn')
+  sleeper.kill('SIGTERM')
+  const result = await waitEgressExit(sleeper.pid, { termTimeoutMs: 200, killGraceMs: 3000 })
+  assert.equal(result.ok, true)
+  assert.equal(egressPidActive(sleeper.pid), false)
+})
+
+test('an egress helper can be reused, replaced and stopped only by its own proxy', {
+  skip: process.platform !== 'linux',
+}, async (t) => {
+  const fx = egressFixture(t)
+  const original = await fx.start()
+  await waitForProcess(() => {
+    try {
+      return path.basename(fs.readlinkSync(`/proc/${original.pid}/exe`)) === 'kin-egress'
+    } catch {
+      return false
+    }
+  })
+  const reused = await fx.start()
   assert.equal(reused.reused, true)
   assert.equal(reused.pid, original.pid)
   const other = egressRunDir(fx.root, 'px-other')
@@ -155,7 +223,7 @@ test('an egress helper can be reused, replaced and stopped only by its own proxy
   assert.equal(inspectEgressProcess(fx.root, 'px-other').ok, false)
   assert.equal(stopEgressProcess(fx.root, 'px-other').ok, true)
   assert.equal(inspectEgressProcess(fx.root, fx.base.proxyId).ok, true)
-  const replacement = fx.start({ proxyUrl: 'socks5h://192.0.2.2:1080' })
+  const replacement = await fx.start({ proxyUrl: 'socks5h://192.0.2.2:1080' })
   assert.equal(replacement.reused, false)
   assert.notEqual(replacement.pid, original.pid)
   await waitForProcess(() => !fs.existsSync(`/proc/${original.pid}`))
@@ -165,27 +233,60 @@ test('an egress helper can be reused, replaced and stopped only by its own proxy
   assert.equal(fs.existsSync(fx.pidFile), false)
 })
 
-test('a running egress remains identifiable after its binary was replaced', {
+test('a replaced egress binary is restarted onto the new file', {
   skip: process.platform !== 'linux',
 }, async (t) => {
   const fx = egressFixture(t)
   const bin = path.join(fx.root, 'kin-egress')
+  const replacement = path.join(fx.root, 'kin-egress-next')
   fs.copyFileSync(egressBin, bin)
+  fs.copyFileSync(egressBin, replacement)
   fs.chmodSync(bin, 0o755)
-  const started = fx.start({ bin })
-  await waitForProcess(() => {
-    try {
-      return fs.readlinkSync(`/proc/${started.pid}/exe`) === bin
-    } catch {
-      return false
-    }
-  })
+  fs.chmodSync(replacement, 0o755)
+  const started = await fx.start({ bin })
+  await waitForProcess(() => inspectEgressProcess(fx.root, fx.base.proxyId).ok)
   fs.unlinkSync(bin)
   assert.match(fs.readlinkSync(`/proc/${started.pid}/exe`), / \(deleted\)$/)
-  assert.equal(inspectEgressProcess(fx.root, fx.base.proxyId).ok, true)
-  assert.equal(fx.start({ bin }).reused, true)
-  assert.equal(stopEgressProcess(fx.root, fx.base.proxyId).ok, true)
+  assert.equal(inspectEgressProcess(fx.root, fx.base.proxyId).ok, false)
+  const restarted = await fx.start({ bin: replacement })
+  assert.equal(restarted.ok, true, restarted.error)
+  assert.equal(restarted.reused, false)
+  assert.notEqual(restarted.pid, started.pid)
   await waitForProcess(() => !fs.existsSync(`/proc/${started.pid}`))
+  let exe = 'missing'
+  try {
+    exe = fs.readlinkSync(`/proc/${restarted.pid}/exe`)
+  } catch (error) {
+    exe = error.code || 'gone'
+  }
+  assert.equal(exe, replacement, JSON.stringify({ old: started.pid, next: restarted.pid, exe }))
+  assert.equal(stopEgressProcess(fx.root, fx.base.proxyId).ok, true)
+})
+
+test('a stale pidfile does not hide an egress process still holding its port', {
+  skip: process.platform !== 'linux',
+}, async (t) => {
+  const fx = egressFixture(t)
+  const orphanBin = path.join(fx.root, 'kin-egress')
+  fs.copyFileSync(egressBin, orphanBin)
+  fs.chmodSync(orphanBin, 0o755)
+  const port = await reservePort()
+  const orphan = await fx.start({ bin: orphanBin, tcpPort: port, dnsPort: 0 })
+  assert.equal(orphan.ok, true, orphan.error)
+  await waitForProcess(() => inspectEgressProcess(fx.root, fx.base.proxyId).ok)
+  fs.unlinkSync(orphanBin)
+  fs.writeFileSync(fx.pidFile, '999999999\n')
+  assert.match(fs.readlinkSync(`/proc/${orphan.pid}/exe`), / \(deleted\)$/)
+  assert.equal(inspectEgressProcess(fx.root, fx.base.proxyId).ok, false)
+  const recovered = await fx.start({ tcpPort: port, dnsPort: 0 })
+  assert.equal(recovered.ok, true, recovered.error)
+  assert.equal(recovered.reused, false)
+  assert.notEqual(recovered.pid, orphan.pid)
+  await waitForProcess(() => !fs.existsSync(`/proc/${orphan.pid}`))
+  assert.equal(inspectEgressProcess(fx.root, fx.base.proxyId).pid, recovered.pid)
+  assert.equal(Number(fs.readFileSync(fx.pidFile, 'utf8')), recovered.pid)
+  assert.equal(JSON.parse(fs.readFileSync(fx.configPath, 'utf8')).listen_tcp, `127.0.0.1:${port}`)
+  assert.equal(stopEgressProcess(fx.root, fx.base.proxyId).ok, true)
 })
 
 test('redundant separators in an egress config path do not change its owner', {
@@ -205,7 +306,7 @@ test('redundant separators in an egress config path do not change its owner', {
   await once(child, 'spawn')
   fs.writeFileSync(fx.pidFile, String(child.pid))
   assert.equal(inspectEgressProcess(fx.root, fx.base.proxyId).ok, true)
-  const reused = fx.start()
+  const reused = await fx.start({ listenHost: '127.0.0.1', tcpPort: 0, dnsPort: 0 })
   assert.equal(reused.reused, true)
   assert.equal(reused.pid, child.pid)
   assert.equal(stopEgressProcess(fx.root, fx.base.proxyId).ok, true)
@@ -438,7 +539,7 @@ test('DNS upstream validation rejects unsafe or malformed URL boundaries', () =>
   }
 })
 
-test('egress config carries dns_upstream only when configured', () => {
+test('egress config carries dns_upstream only when configured', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'egress-dns-'))
   const base = {
     projectRoot: root,
@@ -448,12 +549,12 @@ test('egress config carries dns_upstream only when configured', () => {
     listenHost: '127.0.0.1',
     bin: '/bin/true',
   }
-  const a = startEgressProcess({ ...base, proxyId: 'px-a', dnsUpstream: '' })
+  const a = await startEgressProcess({ ...base, proxyId: 'px-a', dnsUpstream: '' })
   assert.equal(a.ok, true)
   assert.equal(JSON.parse(fs.readFileSync(a.configPath, 'utf8')).dns_upstream, undefined)
-  const b = startEgressProcess({ ...base, proxyId: 'px-b', dnsUpstream: '8.8.8.8:53,1.1.1.1:53' })
+  const b = await startEgressProcess({ ...base, proxyId: 'px-b', dnsUpstream: '8.8.8.8:53,1.1.1.1:53' })
   assert.equal(JSON.parse(fs.readFileSync(b.configPath, 'utf8')).dns_upstream, '8.8.8.8:53,1.1.1.1:53')
-  const c = startEgressProcess({ ...base, proxyId: 'px-c', domainForward: true })
+  const c = await startEgressProcess({ ...base, proxyId: 'px-c', domainForward: true })
   assert.equal(JSON.parse(fs.readFileSync(c.configPath, 'utf8')).domain_forward, true)
   assert.equal(JSON.parse(fs.readFileSync(a.configPath, 'utf8')).domain_forward, undefined)
   fs.rmSync(root, { recursive: true, force: true })
@@ -499,18 +600,91 @@ test('egress readiness checks the exact listener without opening a connection', 
 
 test('DNS override changes restart the helper and disabling clears the override', async (t) => {
   const fx = egressFixture(t, 'px-dns-override')
-  const original = fx.start()
+  const original = await fx.start()
   assert.equal(original.ok, true)
   await waitForProcess(() => inspectEgressProcess(fx.root, 'px-dns-override').ok)
-  assert.equal(fx.start().reused, true)
-  const enabled = fx.start({ dnsEmptyTypes: [64, 65] })
+  assert.equal((await fx.start()).reused, true)
+  const enabled = await fx.start({ dnsEmptyTypes: [64, 65] })
   assert.equal(enabled.ok, true)
   assert.equal(enabled.reused, false)
   assert.notEqual(enabled.pid, original.pid)
   assert.deepEqual(JSON.parse(fs.readFileSync(fx.configPath, 'utf8')).dns_empty_types, [64, 65])
   await waitForProcess(() => inspectEgressProcess(fx.root, 'px-dns-override').ok)
-  assert.equal(fx.start({ dnsEmptyTypes: [64, 65] }).reused, true)
-  const disabled = fx.start()
+  assert.equal((await fx.start({ dnsEmptyTypes: [64, 65] })).reused, true)
+  const disabled = await fx.start()
   assert.equal(disabled.reused, false)
   assert.equal(JSON.parse(fs.readFileSync(fx.configPath, 'utf8')).dns_empty_types, undefined)
+})
+
+test('runExclusiveProxyEgress runs overlapping work for one proxy serially', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'egress-lock-'))
+  let depth = 0
+  let maxDepth = 0
+  const work = async (ms, label) => {
+    depth += 1
+    maxDepth = Math.max(maxDepth, depth)
+    await new Promise((resolve) => setTimeout(resolve, ms))
+    depth -= 1
+    return label
+  }
+  try {
+    const [first, second] = await Promise.all([
+      runExclusiveProxyEgress(root, 'px-lock', () => work(40, 'first')),
+      runExclusiveProxyEgress(root, 'px-lock', () => work(5, 'second')),
+    ])
+    assert.equal(maxDepth, 1)
+    assert.equal(first, 'first')
+    assert.equal(second, 'second')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('concurrent starts for one proxy spawn a single helper and record it', {
+  skip: process.platform !== 'linux',
+}, async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'egress-race-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const proxy = { id: 'px-race', url: 'socks5h://192.0.2.1:1080' }
+  const ports = portsForProxy(proxy.id)
+  const runDocker = (args) =>
+    args[0] === 'network' && args[1] === 'inspect' ? { ok: true, stdout: '172.31.250.0/24|127.0.0.1' } : { ok: true }
+  const runIptables = () => ({ ok: true })
+  const opts = { runDocker, runIptables, dnsUpstream: '', dnsEmptyTypes: [], bin: egressBin }
+  const results = await Promise.all([1, 2, 3].map(() => ensureProxyEgress(root, proxy, opts)))
+  const pids = results.map((r) => r.pid).filter(Boolean)
+  for (const pid of new Set(pids))
+    t.after(() => {
+      try {
+        process.kill(pid, 'SIGKILL')
+      } catch {}
+    })
+  assert.deepEqual(
+    results.map((r) => r.ok),
+    [true, true, true],
+    JSON.stringify(results),
+  )
+  assert.equal(new Set(pids).size, 1, `one helper expected, got ${pids}`)
+  const recorded = Number(fs.readFileSync(path.join(egressRunDir(root, proxy.id), 'egress.pid'), 'utf8'))
+  assert.equal(recorded, pids[0])
+  assert.equal(egressPidActive(recorded), true)
+  assert.equal(egressListening(root, proxy.id).ok, true, `listening on ${ports.tcp}`)
+})
+
+test('waitPortReleased returns at once for a free port without blocking the event loop', {
+  skip: process.platform !== 'linux',
+}, async () => {
+  let ticks = 0
+  const timer = setInterval(() => ticks++, 5)
+  const started = Date.now()
+  const result = await waitPortReleased('127.0.0.1', 1)
+  const elapsed = Date.now() - started
+  clearInterval(timer)
+  assert.equal(result.ok, true)
+  assert.ok(elapsed < 150, `took ${elapsed}ms`)
+})
+
+test('egress wait loops do not shell out to python3', () => {
+  const src = fs.readFileSync(path.join(import.meta.dirname, '../../src/lib/vm/egress.mjs'), 'utf8')
+  assert.equal(src.includes('python3'), false)
 })

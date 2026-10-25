@@ -1,10 +1,19 @@
 import type { RuntimeType } from '@/types/panel-vm'
 
 /** `routing.compatibility.persona_preset`。PUT 严格匹配，不做别名归一化。 */
-export type PersonaPreset = 'official' | 'official_full' | 'zero' | 'custom'
+export type PersonaPreset =
+  'official' | 'official_full' | 'zero' | 'custom' | 'official_303'
 
 /** `routing.compatibility.overlay_preset`。`off` 没有模板体。 */
 export type OverlayPreset = 'off' | 'official' | 'minimal' | 'custom'
+
+/**
+ * `routing.inference.session_idle_ttl_seconds`。
+ * kernel 原生 sticky 槽空闲秒数，不是流空闲，也不是池账号绑定 TTL。
+ */
+export const SESSION_IDLE_TTL_SECONDS_MIN = 1
+export const SESSION_IDLE_TTL_SECONDS_MAX = 86400
+export const SESSION_IDLE_TTL_SECONDS_DEFAULT = 600
 
 /**
  * persona / overlay 模板的一个 system 块。
@@ -268,4 +277,22 @@ export type VmRoutingConfig = {
   smbios: VmRoutingSmbios
   mac_oui: string
   allow_tcg: boolean
+}
+
+/** `routing.websocket`：全局推理 WebSocket 总闸，不影响终端/集群 WS。 */
+export type RoutingWebsocketConfig = {
+  enabled: boolean
+}
+
+/** `routing.codex.upstream_transport`。任一 WS 闸关闭时实际强制 HTTP。 */
+export type CodexUpstreamTransport = 'prefer_websocket' | 'http'
+
+/** `routing.codex.client_features`：安装 UUID / client_metadata，默认关。 */
+export type CodexClientFeatures = {
+  enabled: boolean
+}
+
+/** `routing.codex.analytics`：官方 analytics-events，默认关。 */
+export type CodexAnalyticsConfig = {
+  enabled: boolean
 }

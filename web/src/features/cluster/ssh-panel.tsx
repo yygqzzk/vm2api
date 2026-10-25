@@ -13,28 +13,39 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { StatusMark } from '@/components/status-mark'
 import { WsTerminal } from '@/components/ws-terminal'
+import { DirectLinkConfig } from '@/features/cluster/direct-link-config'
 import { DockerTab } from '@/features/cluster/docker-tab'
 import {
   LINK_STATE_TEXT,
   LINK_TONE,
   remoteLink,
 } from '@/features/cluster/model'
+import { NodeConfig } from '@/features/cluster/node-config'
 import { CLUSTER_NODES_KEY } from '@/features/cluster/queries'
 
 /** 弹出式节点面板：终端 / Docker / 连接。`node` 跟着节点列表轮询刷新。 */
 export function SshPanel({
   node,
   nodes,
+  vmCount,
   onOpenChange,
 }: {
   node: ClusterApiNode | null
   nodes: ClusterApiNode[]
+  vmCount: number | null
   onOpenChange: (open: boolean) => void
 }) {
   return (
     <Dialog open={!!node} onOpenChange={onOpenChange}>
       <DialogContent className='flex h-[86vh] flex-col gap-3 sm:max-w-5xl'>
-        {node ? <PanelBody node={node} nodes={nodes} /> : null}
+        {node ? (
+          <PanelBody
+            key={node.id}
+            node={node}
+            nodes={nodes}
+            vmCount={vmCount}
+          />
+        ) : null}
       </DialogContent>
     </Dialog>
   )
@@ -43,16 +54,20 @@ export function SshPanel({
 function PanelBody({
   node,
   nodes,
+  vmCount,
 }: {
   node: ClusterApiNode
   nodes: ClusterApiNode[]
+  vmCount: number | null
 }) {
   const ready = node.link.state === 'ready'
   return (
     <>
       <DialogHeader>
         <DialogTitle className='flex items-center gap-2'>
-          {node.label}
+          <span className='min-w-0 truncate' title={node.label}>
+            {node.label}
+          </span>
           <StatusMark tone={LINK_TONE[remoteLink(node)]} variant='pill' />
         </DialogTitle>
         <DialogDescription className='font-mono text-xs'>
@@ -82,7 +97,7 @@ function PanelBody({
           <DockerTab node={node} />
         </TabsContent>
         <TabsContent value='link' className='min-h-0 flex-1 overflow-auto'>
-          <LinkTab node={node} nodes={nodes} />
+          <LinkTab node={node} nodes={nodes} vmCount={vmCount} />
         </TabsContent>
       </Tabs>
     </>
@@ -92,9 +107,11 @@ function PanelBody({
 function LinkTab({
   node,
   nodes,
+  vmCount,
 }: {
   node: ClusterApiNode
   nodes: ClusterApiNode[]
+  vmCount: number | null
 }) {
   const qc = useQueryClient()
   const reconnect = useMutation({
@@ -120,14 +137,16 @@ function LinkTab({
     ['经由', jump ? `${jump.label} · ${jump.host}` : '直连'],
     ['认证', node.auth_type === 'key' ? '私钥' : '密码'],
     ['固定指纹', `${node.host_key_alg} ${node.host_key_sha256}`],
-    [
-      'Docker',
-      node.health
-        ? node.health.docker.ok
-          ? '可用'
-          : node.health.docker.error || '不可用'
-        : '—',
-    ],
+    node.platform === 'darwin'
+      ? ['运行方式', 'macOS 原生（槽位是 launchd 服务，不用 Docker）']
+      : [
+          'Docker',
+          node.health
+            ? node.health.docker.ok
+              ? '可用'
+              : node.health.docker.error || '不可用'
+            : '—',
+        ],
   ]
 
   return (
@@ -153,6 +172,14 @@ function LinkTab({
       >
         立即重连
       </Button>
+
+      <NodeConfig
+        node={node}
+        vmCount={vmCount}
+        dependentCount={nodes.filter((n) => n.jump_node_id === node.id).length}
+      />
+
+      <DirectLinkConfig key={node.id} node={node} />
 
       <div className='space-y-1.5'>
         <div className='text-xs font-medium'>本机 Docker 桥</div>

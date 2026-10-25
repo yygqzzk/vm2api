@@ -5,6 +5,8 @@ import path from 'node:path'
 import { prepareOutboundHeaders } from '../protocol/outbound-attempt.mjs'
 import { sanitizeAnthropicBodyForBetaTokens } from '../protocol/anthropic-policy.mjs'
 import { withRequestProtocolBetas } from '../protocol/claude-code-betas.mjs'
+import { pinThreadBetas, rememberThreadTurn } from '../protocol/thread-betas.mjs'
+import { applyThinkingDisplay, thinkingDisplayMode } from '../protocol/thinking.mjs'
 import { sealClaudeCodeCch } from '../identity/cch.mjs'
 import { credentialModeFromOauth } from '../oauth/credential-mode.mjs'
 import { isCrsMock, writeCrsTrace, mockCrsPayload, emitMockSse } from './crs-mock.mjs'
@@ -17,6 +19,8 @@ import {
   readWorkerCredentialFile,
   REFRESH_SKEW_MS,
   writeWorkerCredentialFile,
+  ensureOfficialCredentialLink,
+  authLoginBlocksRefresh,
 } from '../oauth/oauth-credentials.mjs'
 import { isApiKeyMode } from '../oauth/credential-mode.mjs'
 import { runSlotOauth } from './slot-oauth.mjs'
@@ -429,19 +433,40 @@ function dumpSessionEnvelope(envelope) {
  * body on the VM's HTTP betas would lift every role=system turn into system[],
  * so system grows each turn and no cached prefix is ever read.
  */
-export function finalizeWorkerPayload({ body, reqHeaders, exec, identity, want1m = false, cliHop = false }) {
+export function finalizeWorkerPayload({
+  body,
+  reqHeaders,
+  exec,
+  identity,
+  routing,
+  want1m = false,
+  cliHop = false,
+  requestContext = null,
+} = {}) {
   const model = body?.model || ''
   const credMode = credentialModeFromOauth(exec?.vm?.claude || {})
   const headers = prepareOutboundHeaders(reqHeaders, exec?.homeDir, identity, model, {
     credentialMode: credMode,
     want1m: want1m === true,
   })
-  const betas = withRequestProtocolBetas(String(headers?.['anthropic-beta'] || '').split(','), body)
+  const displayed =
+    requestContext?.purpose === 'auto_mode_classifier' ? body : applyThinkingDisplay(body, thinkingDisplayMode(routing))
+  const thread = pinThreadBetas(
+    displayed,
+    withRequestProtocolBetas(String(headers?.['anthropic-beta'] || '').split(','), displayed),
+  )
+  const betas = thread.betas
   headers['anthropic-beta'] = betas.join(',')
   // Envelope headers are discarded; the existing MessageRequest.betas channel
   // carries request gates to the native CLI, which builds the actual HTTP wire.
-  const gated = cliHop ? { ...body, betas } : sanitizeAnthropicBodyForBetaTokens(body, headers['anthropic-beta'])
-  return { headers, body: sealClaudeCodeCch(gated) }
+  const gated = cliHop
+    ? { ...displayed, betas }
+    : sanitizeAnthropicBodyForBetaTokens(displayed, headers['anthropic-beta'])
+  return {
+    headers,
+    body: sealClaudeCodeCch(gated, { enabled: routing?.compatibility?.cch_enabled !== false, seal: !cliHop }),
+    thread: thread.turn,
+  }
 }
 
 function workerEnvelope({
@@ -450,6 +475,7 @@ function workerEnvelope({
   reqHeaders,
   exec,
   identity,
+  routing,
   stream,
   deliveryMode,
   want1m = false,
@@ -457,7 +483,16 @@ function workerEnvelope({
   preserveCacheBreakpoints = null,
   cliHop = false,
 } = {}) {
-  const finalized = finalizeWorkerPayload({ body, reqHeaders, exec, identity, want1m, cliHop })
+  const finalized = finalizeWorkerPayload({
+    body,
+    reqHeaders,
+    exec,
+    identity,
+    routing,
+    want1m,
+    cliHop,
+    requestContext,
+  })
   const envelope = {
     ...(requestContext ? { request_context: requestContext } : {}),
     body: finalized.body,
@@ -468,7 +503,18 @@ function workerEnvelope({
     cache_ttl: cacheTtl == null ? null : String(cacheTtl),
   }
   dumpSessionEnvelope(envelope)
-  return envelope
+  return { envelope, thread: finalized.thread }
+}
+
+/**
+ * 把这一跳真正 POST 给槽位 worker 的 envelope 交给调用方（请求日志据此记录出站 body / headers）。
+ * 只是旁路观察：回调抛错也不能影响这一跳。
+ */
+function reportEnvelope(onEnvelope, envelope) {
+  if (typeof onEnvelope !== 'function') return
+  try {
+    onEnvelope(envelope)
+  } catch {}
 }
 
 function mockScenario(exec) {
@@ -487,6 +533,7 @@ export async function callGoWorker({
   reqHeaders = {},
   timeoutMs,
   identity = null,
+  routing,
   signal,
   want1m = false,
   cacheTtl = null,
@@ -494,9 +541,20 @@ export async function callGoWorker({
   requestPath = '/internal/v1/messages',
   envelope = null,
   cliHop = false,
+  onEnvelope = null,
 } = {}) {
   if (isCrsMock()) {
-    const { body: outboundBody, headers } = finalizeWorkerPayload({ body, reqHeaders, exec, identity, want1m, cliHop })
+    const { body: outboundBody, headers } = finalizeWorkerPayload({
+      body,
+      reqHeaders,
+      exec,
+      identity,
+      routing,
+      want1m,
+      cliHop,
+      requestContext,
+    })
+    reportEnvelope(onEnvelope, { body: outboundBody, headers })
     writeCrsTrace({ body: outboundBody, headers, stream: false })
     const mock = mockCrsPayload({ scenario: mockScenario(exec) })
     return {
@@ -511,33 +569,36 @@ export async function callGoWorker({
   const requestId = randomUUID()
   const stopCancel = cancelOnAbort(exec, signal, requestId)
   try {
+    const prepared = envelope
+      ? { envelope, thread: null }
+      : workerEnvelope({
+          body,
+          reqHeaders,
+          exec,
+          identity,
+          routing,
+          stream: false,
+          want1m,
+          cacheTtl,
+          preserveCacheBreakpoints,
+          cliHop,
+          requestContext,
+        })
+    reportEnvelope(onEnvelope, prepared.envelope)
     const response = await workerRequest(exec, {
       method: 'POST',
       requestPath,
-      body: {
-        ...(envelope ||
-          workerEnvelope({
-            body,
-            reqHeaders,
-            exec,
-            identity,
-            stream: false,
-            want1m,
-            cacheTtl,
-            preserveCacheBreakpoints,
-            cliHop,
-            requestContext,
-          })),
-        request_id: requestId,
-      },
+      body: { ...prepared.envelope, request_id: requestId },
       signal,
       timeoutMs,
     })
     const data = await readAll(response)
     const parsed = parseJson(data)
     const headers = mergeRateLimitHeaders(publicHeaders(response.headers))
+    const ok = response.statusCode >= 200 && response.statusCode < 300 && parsed?.type !== 'error'
+    if (ok) rememberThreadTurn(parsed?.id, prepared.thread)
     return restoreKernelErrorStatus({
-      ok: response.statusCode >= 200 && response.statusCode < 300 && parsed?.type !== 'error',
+      ok,
       status: response.statusCode || 0,
       via: 'go-worker',
       body: parsed,
@@ -547,6 +608,7 @@ export async function callGoWorker({
       stopReason: parsed?.stop_reason || null,
       terminalState: headers['x-terminal-state'] || null,
       transportError: false,
+      threadBetas: prepared.thread,
     })
   } catch (error) {
     return {
@@ -578,6 +640,7 @@ export async function streamGoWorker({
   timeoutMs,
   idleTimeoutMs = 0,
   identity = null,
+  routing,
   signal,
   deliveryMode = 'realtime',
   onEvent,
@@ -588,9 +651,21 @@ export async function streamGoWorker({
   requestPath = '/internal/v1/messages',
   envelope = null,
   cliHop = false,
+  onEnvelope = null,
+  onOutboundHeaders = null,
 } = {}) {
   if (isCrsMock()) {
-    const { body: outboundBody, headers } = finalizeWorkerPayload({ body, reqHeaders, exec, identity, want1m, cliHop })
+    const { body: outboundBody, headers } = finalizeWorkerPayload({
+      body,
+      reqHeaders,
+      exec,
+      identity,
+      routing,
+      want1m,
+      cliHop,
+      requestContext,
+    })
+    reportEnvelope(onEnvelope, { body: outboundBody, headers })
     writeCrsTrace({ body: outboundBody, headers, stream: true })
     const scenario = mockScenario(exec)
     const mockStartedAt = Date.now()
@@ -667,26 +742,27 @@ export async function streamGoWorker({
   const requestId = randomUUID()
   const stopCancel = cancelOnAbort(exec, signal, requestId)
   try {
+    const prepared = envelope
+      ? { envelope, thread: null }
+      : workerEnvelope({
+          body,
+          reqHeaders,
+          exec,
+          identity,
+          routing,
+          stream: true,
+          deliveryMode,
+          want1m,
+          cacheTtl,
+          preserveCacheBreakpoints,
+          cliHop,
+          requestContext,
+        })
+    reportEnvelope(onEnvelope, prepared.envelope)
     const response = await workerRequest(exec, {
       method: 'POST',
       requestPath,
-      body: {
-        ...(envelope ||
-          workerEnvelope({
-            body,
-            reqHeaders,
-            exec,
-            identity,
-            stream: true,
-            deliveryMode,
-            want1m,
-            cacheTtl,
-            preserveCacheBreakpoints,
-            cliHop,
-            requestContext,
-          })),
-        request_id: requestId,
-      },
+      body: { ...prepared.envelope, request_id: requestId },
       signal,
       timeoutMs,
       timeoutMode: 'first-byte',
@@ -704,6 +780,7 @@ export async function streamGoWorker({
         committed: false,
         terminalState: headers['x-terminal-state'] || 'error',
         transportError: false,
+        threadBetas: prepared.thread,
       })
     }
     let buffer = ''
@@ -748,6 +825,7 @@ export async function streamGoWorker({
       }
       if (event.type === 'error') lastError = event
       if (event.type === 'message_stop') sawMessageStop = true
+      if (event.type === 'message_start') rememberThreadTurn(event.message?.id, prepared.thread)
       const evUsage = usageFromSseEvent(event)
       if (evUsage) sseUsage = mergeUsage(sseUsage, evUsage)
       if (event.message?.model) sseModel = event.message.model
@@ -760,6 +838,7 @@ export async function streamGoWorker({
     let lastChunkAt = Date.now()
     let sawChunk = false
     let sawMessageStop = false
+    let outboundHeadersFrame = false
     let idleTimer = null
     if (firstByteMs > 0 || idleMs > 0) {
       idleTimer = setInterval(() => {
@@ -778,13 +857,37 @@ export async function streamGoWorker({
       // job_done and its trailers afterward. Keep reading until the worker
       // closes the response so a normal completion is not mistaken for cancel.
       for await (const chunk of response) {
-        sawChunk = true
-        lastChunkAt = Date.now()
         buffer += Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk)
         let newline
         while ((newline = buffer.indexOf('\n')) >= 0) {
           const line = buffer.slice(0, newline).replace(/\r$/, '')
           buffer = buffer.slice(newline + 1)
+          // CLI diagnostics share the internal stream, never the caller's SSE.
+          if (line.startsWith('event:')) outboundHeadersFrame = line.slice(6).trim() === 'kin_outbound_headers'
+          if (outboundHeadersFrame) {
+            if (line.startsWith('data:')) {
+              const event = parseJson(line.slice(5).trim())
+              if (
+                event?.type === 'kin_outbound_headers' &&
+                event.headers &&
+                typeof event.headers === 'object' &&
+                !Array.isArray(event.headers) &&
+                typeof onOutboundHeaders === 'function'
+              ) {
+                try {
+                  onOutboundHeaders(event.headers)
+                } catch {
+                  console.warn('[worker] outbound header observer failed')
+                }
+              }
+            }
+            if (line === '') outboundHeadersFrame = false
+            continue
+          }
+          if (line) {
+            sawChunk = true
+            lastChunkAt = Date.now()
+          }
           applyClaudeSSELineToMessage(line, assembler)
           if (line.startsWith('data:')) {
             const piece = line.slice(5).trim()
@@ -807,8 +910,9 @@ export async function streamGoWorker({
           }
           await emitLine(line)
         }
+        if (sawChunk && !outboundHeadersFrame && buffer) lastChunkAt = Date.now()
       }
-      if (buffer) {
+      if (buffer && !outboundHeadersFrame) {
         applyClaudeSSELineToMessage(buffer, assembler)
         await emitLine(buffer)
       }
@@ -842,6 +946,7 @@ export async function streamGoWorker({
         committed,
         terminalState,
         transportError: false,
+        threadBetas: prepared.thread,
       })
     } finally {
       if (idleTimer) clearInterval(idleTimer)
@@ -929,6 +1034,7 @@ export async function ensureWorkerCredential(exec, { force = false } = {}) {
     }
   }
 
+  if (exec?.homeDir) ensureOfficialCredentialLink(exec.homeDir)
   const credential = readWorkerCredentialFile(exec.homeDir)
   if (!credential) {
     return {
@@ -941,6 +1047,15 @@ export async function ensureWorkerCredential(exec, { force = false } = {}) {
 
   const now = Date.now()
   const apiKey = isApiKeyMode(credential.type || credential.mode)
+  if (!apiKey && authLoginBlocksRefresh(exec?.homeDir, now)) {
+    return {
+      ok: true,
+      status: 200,
+      refreshed: false,
+      refresh_class: 'login_in_progress',
+      credential: credentialSummary(credential, now),
+    }
+  }
   const alreadyFresh = apiKey || (!force && !needsRefresh(credential.expires_at, now, REFRESH_SKEW_MS))
   if (alreadyFresh) {
     return {
@@ -955,6 +1070,17 @@ export async function ensureWorkerCredential(exec, { force = false } = {}) {
   const snapshotRefresh = String(credential.refresh_token || '')
   const lockKey = String(exec.homeDir || exec.vm?.id || 'credential')
   return withCredentialRefreshLock(lockKey, async () => {
+    if (exec?.homeDir) ensureOfficialCredentialLink(exec.homeDir)
+    if (!apiKey && authLoginBlocksRefresh(exec?.homeDir)) {
+      const held = readWorkerCredentialFile(exec.homeDir) || credential
+      return {
+        ok: true,
+        status: 200,
+        refreshed: false,
+        refresh_class: 'login_in_progress',
+        credential: credentialSummary(held, Date.now()),
+      }
+    }
     const live = readWorkerCredentialFile(exec.homeDir) || credential
     const liveRefresh = String(live?.refresh_token || '')
     if (snapshotRefresh && liveRefresh && snapshotRefresh !== liveRefresh) {

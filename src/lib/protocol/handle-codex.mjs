@@ -6,6 +6,7 @@ import { getVm, listVms, persistCodexUsage, syncCodexQuotaSchedule } from '../vm
 import { isValidVmId } from '../vm/vm-file.mjs'
 import { isCodexProtocolAllowed, isCodexVm, normalizeCodexRouting } from './codex-route.mjs'
 import { keyAllowsVm, keyScopeFromRequest, vmPoolDenial } from '../admin/key-scope.mjs'
+import { ownerScopeFromRequest, vmMatchesOwnerScope } from '../admin/resource-owner.mjs'
 import { normalizeOpenAIQuotaPolicy } from '../pool/openai-quota-policy.mjs'
 import { restrictCodexClient } from './codex-restriction.mjs'
 import {
@@ -18,10 +19,19 @@ import {
   isToolArgumentsError,
   toCodexResponses,
 } from './codex-convert.mjs'
-import { extraFromCodexHeaders, codexQuotaPark, CODEX_DEFAULT_PARK_MS } from './codex-usage.mjs'
+import {
+  extraFromCodexHeaders,
+  codexCreditsFromHeaders,
+  codexQuotaPark,
+  CODEX_DEFAULT_PARK_MS,
+} from './codex-usage.mjs'
 import { extractOpenaiUsage, openaiAnthropicUsageFromExtract, disjointOpenaiUsage } from './openai-usage.mjs'
 import { streamCodexKernel } from '../transport/codex-kernel-client.mjs'
-import { ensureCodexKernel, writeCodexKernelConfig } from '../transport/codex-kernel-supervisor.mjs'
+import {
+  codexKernelRequestOptions,
+  ensureCodexKernel,
+  writeCodexKernelConfig,
+} from '../transport/codex-kernel-supervisor.mjs'
 import { isLocalEgressProxy } from '../vm/egress.mjs'
 import { vmNodeId } from '../cluster/placement.mjs'
 import { hostProxyUrlForVm } from '../vm/slot-host.mjs'
@@ -30,6 +40,8 @@ import { scopeAccountFromVm } from './jev-intercept.mjs'
 import {
   CODEX_APP_VERSION,
   CODEX_CATALOG_ORIGINATOR,
+  CODEX_IMAGE_EDITS_URL,
+  CODEX_IMAGE_GENERATIONS_URL,
   CODEX_SEARCH_URL,
   CODEX_USER_AGENT,
   makeProxyFetch,
@@ -37,6 +49,7 @@ import {
 } from './codex-models.mjs'
 import { orderCodexSessionSlots, codexSlotAllowsModel, isCodexFailoverError } from '../pool/codex-slot-pool.mjs'
 import {
+  holdOpenAIAccount,
   reportOpenAIAttempt,
   tryAcquireOpenAISlot,
   waitForOpenAICapacity,
@@ -44,6 +57,8 @@ import {
 } from '../pool/openai-account-runtime.mjs'
 import { CLIENT_POOL_BUSY_MESSAGE, CLIENT_POOL_UNAVAILABLE_MESSAGE, ErrorCode } from '../core/errors.mjs'
 import { applyOpenaiWashLog } from './openai-wash.mjs'
+import { canonicalImageToolModel, imageGenerationTools } from './image-tool-models.mjs'
+import { isImageToolModelEnabled } from './gpt-model-policy.mjs'
 import { sessionIdForLog } from './log-fields.mjs'
 import { redactHeaders } from '../admin/request-log.mjs'
 import {
@@ -134,6 +149,45 @@ function firstUserIdentityFromCodex(body = {}) {
   return extractFirstUserIdentity(body?.messages) || String(body?.prompt || '')
 }
 
+/** Codex failover shares the Claude pool's attempt budget. */
+export function codexFailoverBudget(routing = {}) {
+  const failover = routing?.failover || {}
+  const attempts = Number(failover.max_total_attempts)
+  const switches = Number(failover.max_account_switches)
+  const sameRetries = Number(failover.max_same_account_retries)
+  return {
+    maxAttempts: Number.isFinite(attempts) && attempts > 0 ? Math.min(64, Math.floor(attempts)) : 12,
+    maxSwitches: Number.isFinite(switches) && switches >= 0 ? Math.min(63, Math.floor(switches)) : 3,
+    maxSameAccountRetries: Number.isFinite(sameRetries) && sameRetries >= 0 ? Math.min(16, Math.floor(sameRetries)) : 3,
+  }
+}
+
+/** Same-account retries are only useful for transient failures; auth and quota errors switch seats. */
+export function isRetryableSameCodexAccount(
+  result,
+  { headersSent = false, conversionError = null, signal = null } = {},
+) {
+  if (!result || result.ok === true || result.committed === true || headersSent || conversionError) return false
+  if (signal?.aborted) return false
+  const status = Number(result.status) || 0
+  const code = String(result.body?.error?.code || result.error_code || '')
+  const message = String(result.body?.error?.message || result.error || '')
+  if (
+    /content_policy|refusal|usage_policy|guard|tool_arguments_mismatch|upstream_protocol_error/i.test(
+      `${code} ${message}`,
+    )
+  )
+    return false
+  if (result.transportError === true || status === 0) return true
+  if (status === 408) return true
+  if (status === 500 || status === 502 || status === 503 || status === 504) {
+    return (
+      code === '' || /server_error|provider_error|upstream_error|overloaded_error|internal_error|transport/i.test(code)
+    )
+  }
+  return false
+}
+
 function applyCodexRebuildBody(body, sessionId, mode) {
   const out = { ...body }
   if (mode !== 'rebuild') return out
@@ -158,9 +212,10 @@ function pinnedVmId(req) {
 export function pickCodexCandidates(
   projectRoot,
   req,
-  { stickyRouter = null, sessions = null, body = null, excluded = null, routing = {} } = {},
+  { stickyRouter = null, sessions = null, body = null, excluded = null, routing = {}, ownerScope = null } = {},
 ) {
   const pin = pinnedVmId(req)
+  const owner = ownerScope || ownerScopeFromRequest(req)
   const model = body?.model || null
   const routingPolicy = normalizeCodexRouting(routing.codex || routing).quota
   const scope = keyScopeFromRequest(req)
@@ -188,7 +243,9 @@ export function pickCodexCandidates(
   const stickyKeys = stickyRouter?.collectPoolKeys?.(req, body || {}, { platform: 'openai' }) || []
   const sessionKey = stickyRouter?.extractPoolKey?.(req, body || {}, { platform: 'openai' }) || stickyKeys[0] || null
   const bound = sessionKey ? stickyRouter?.resolve?.(sessionKey) : null
-  const vms = listVms(projectRoot, { codex: { quota: routingPolicy } }).filter((vm) => keyAllowsVm(scope, vm))
+  const vms = listVms(projectRoot, { codex: { quota: routingPolicy } }).filter(
+    (vm) => vmMatchesOwnerScope(vm, owner) && keyAllowsVm(scope, vm),
+  )
   const continuesResponse = !!body?.previous_response_id && !!bound?.vmId
   if (scope.vm_pool_id && vms.length === 0 && !continuesResponse) {
     return { error: 'vm_pool_unavailable', message: '账号池没有可调度的 GPT 槽位', ids: [], candidates: [] }
@@ -228,7 +285,7 @@ function ingestCodexHop(projectRoot, vmId, result, now = Date.now(), policy = nu
     limitedUntil = park.until || now + CODEX_DEFAULT_PARK_MS
     quotaExceeded = String(result?.body?.error?.code || result?.error_code || '') === 'usage_limit_reached'
   }
-  if (!extra && !limitedUntil) return null
+  if (!extra && !limitedUntil && !codexCreditsFromHeaders(headers, now)) return null
   return persistCodexUsage(projectRoot, vmId, { headers, extra, limitedUntil, quotaExceeded, now, policy })
 }
 
@@ -250,6 +307,32 @@ export function isRetryableCodexTransport(result) {
   if (status === 0) return true
   if (status === 502 && /upstream_transport|worker_transport|transport/i.test(`${code} ${msg}`)) return true
   return /upstream_transport|worker_transport_error/i.test(code)
+}
+
+/**
+ * Short process-local hold for an account that just failed upstream. This is
+ * not the operator scheduling switch: it expires by itself and keeps the next
+ * request from spending another turn on the same dead 401 / rate-limited
+ * account. Committed streams and request-shaped errors are never parked.
+ */
+export function codexFailureHold(result, now = Date.now()) {
+  if (!result || result.ok === true || result.committed === true) return null
+  const status = Number(result.status) || 0
+  const code = String(result.body?.error?.code || result.error_code || '')
+  const message = String(result.body?.error?.message || result.error || '')
+  if (status === 400 || status === 422) return null
+  if (
+    /content_policy|refusal|usage_policy|guard|tool_arguments_mismatch|upstream_protocol_error/i.test(
+      `${code} ${message}`,
+    )
+  )
+    return null
+  if (status === 401) return { until: now + 5 * 60_000, reason: 'oauth_401' }
+  if (status === 403) return { until: now + 5 * 60_000, reason: 'permission_denied' }
+  if (status === 429) return { until: now + 60_000, reason: 'rate_limited' }
+  if (status === 408 || status >= 500) return { until: now + 30_000, reason: 'upstream_5xx' }
+  if (result.transportError === true || status === 0) return { until: now + 30_000, reason: 'transport_error' }
+  return null
 }
 
 /** Idle SOCKS / first hop 502 is retryable only before any SSE byte is committed. */
@@ -275,6 +358,30 @@ export function usageFromSseLine(line) {
   } catch {
     return null
   }
+}
+
+/** `tool_usage.image_gen` from a terminal Responses frame (official `response.tool_usage`). */
+export function imageGenUsageFromSseLine(line) {
+  if (typeof line !== 'string' || !line.startsWith('data:') || !line.includes('tool_usage')) return null
+  try {
+    const ev = JSON.parse(line.slice(5).trim())
+    if (ev?.type !== 'response.completed' && ev?.type !== 'response.incomplete') return null
+    const usage = ev.response?.tool_usage?.image_gen
+    return usage && typeof usage === 'object' ? usage : null
+  } catch {
+    return null
+  }
+}
+
+/** A known image model the GPT policy disabled is refused before any slot is picked. */
+function disabledImageTool(body, logBag) {
+  for (const tool of imageGenerationTools(body)) {
+    const model = typeof tool.model === 'string' ? tool.model.trim() : ''
+    if (!model) continue
+    logBag.image_model = canonicalImageToolModel(model) || model
+    if (isImageToolModelEnabled(model) === false) return model
+  }
+  return null
 }
 
 function usageTokens(usage) {
@@ -441,6 +548,7 @@ export async function handleCodexProtocol({
   captureOutbound = false,
   requestStartedAt = Date.now(),
   accountGate = null,
+  ownerScope = null,
 }) {
   const codex = normalizeCodexRouting(routing.codex)
   const allowed = isCodexProtocolAllowed(protocol, { codex })
@@ -489,6 +597,19 @@ export async function handleCodexProtocol({
     converted: converted.converted,
     outboundBody: converted.body,
   })
+  const disabledImage = disabledImageTool(converted.body, logBag)
+  if (disabledImage) {
+    stats.errors++
+    logBag.via = 'codex-kernel'
+    logBag.error_code = 'model_disabled'
+    return json(res, 400, {
+      error: {
+        type: 'invalid_request_error',
+        code: 'model_disabled',
+        message: `image_generation model '${disabledImage}' is disabled by gateway GPT model policy`,
+      },
+    })
+  }
   const stream = inbound?.stream !== false && ctx.body?.stream !== false
   const inboundSession = sessionFrom(req, converted.body)
   const sessionMode = outboundSessionMode(routing)
@@ -514,13 +635,20 @@ export async function handleCodexProtocol({
     body: body || converted.body || inbound,
     excluded: new Set(),
     routing,
+    ownerScope,
   }
   const deadline = Date.now() + codexWaitTimeoutMs(routing)
   const gone = clientGoneSignal(req, res)
+  const failoverBudget = codexFailoverBudget(routing)
+  const sameRetryDelay = Number(routing?.failover?.same_account_retry_delay_ms)
+  const sameRetryDelayMs =
+    Number.isFinite(sameRetryDelay) && sameRetryDelay >= 0 ? Math.min(10_000, sameRetryDelay) : 100
   logBag.via = 'codex-kernel'
   logBag.attempt_count = 0
   let last = null
   let hops = 0
+  let attempts = 0
+  let switches = 0
   let counted = false
   try {
     for (;;) {
@@ -541,6 +669,11 @@ export async function handleCodexProtocol({
         lease.release()
         pickOpts.excluded.add(admitted.vmId)
         continue
+      }
+      attempts += 1
+      if (attempts > failoverBudget.maxAttempts) {
+        lease.release()
+        break
       }
       if (!counted) {
         counted = true
@@ -585,7 +718,7 @@ export async function handleCodexProtocol({
       let attemptKind = 'failed'
       try {
         const localExit = isLocalEgressProxy(vm.proxy)
-        writeCfg(projectRoot, vm, {
+        const written = writeCfg(projectRoot, vm, {
           // Same rule as slot start: a node on local egress must leave through
           // that node's forwarder, not the control plane's deployment proxy.
           proxyUrl: localExit && !vmNodeId(vm) ? '' : hostProxyUrlForVm(vm),
@@ -608,7 +741,11 @@ export async function handleCodexProtocol({
             },
           }
           pickOpts.excluded.add(vm.id)
-          if (!res.headersSent) continue
+          switches += 1
+          if (!res.headersSent) {
+            if (switches > failoverBudget.maxSwitches || attempts >= failoverBudget.maxAttempts) break
+            continue
+          }
           stats.errors++
           logBag.error_code = 'codex_kernel_unavailable'
           return json(res, 503, last.body)
@@ -620,6 +757,7 @@ export async function handleCodexProtocol({
         const nameSseEvent = createResponsesSseEventNamer()
         let responseServiceTier = null
         let streamedUsage = null
+        let streamedImageUsage = null
         let conversionError = null
         const attemptStartedAt = Date.now()
         const sessionOptions = {
@@ -648,56 +786,85 @@ export async function handleCodexProtocol({
         const outboundHeaders = codexKernelHeaders(req.headers, outboundBody, session)
         if (captureOutbound) logBag.outbound_body = outboundBody
         logBag.outbound_headers = redactHeaders(outboundHeaders)
-        const result = await runCodexKernelHop({
-          hop,
-          args: {
-            exec: execFor(projectRoot, vm),
-            signal: gone.signal,
-            body: outboundBody,
-            reqHeaders: req.headers,
-            envelope: {
+        let hopEmitted = false
+        const runHop = () =>
+          runCodexKernelHop({
+            hop,
+            args: {
+              exec: execFor(projectRoot, vm),
+              signal: gone.signal,
               body: outboundBody,
-              headers: outboundHeaders,
-              stream: true,
-              session,
+              reqHeaders: req.headers,
+              envelope: {
+                body: outboundBody,
+                headers: outboundHeaders,
+                stream: true,
+                session,
+                options: { ...codexKernelRequestOptions(routing), installation_id: written?.installationId },
+              },
             },
-          },
-          onReasoningFallback: ({ body: retryBody }) => {
-            if (captureOutbound) logBag.outbound_body = retryBody
-          },
-          onEvent: async (line) => {
-            if (conversionError) return
-            const tier = serviceTierFromSseLine(line)
-            if (tier) responseServiceTier = tier
-            const seen = usageFromSseLine(line)
-            if (seen) streamedUsage = preferUsage(streamedUsage, seen)
-            if (!stream) {
-              chunks.push(line)
-              return
-            }
-            if (!res.headersSent) writeSSEHeaders(res)
-            if (protocol !== 'openai.responses') {
-              try {
-                const mapped =
-                  protocol === 'anthropic.messages'
-                    ? responsesSseToAnthropicEvents(line, anthropicSse)
-                    : responsesSseToChatChunk(line, 'codex', chatSse)
-                if (mapped) res.write(mapped)
-              } catch (error) {
-                if (error.code !== 'tool_arguments_mismatch') throw error
-                conversionError = { type: 'upstream_protocol_error', code: error.code, message: error.message }
-                res.write(
-                  protocol === 'anthropic.messages'
-                    ? `event: error\ndata: ${JSON.stringify({ type: 'error', error: conversionError })}\n\n`
-                    : `data: ${JSON.stringify({ error: conversionError })}\n\ndata: [DONE]\n\n`,
-                )
+            onReasoningFallback: ({ body: retryBody }) => {
+              if (captureOutbound) logBag.outbound_body = retryBody
+            },
+            onEvent: async (line) => {
+              hopEmitted = true
+              if (conversionError) return
+              const tier = serviceTierFromSseLine(line)
+              if (tier) responseServiceTier = tier
+              const seen = usageFromSseLine(line)
+              if (seen) streamedUsage = preferUsage(streamedUsage, seen)
+              const imageGen = imageGenUsageFromSseLine(line)
+              if (imageGen) streamedImageUsage = imageGen
+              if (!stream) {
+                chunks.push(line)
+                return
               }
-              return
-            }
-            const named = nameSseEvent(line)
-            if (named) res.write(named)
-          },
-        })
+              if (!res.headersSent) writeSSEHeaders(res)
+              if (protocol !== 'openai.responses') {
+                try {
+                  const mapped =
+                    protocol === 'anthropic.messages'
+                      ? responsesSseToAnthropicEvents(line, anthropicSse)
+                      : responsesSseToChatChunk(line, 'codex', chatSse)
+                  if (mapped) res.write(mapped)
+                } catch (error) {
+                  if (error.code !== 'tool_arguments_mismatch') throw error
+                  conversionError = { type: 'upstream_protocol_error', code: error.code, message: error.message }
+                  res.write(
+                    protocol === 'anthropic.messages'
+                      ? `event: error\ndata: ${JSON.stringify({ type: 'error', error: conversionError })}\n\n`
+                      : `data: ${JSON.stringify({ error: conversionError })}\n\ndata: [DONE]\n\n`,
+                  )
+                }
+                return
+              }
+              const named = nameSseEvent(line)
+              if (named) res.write(named)
+            },
+          })
+        let result = await runHop()
+        // A transient seat-local failure gets the same account up to N retries
+        // before the request spends a switch. 401/403/429 are never retried here:
+        // they are credential/account state and must move to another seat.
+        let sameAccountRetries = result?.transport_retried || result?.reasoning_history_retried ? 1 : 0
+        while (
+          sameAccountRetries < failoverBudget.maxSameAccountRetries &&
+          attempts < failoverBudget.maxAttempts &&
+          isRetryableSameCodexAccount(result, {
+            headersSent: res.headersSent || hopEmitted,
+            conversionError,
+            signal: gone.signal,
+          })
+        ) {
+          sameAccountRetries += 1
+          attempts += 1
+          hops += 1
+          logBag.attempt_count = hops
+          logBag.codex_same_account_retried = sameAccountRetries
+          await new Promise((resolve) => setTimeout(resolve, sameRetryDelayMs))
+          hopEmitted = false
+          result = await runHop()
+        }
         // The log and total duration share ingress time; pool scoring keeps hop TTFT.
         logBag.first_token_ms = Number.isFinite(result?.firstTokenAt)
           ? Math.max(0, result.firstTokenAt - requestStartedAt)
@@ -728,6 +895,9 @@ export async function handleCodexProtocol({
           const disjoint = extracted ? openaiAnthropicUsageFromExtract(extracted) : null
           const logged = disjointOpenaiUsage(usage && serviceTier ? { ...usage, service_tier: serviceTier } : usage)
           logBag.usage = logged
+          const imageUsage =
+            result.body?.tool_usage?.image_gen || result.body?.response?.tool_usage?.image_gen || streamedImageUsage
+          if (imageUsage) logBag.image_usage = imageUsage
           logBag.input_tokens = disjoint?.input_tokens ?? usage?.input_tokens ?? usage?.prompt_tokens ?? null
           logBag.output_tokens = disjoint?.output_tokens ?? usage?.output_tokens ?? usage?.completion_tokens ?? null
           logBag.cache_read_tokens =
@@ -769,7 +939,9 @@ export async function handleCodexProtocol({
           return res.end()
         }
         reportOpenAIAttempt(vm.id, attemptKind, result?.ttftMs ?? null)
-        if (res.headersSent) {
+        const failureHold = codexFailureHold(result)
+        if (failureHold) holdOpenAIAccount(vm.id, failureHold)
+        if (res.headersSent || hopEmitted) {
           stats.errors++
           logBag.error_code = result?.body?.error?.code || 'codex_upstream'
           logBag.upstream_status = result?.status || 0
@@ -778,6 +950,8 @@ export async function handleCodexProtocol({
         if (isCodexFailoverError(result)) {
           pickOpts.excluded.add(vm.id)
           leaveSticky()
+          switches += 1
+          if (switches > failoverBudget.maxSwitches || attempts >= failoverBudget.maxAttempts) break
           continue
         }
         break
@@ -940,11 +1114,24 @@ function plainHeaders(headers) {
   return { ...(headers || {}) }
 }
 
-/** One search call on one slot. Resolves `{ status, text, headers }`, or `{ status: 0, error }`. */
-async function postCodexSearch({ projectRoot, vm, body, turnMetadata, fetchImpl, refresh = refreshCodexAccessToken }) {
+/**
+ * One JSON POST to a Codex backend endpoint (search, images) on one slot.
+ * Resolves `{ status, text, headers }`, or `{ status: 0, error }`.
+ */
+async function postCodexJson({
+  url,
+  timeoutMs,
+  projectRoot,
+  vm,
+  body,
+  turnMetadata,
+  extraHeaders = {},
+  fetchImpl,
+  refresh = refreshCodexAccessToken,
+}) {
   const proxyUrl = hostProxyUrlForVm(vm)
   if (!fetchImpl && !proxyUrl && !isLocalEgressProxy(vm.proxy)) return { status: 0, error: 'proxy_required' }
-  const doFetch = fetchImpl || makeProxyFetch(proxyUrl, CODEX_SEARCH_TIMEOUT_MS, { maxMs: CODEX_SEARCH_TIMEOUT_MS })
+  const doFetch = fetchImpl || makeProxyFetch(proxyUrl, timeoutMs, { maxMs: timeoutMs })
   const creds = searchCredentials(projectRoot, vm)
   const send = async (access) => {
     // Same identity as the slot's kernel; the backend wants originator, User-Agent and version to agree.
@@ -958,8 +1145,9 @@ async function postCodexSearch({ projectRoot, vm, body, turnMetadata, fetchImpl,
     }
     if (creds.accountId) headers['chatgpt-account-id'] = creds.accountId
     if (turnMetadata) headers['x-codex-turn-metadata'] = turnMetadata
+    Object.assign(headers, extraHeaders)
     try {
-      const res = await doFetch(CODEX_SEARCH_URL, { method: 'POST', headers, body: JSON.stringify(body) })
+      const res = await doFetch(url, { method: 'POST', headers, body: JSON.stringify(body) })
       return { status: Number(res?.status) || 0, text: await res.text(), headers: plainHeaders(res?.headers) }
     } catch (e) {
       return { status: 0, error: /abort/i.test(`${e?.name} ${e?.message}`) ? 'upstream_timeout' : 'upstream_transport' }
@@ -972,6 +1160,10 @@ async function postCodexSearch({ projectRoot, vm, body, turnMetadata, fetchImpl,
     if (access) out = await send(access)
   }
   return out
+}
+
+function postCodexSearch(args) {
+  return postCodexJson({ ...args, url: CODEX_SEARCH_URL, timeoutMs: CODEX_SEARCH_TIMEOUT_MS })
 }
 
 function isSearchFailover(out) {
@@ -1003,6 +1195,7 @@ export async function handleCodexSearch({
   projectRoot,
   stickyRouter = null,
   ops = {},
+  ownerScope = null,
 }) {
   logBag.via = 'codex-search'
   const reject = (status, type, code, message) => {
@@ -1021,7 +1214,7 @@ export async function handleCodexSearch({
   for (const key of CODEX_SEARCH_DROP_FIELDS) delete outbound[key]
   const turnMetadata = headerString(req.headers, 'x-codex-turn-metadata')
   const post = ops.postCodexSearch || postCodexSearch
-  const pickOpts = { stickyRouter, sessions: null, body: outbound, excluded: new Set() }
+  const pickOpts = { stickyRouter, sessions: null, body: outbound, excluded: new Set(), ownerScope }
   const deadline = Date.now() + codexWaitTimeoutMs(routing)
   const gone = clientGoneSignal(req, res)
   let last = null
@@ -1090,6 +1283,166 @@ export async function handleCodexSearch({
   if (last.status >= 400) {
     stats.errors++
     logBag.error_code = payload?.error?.code || `upstream_${last.status}`
+  }
+  return json(res, last.status, payload)
+}
+
+// Image generation runs for minutes. codex-proxy-rs sets no total deadline on these JSON endpoints
+// (connect timeout only); the proxy fetch here needs one, so it is generous.
+const CODEX_IMAGES_TIMEOUT_MS = 600000
+const CODEX_IMAGES_URLS = Object.freeze({
+  generations: CODEX_IMAGE_GENERATIONS_URL,
+  edits: CODEX_IMAGE_EDITS_URL,
+})
+
+/** Official Codex `image_generation_available` excludes Free (codex-proxy-rs credential/selector.rs). */
+function isFreePlanSlot(projectRoot, vm) {
+  const plan = vm?.codex?.plan_type || readCodexAccounts(projectRoot, vm.id)[0]?.chatgpt_plan_type || ''
+  return String(plan).trim().toLowerCase() === 'free'
+}
+
+/**
+ * POST /v1/images/{generations,edits}: native Codex Images JSON, passed through on one slot
+ * (codex-proxy-rs `gateway-api/src/openai/images`). No inference session window; an
+ * `x-codex-image-turn-id` keeps one edit turn on the slot that served it.
+ */
+export async function handleCodexImages({
+  req,
+  res,
+  kind,
+  body,
+  logBag,
+  stats,
+  json,
+  routing = {},
+  projectRoot,
+  stickyRouter = null,
+  ops = {},
+  ownerScope = null,
+}) {
+  logBag.via = 'codex-images'
+  const reject = (status, type, code, message) => {
+    stats.errors++
+    logBag.error_code = code
+    return json(res, status, { error: { type, code, message } })
+  }
+  const codex = normalizeCodexRouting(routing.codex)
+  if (!codex.enabled) return reject(400, 'invalid_request_error', 'codex_disabled', 'Codex routing is disabled')
+  const restriction = restrictCodexClient(req.headers, body, { codex }, 'openai.images')
+  if (!restriction.ok) return reject(403, 'permission_error', restriction.code, restriction.message)
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return reject(400, 'invalid_request_error', 'invalid_request', 'Images request body must be a JSON object')
+  }
+  const model = typeof body.model === 'string' ? body.model.trim() : ''
+  if (model) {
+    logBag.image_model = canonicalImageToolModel(model) || model
+    if (isImageToolModelEnabled(model) === false) {
+      return reject(
+        400,
+        'invalid_request_error',
+        'model_disabled',
+        `image model '${model}' is disabled by gateway GPT model policy`,
+      )
+    }
+  }
+  const excluded = new Set()
+  let usable = 0
+  for (const item of listVms(projectRoot)) {
+    if (!isCodexVm(item)) continue
+    if (isFreePlanSlot(projectRoot, getVm(projectRoot, item.id) || item)) excluded.add(item.id)
+    else usable += 1
+  }
+  if (!usable && excluded.size) {
+    return reject(
+      403,
+      'permission_error',
+      'image_generation_unavailable',
+      'Image generation is not available on Free-plan GPT slots',
+    )
+  }
+  const turnMetadata = headerString(req.headers, 'x-codex-turn-metadata')
+  const imageTurnId = headerString(req.headers, 'x-codex-image-turn-id')
+  const extraHeaders = imageTurnId ? { 'x-codex-image-turn-id': imageTurnId } : {}
+  const post = ops.postCodexJson || postCodexJson
+  // Selection-only body: the turn id becomes the sticky session; the upstream body is untouched.
+  const pickBody = { model: model || null, ...(imageTurnId ? { session_id: `codex-image-turn:${imageTurnId}` } : {}) }
+  const pickOpts = { stickyRouter, sessions: null, body: pickBody, excluded, ownerScope }
+  const deadline = Date.now() + codexWaitTimeoutMs(routing)
+  const gone = clientGoneSignal(req, res)
+  let last = null
+  let attempts = 0
+  try {
+    for (;;) {
+      const admitted = await admitCodexCandidate(projectRoot, req, pickOpts, { deadline, signal: gone.signal })
+      if (!admitted.lease) {
+        if (admitted.picked.error === 'client_cancelled') {
+          logBag.final_state = 'cancelled'
+          return
+        }
+        if (last) break
+        return rejectCodexAdmission({ res, json, stats, logBag, picked: admitted.picked, model })
+      }
+      try {
+        const vm = getVm(projectRoot, admitted.vmId)
+        excluded.add(admitted.vmId)
+        if (!vm || !isCodexVm(vm)) continue
+        if (!attempts) {
+          stats.requests++
+          stats.by_route['openai.images'] = (stats.by_route['openai.images'] || 0) + 1
+        }
+        attempts += 1
+        logBag.vm_id = vm.id
+        logBag.account_id = vm.id
+        logBag.attempt_count = attempts
+        last = await post({
+          url: CODEX_IMAGES_URLS[kind] || CODEX_IMAGE_GENERATIONS_URL,
+          timeoutMs: CODEX_IMAGES_TIMEOUT_MS,
+          projectRoot,
+          vm,
+          body,
+          turnMetadata,
+          extraHeaders,
+          fetchImpl: ops.fetchImpl,
+          refresh: ops.refresh,
+        })
+        logBag.upstream_status = last.status || null
+        ingestCodexHop(projectRoot, vm.id, {
+          ok: last.status >= 200 && last.status < 300,
+          status: last.status,
+          headers: last.headers || {},
+          body: parseJson(last.text),
+        })
+        if (last.status >= 200 && last.status < 300 && stickyRouter?.bind) {
+          for (const key of admitted.picked.stickyKeys || []) stickyRouter.bind(key, { accountId: vm.id, vmId: vm.id })
+        }
+        if (!isSearchFailover(last)) break
+      } finally {
+        admitted.lease.release()
+      }
+    }
+  } finally {
+    gone.settle()
+  }
+  if (!last.status) {
+    logBag.final_state = 'upstream_error'
+    return reject(502, 'api_error', last.error || 'upstream_transport', 'Codex images upstream request failed')
+  }
+  const payload = parseJson(last.text)
+  if (payload === undefined) {
+    logBag.final_state = 'upstream_error'
+    return reject(
+      502,
+      'api_error',
+      'upstream_invalid_body',
+      `Codex images upstream answered ${last.status} without JSON`,
+    )
+  }
+  logBag.final_state = last.status < 300 ? 'verified' : 'upstream_error'
+  if (last.status >= 400) {
+    stats.errors++
+    logBag.error_code = payload?.error?.code || `upstream_${last.status}`
+  } else if (payload?.usage && typeof payload.usage === 'object') {
+    logBag.image_usage = payload.usage
   }
   return json(res, last.status, payload)
 }

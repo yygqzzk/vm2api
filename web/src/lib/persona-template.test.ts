@@ -4,12 +4,17 @@ import {
   DEFAULT_PERSONA_TEMPLATES,
   EMPTY_BLOCK_TEXT,
   PERSONA_PRESETS,
+  PREVIEW_CALLER_AGENT,
+  PREVIEW_CALLER_SYSTEM,
   agentStandingVar,
+  applyPersonaEnvVars,
+  dropLegacyAutoScope,
   overlayDisabledByPersona,
   personaInjectFromPreset,
   presetSeed,
   personaHideEnabled,
   presetFlagEnabled,
+  previewModelSentence,
   previewSystemBlocks,
   setPersonaHide,
   setPresetFlag,
@@ -43,6 +48,9 @@ describe('persona template contract', () => {
       'official_full'
     )
     expect(personaInjectFromPreset('zero', 'rewrite')).toBe('zero')
+    expect(personaInjectFromPreset('official_303', 'rewrite')).toBe(
+      'official_full'
+    )
     expect(personaInjectFromPreset('custom', 'append')).toBe('append')
   })
 })
@@ -50,6 +58,9 @@ describe('persona template contract', () => {
 describe('agent standing + system preview', () => {
   const vars = {
     identity: 'ID',
+    identity_cli: 'ID',
+    reporting: 'REPORTING',
+    dynamic_boundary: 'BOUNDARY',
     agent_official: 'AGENT',
     env_official: 'ENV',
     caller_agent: '',
@@ -166,16 +177,278 @@ describe('agent standing + system preview', () => {
   it('reports whether a template can switch standing / env', () => {
     const full = DEFAULT_PERSONA_TEMPLATES.official_full
     expect(templateSlotState(full, 'agent_standing')).toBe('switch')
-    expect(templateSlotState(full, 'env', ['env_official'])).toBe('builtin')
-    expect(
-      templateSlotState(DEFAULT_PERSONA_TEMPLATES.zero, 'env', ['env_official'])
-    ).toBe('switch')
-    expect(templateSlotState([], 'env', ['env_official'])).toBe('absent')
+    expect(templateSlotState(full, 'env')).toBe('switch')
+    expect(templateSlotState(DEFAULT_PERSONA_TEMPLATES.zero, 'env')).toBe(
+      'switch'
+    )
+    expect(templateSlotState([], 'env')).toBe('absent')
     expect(templateSlotState(DEFAULT_PERSONA_TEMPLATES.official, 'env')).toBe(
       'switch'
     )
+    expect(
+      templateSlotState(
+        [{ type: 'text', text: '{{env_timezone_only}}' }],
+        'env'
+      )
+    ).toBe('switch')
+    expect(
+      templateSlotState([{ type: 'text', text: '{{timezone}}' }], 'env')
+    ).toBe('switch')
+    expect(
+      templateSlotState(
+        [{ type: 'text', text: '# Environment\n - Timezone: UTC' }],
+        'env'
+      )
+    ).toBe('absent')
+  })
+  it('keeps the model sentence off until the preset switch is enabled', () => {
+    const edited = {
+      model_env_extra: {
+        'claude-sonnet-5-5': 'Sonnet extra.',
+        'claude-haiku-5-5': 'Haiku extra.',
+      },
+    }
+    const on = {
+      ...edited,
+      model_env_extra_presets: { official_303: true },
+    }
+    const block = (model: string, compat: Record<string, unknown>) =>
+      previewSystemBlocks(DEFAULT_PERSONA_TEMPLATES.official_303, {
+        model_sentence: previewModelSentence(compat, model, 'official_303'),
+      }).find((item) => item.id === 'env_extra')
+    expect(block('claude-sonnet-5-5', edited)).toBeUndefined()
+    expect(block('claude-sonnet-5-5', on)?.text).toBe('Sonnet extra.')
+    expect(block('claude-haiku-5-5', on)?.text).toBe('Haiku extra.')
+    expect(block('claude-opus-5-5', on)).toBeUndefined()
   })
 
+  it('omits generated env when the per-preset switch is off', () => {
+    const isolated = {
+      persona_env_presets: {
+        official: true,
+        official_full: false,
+        zero: false,
+        custom: true,
+      },
+    }
+    const tokyo = '# Environment\n - Timezone: Asia/Tokyo'
+    expect(
+      applyPersonaEnvVars(
+        { env_official: 'ENV', timezone: 'UTC' },
+        {},
+        'official_full'
+      )
+    ).toEqual({ env_official: 'ENV', timezone: 'UTC' })
+
+    const fullOn = previewSystemBlocks(
+      DEFAULT_PERSONA_TEMPLATES.official_full,
+      {
+        ...vars,
+        env_official: 'ENV',
+      }
+    )
+    expect(fullOn.map((block) => block.id)).toEqual([
+      'identity',
+      'agent_official',
+      'env_official',
+    ])
+    expect(fullOn[1]).toMatchObject({
+      text: 'AGENT',
+      placeholder: false,
+      ttl: '1h',
+      scope: '',
+    })
+    expect(fullOn[2]).toMatchObject({
+      text: 'ENV',
+      placeholder: false,
+      ttl: '1h',
+      scope: '',
+    })
+
+    const fullOff = previewSystemBlocks(
+      DEFAULT_PERSONA_TEMPLATES.official_full,
+      applyPersonaEnvVars(
+        { ...vars, env_official: 'ENV', timezone: 'Asia/Tokyo' },
+        isolated,
+        'official_full'
+      )
+    )
+    expect(fullOff.map((block) => block.id)).toEqual([
+      'identity',
+      'agent_official',
+    ])
+    expect(
+      fullOff.find((block) => block.id === 'agent_official')
+    ).toMatchObject({
+      placeholder: false,
+    })
+    expect(fullOff.some((block) => block.id === 'env_official')).toBe(false)
+
+    const selected = previewSystemBlocks(
+      [
+        ...DEFAULT_PERSONA_TEMPLATES.official_full.filter(
+          (block) => block.id !== 'env_official'
+        ),
+        {
+          id: 'env_timezone_only',
+          type: 'text',
+          text: '{{env_timezone_only}}',
+        },
+      ],
+      { ...vars, env_timezone_only: tokyo }
+    )
+    expect(selected[selected.length - 1]?.text).toBe(tokyo)
+    expect(
+      previewSystemBlocks(
+        DEFAULT_PERSONA_TEMPLATES.official,
+        applyPersonaEnvVars({ ...vars, env: tokyo }, isolated, 'official')
+      ).map((block) => block.text)
+    ).toEqual(['ID', tokyo])
+
+    expect(
+      previewSystemBlocks(
+        DEFAULT_PERSONA_TEMPLATES.zero,
+        applyPersonaEnvVars(
+          { ...vars, agent_standing: '', env: tokyo },
+          isolated,
+          'zero'
+        )
+      ).map((block) => block.id)
+    ).toEqual(['identity_slot', 'agent_slot'])
+
+    const literal = previewSystemBlocks(
+      [
+        {
+          id: 'authored',
+          type: 'text',
+          text: '# Environment\n - Timezone: Europe/Paris',
+        },
+      ],
+      applyPersonaEnvVars(
+        { env: 'GENERATED', timezone: 'UTC' },
+        { persona_env_presets: { custom: false } },
+        'custom'
+      )
+    )
+    expect(literal).toHaveLength(1)
+    expect(literal[0].text).toBe('# Environment\n - Timezone: Europe/Paris')
+
+    const mixed = previewSystemBlocks(
+      [
+        {
+          id: 'mix',
+          type: 'text',
+          text: '# Environment\n{{env_official}}',
+          cache_control: { type: 'ephemeral', ttl: '1h' },
+        },
+      ],
+      applyPersonaEnvVars(
+        { env_official: 'ENV' },
+        { persona_env_presets: { custom: false } },
+        'custom'
+      )
+    )
+    expect(mixed).toHaveLength(1)
+    expect(mixed[0]).toMatchObject({
+      text: '# Environment\n',
+      placeholder: false,
+      ttl: '1h',
+    })
+
+    expect(
+      previewSystemBlocks(
+        [
+          {
+            id: 'tz',
+            type: 'text',
+            text: '{{env_timezone_only}}',
+            cache_control: { type: 'ephemeral', ttl: '1h' },
+          },
+          {
+            id: 'timezone-scalar',
+            type: 'text',
+            text: '{{timezone}}',
+          },
+        ],
+        applyPersonaEnvVars(
+          { env_timezone_only: tokyo },
+          { persona_env_presets: { official: false } },
+          'official'
+        )
+      )
+    ).toEqual([])
+
+    expect(
+      previewSystemBlocks(
+        [{ id: 'line', type: 'text', text: 'tz={{timezone}} cwd={{cwd}}' }],
+        applyPersonaEnvVars(
+          { timezone: 'UTC', cwd: '/tmp' },
+          { persona_env_presets: { custom: false } },
+          'custom'
+        )
+      )[0]?.text
+    ).toBe('tz= cwd=/tmp')
+
+    expect(
+      applyPersonaEnvVars(
+        {
+          env: 'E',
+          env_official: 'O',
+          env_timezone_only: 'T',
+          timezone: 'UTC',
+          caller_system: PREVIEW_CALLER_SYSTEM,
+          caller_agent: PREVIEW_CALLER_AGENT,
+        },
+        { persona_env_presets: { official: false } },
+        'official'
+      )
+    ).toMatchObject({
+      env: '',
+      env_official: '',
+      env_timezone_only: '',
+      timezone: '',
+      caller_system: PREVIEW_CALLER_SYSTEM,
+      caller_agent: PREVIEW_CALLER_AGENT,
+    })
+  })
+
+  it('preview keeps builtin 1h cache without scope and retains custom explicit scope', () => {
+    const builtin = previewSystemBlocks(
+      DEFAULT_PERSONA_TEMPLATES.official_full,
+      {
+        ...vars,
+        env_official: 'ENV',
+      }
+    )
+    expect(
+      builtin.find((block) => block.id === 'agent_official')
+    ).toMatchObject({
+      text: 'AGENT',
+      ttl: '1h',
+      scope: '',
+    })
+    const custom = previewSystemBlocks(
+      [
+        {
+          id: 'scoped',
+          type: 'text',
+          text: 'custom-scoped',
+          cache_control: { type: 'ephemeral', ttl: '1h', scope: 'global' },
+        },
+      ],
+      vars
+    )
+    expect(custom).toEqual([
+      {
+        id: 'scoped',
+        text: 'custom-scoped',
+        hide: false,
+        ttl: '1h',
+        scope: 'global',
+        placeholder: false,
+      },
+    ])
+  })
   it('toggle map is removed only when values match the field default', () => {
     const off = setPresetFlag({}, 'persona_env_presets', 'zero', false, {})
     expect(off.persona_env_presets).toEqual({
@@ -183,6 +456,7 @@ describe('agent standing + system preview', () => {
       official_full: true,
       zero: false,
       custom: true,
+      official_303: true,
     })
     const back = setPresetFlag(off, 'persona_env_presets', 'zero', true, {})
     expect('persona_env_presets' in back).toBe(false)
@@ -203,6 +477,7 @@ describe('agent standing + system preview', () => {
       official_full: false,
       zero: false,
       custom: false,
+      official_303: false,
     })
     expect(agentStandingVar(standingOn, 'official')).toBe(
       `${DEFAULT_AGENT_STANDING}\n`
@@ -229,6 +504,7 @@ describe('agent standing + system preview', () => {
       official_full: false,
       zero: false,
       custom: false,
+      official_303: false,
     })
   })
 
@@ -252,5 +528,39 @@ describe('agent standing + system preview', () => {
     expect(
       'persona_hide_presets' in setPersonaHide(off, 'zero', true, zero, {})
     ).toBe(false)
+  })
+})
+
+describe('legacy global cache scope', () => {
+  const legacy = { type: 'ephemeral', ttl: '1h', scope: 'global' }
+  it('preview drops the old default scope from saved built-in agent blocks only', () => {
+    const saved = DEFAULT_PERSONA_TEMPLATES.official_full.map((block) =>
+      block.id === 'agent_official'
+        ? { ...block, cache_control: legacy }
+        : { ...block }
+    )
+    const blocks = previewSystemBlocks(
+      dropLegacyAutoScope('official_full', saved),
+      { agent_official: 'AGENT', env_official: 'ENV' }
+    )
+    expect(blocks.some((block) => block.scope)).toBe(false)
+    expect(blocks.find((block) => block.id === 'agent_official')?.ttl).toBe(
+      '1h'
+    )
+  })
+  it('keeps custom presets and other explicit scopes', () => {
+    const custom = [
+      { id: 'agent', type: 'text', text: 'x', cache_control: legacy },
+    ]
+    expect(dropLegacyAutoScope('custom', custom)).toEqual(custom)
+    const explicit = [
+      {
+        id: 'agent_official',
+        type: 'text',
+        text: 'x',
+        cache_control: { type: 'ephemeral', ttl: '5m', scope: 'global' },
+      },
+    ]
+    expect(dropLegacyAutoScope('official_full', explicit)).toEqual(explicit)
   })
 })

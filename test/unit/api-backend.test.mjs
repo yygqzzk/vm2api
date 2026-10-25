@@ -10,7 +10,15 @@ import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import { CRS_OFFICIAL_AGENT_PROMPT } from '../../src/lib/identity/crs-persona.mjs'
 import { sessionIdFromOutboundBody } from '../../src/lib/identity/identity-rewrite.mjs'
 import { DEFAULT_AGENT_STANDING } from '../../src/lib/identity/persona-template.mjs'
-import { resolveInferenceBackend, messagesUrl, runApiInference } from '../../src/lib/pool/api-protocol.mjs'
+import {
+  isOpenAIResponsesCommitEvent,
+  resolveInferenceBackend,
+  messagesUrl,
+  runApiInference,
+} from '../../src/lib/pool/api-protocol.mjs'
+import { createClaudeMessageAssembler, applyClaudeSSELineToMessage } from '../../src/lib/protocol/convert.mjs'
+
+const unixTest = process.platform === 'win32' ? test.skip : test
 
 function fakeResponse() {
   return { headersSent: false, on() {}, once() {}, off() {}, write() {}, end() {} }
@@ -23,6 +31,14 @@ function messageStart() {
   })}\n\n`
 }
 
+function messageStop() {
+  return `data: ${JSON.stringify({ type: 'message_stop' })}\n\n`
+}
+
+function completeAnthropicSse(extraEvents = '') {
+  return messageStart() + extraEvents + messageStop()
+}
+
 test('only a managed key explicitly marked api uses the Anthropic address path', () => {
   assert.equal(resolveInferenceBackend({ apiKeyKind: 'managed', apiKeyRecord: { category: 'api' } }), 'api')
   assert.equal(resolveInferenceBackend({ apiKeyKind: 'managed', apiKeyRecord: { category: ' API ' } }), 'api')
@@ -31,6 +47,55 @@ test('only a managed key explicitly marked api uses the Anthropic address path',
   assert.equal(resolveInferenceBackend({ apiKeyKind: 'master', headers: { 'x-kin-backend': 'api' } }), 'oauth')
   assert.equal(resolveInferenceBackend({ apiKeyKind: 'master', apiKeyRecord: { category: 'api' } }), 'oauth')
   assert.equal(resolveInferenceBackend({ headers: { 'x-kin-backend': 'api' } }), 'oauth')
+})
+
+test('tenant api-category keys cannot reach platform API endpoints', async () => {
+  const response = fakeResponse()
+  let picked = 0
+  const handler = createHandleProtocol({
+    json: (_res, status, body) => {
+      response.status = status
+      response.body = body
+      return body
+    },
+    writeSSEHeaders() {},
+    readBody: async () => ({ model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hello' }] }),
+    requireAuth: () => true,
+    cfg: {
+      rewrite: { enabled: false },
+      intercept: { rules: [] },
+      distill: { enabled: false },
+      limits: { max_body_bytes: 1024 * 1024, upstream_timeout_ms: 2000 },
+      paths: { data: os.tmpdir() },
+    },
+    requestLog: { start: () => ({ request_id: 'api-tenant-test' }), finish() {} },
+    stickyRouter: {},
+    accountQuota: {},
+    apiKeyStore: { acquire: () => ({ ok: true }), release() {}, users: { getById: () => ({ role: 'user' }) } },
+    apiScheduler: {
+      pick: () => {
+        picked += 1
+        return { ok: false }
+      },
+    },
+    apiEndpointStore: {},
+    stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },
+    routingConfig: { failover: {} },
+    groupsRepo: { rateMultiplier: () => 1 },
+  })
+  const req = {
+    method: 'POST',
+    url: '/v1/messages',
+    headers: { authorization: 'Bearer sk-vm-tenant', 'user-agent': 'test-client' },
+    apiKeyKind: 'managed',
+    apiKeyRecord: { category: 'api', user_id: 'u1' },
+    once() {},
+    off() {},
+  }
+  await handler.handleProtocol(req, response, 'anthropic.messages', '/v1/messages')
+  assert.equal(response.status, 403)
+  assert.equal(response.body.error.code, 'api_backend_forbidden')
+  assert.equal(picked, 0)
 })
 
 test('messagesUrl appends /v1/messages?beta=true', () => {
@@ -60,7 +125,7 @@ test('API backend applies the global official_full persona setting', async () =>
     req.on('end', () => {
       received = JSON.parse(Buffer.concat(chunks).toString('utf8'))
       res.writeHead(200, { 'content-type': 'text/event-stream' })
-      res.end(messageStart())
+      res.end(completeAnthropicSse())
     })
   })
   await new Promise((resolve, reject) => {
@@ -124,8 +189,10 @@ test('API backend applies the global official_full persona setting', async () =>
     assert.equal(response.status, 200)
     assert.ok(received)
     const outbound = JSON.parse(received.body)
-    assert.equal(outbound.system.length, 4)
-    assert.equal(outbound.system[2].text, `${DEFAULT_AGENT_STANDING}\n${CRS_OFFICIAL_AGENT_PROMPT}`)
+    assert.equal(outbound.system.length, 5)
+    assert.ok(
+      outbound.system.some((block) => String(block.text || '').includes(CRS_OFFICIAL_AGENT_PROMPT.slice(0, 80))),
+    )
   } finally {
     await new Promise((resolve) => kernel.close(resolve))
     fs.rmSync(root, { recursive: true, force: true })
@@ -211,8 +278,8 @@ test('OAuth cli-hop applies the resolved Protocol custom persona template', asyn
     await handler.handleProtocol(req, response, 'anthropic.messages', '/v1/messages')
     assert.equal(response.status, 503)
     assert.ok(prepared?.body)
-    assert.equal(prepared.body.system.length, 1)
-    assert.equal(prepared.body.system[0].text, 'CUSTOM_PERSONA UTC')
+    assert.equal(prepared.body.system.length, 3)
+    assert.ok(prepared.body.system.some((block) => String(block.text || '').includes('CUSTOM_PERSONA UTC')))
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
@@ -516,6 +583,31 @@ test('a managed key is charged exactly once for a hop billed inline', async () =
     assert.equal(charges.length, 1)
     assert.equal(charges[0].opts.rateMultiplier, 2)
     assert.equal(charges[0].opts.officialCost, logged[0].total_cost)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('native mixed TTL usage is billed from upstream buckets rather than the panel default', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-key-mixed-cache-'))
+  try {
+    const usage = {
+      input_tokens: 1000,
+      output_tokens: 200,
+      cache_creation_input_tokens: 400,
+      cache_creation: { ephemeral_5m_input_tokens: 100, ephemeral_1h_input_tokens: 300 },
+    }
+    const { charges, logged } = await runManagedKeyHop(root, {
+      ok: false,
+      status: 503,
+      accountId: 'account-1',
+      usage,
+      body: { error: { type: 'server_error', code: 'x', message: 'stop' } },
+    })
+    assert.deepEqual(logged[0].usage.cache_creation, usage.cache_creation)
+    assert.deepEqual(charges[0].usage.cache_creation, usage.cache_creation)
+    // Haiku 4.5 writes: 100 × $1.25/M + 300 × $2/M, not 400 × $2/M.
+    assert.ok(Math.abs(logged[0].cache_creation_cost - 0.000725) < 1e-12)
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
@@ -1120,6 +1212,219 @@ test('Responses API backend keeps parallel done-only tools in one stream state',
   }
 })
 
+test('API Anthropic non-stream rejects message_start without message_stop', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-api-incomplete-'))
+  const socket = path.join(root, 'run', 'api-kernel.sock')
+  fs.mkdirSync(path.dirname(socket), { recursive: true })
+  const kernel = http.createServer((req, res) => {
+    req.resume()
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.end(messageStart())
+    })
+  })
+  await new Promise((resolve) => kernel.listen(socket, resolve))
+  try {
+    const result = await runApiInference({
+      cfg: { paths: { data: root } },
+      res: { headersSent: false, write: () => {} },
+      protocol: 'anthropic.messages',
+      clientStream: false,
+      deliveryMode: 'verified',
+      convertedBody: { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] },
+      inbound: {},
+      converters: { createClaudeMessageAssembler, applyClaudeSSELineToMessage },
+      scheduler: {
+        pick: () => ({
+          ok: true,
+          endpoint: { id: 'ep', kind: 'claude', protocol: 'anthropic', base_url: 'https://fixture.invalid' },
+          key: { id: 'key', api_key: 'fixture' },
+          upstream_model: 'claude-haiku-4-5',
+        }),
+      },
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.terminalState, 'incomplete')
+    assert.equal(result.sawMessageStop, false)
+    assert.equal(result.body?.type, 'message')
+  } finally {
+    kernel.closeAllConnections()
+    await new Promise((resolve) => kernel.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('API Anthropic non-stream rejects stop_reason and text without message_stop', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-api-delta-no-stop-'))
+  const socket = path.join(root, 'run', 'api-kernel.sock')
+  fs.mkdirSync(path.dirname(socket), { recursive: true })
+  const kernel = http.createServer((req, res) => {
+    req.resume()
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      const events = [
+        {
+          type: 'message_start',
+          message: { type: 'message', role: 'assistant', content: [], model: 'claude-haiku-4-5' },
+        },
+        { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+        { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'hello' } },
+        { type: 'content_block_stop', index: 0 },
+        {
+          type: 'message_delta',
+          delta: { stop_reason: 'end_turn', stop_sequence: null },
+          usage: { output_tokens: 1 },
+        },
+      ]
+      res.end(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''))
+    })
+  })
+  await new Promise((resolve) => kernel.listen(socket, resolve))
+  try {
+    const result = await runApiInference({
+      cfg: { paths: { data: root } },
+      res: { headersSent: false, write: () => {} },
+      protocol: 'anthropic.messages',
+      clientStream: false,
+      deliveryMode: 'verified',
+      convertedBody: { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] },
+      inbound: {},
+      converters: { createClaudeMessageAssembler, applyClaudeSSELineToMessage },
+      scheduler: {
+        pick: () => ({
+          ok: true,
+          endpoint: { id: 'ep', kind: 'claude', protocol: 'anthropic', base_url: 'https://fixture.invalid' },
+          key: { id: 'key', api_key: 'fixture' },
+          upstream_model: 'claude-haiku-4-5',
+        }),
+      },
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.terminalState, 'incomplete')
+    assert.equal(result.sawMessageStop, false)
+    assert.equal(result.body?.content?.[0]?.text, 'hello')
+  } finally {
+    kernel.closeAllConnections()
+    await new Promise((resolve) => kernel.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('API Anthropic non-stream accepts message_stop as terminal', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-api-complete-'))
+  const socket = path.join(root, 'run', 'api-kernel.sock')
+  fs.mkdirSync(path.dirname(socket), { recursive: true })
+  const kernel = http.createServer((req, res) => {
+    req.resume()
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.end(completeAnthropicSse())
+    })
+  })
+  await new Promise((resolve) => kernel.listen(socket, resolve))
+  try {
+    const result = await runApiInference({
+      cfg: { paths: { data: root } },
+      res: { headersSent: false, write: () => {} },
+      protocol: 'anthropic.messages',
+      clientStream: false,
+      deliveryMode: 'verified',
+      convertedBody: { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] },
+      inbound: {},
+      converters: { createClaudeMessageAssembler, applyClaudeSSELineToMessage },
+      scheduler: {
+        pick: () => ({
+          ok: true,
+          endpoint: { id: 'ep', kind: 'claude', protocol: 'anthropic', base_url: 'https://fixture.invalid' },
+          key: { id: 'key', api_key: 'fixture' },
+          upstream_model: 'claude-haiku-4-5',
+        }),
+      },
+    })
+    assert.equal(result.ok, true)
+    assert.equal(result.terminalState, 'verified')
+    assert.equal(result.sawMessageStop, true)
+    assert.equal(result.body?.type, 'message')
+  } finally {
+    kernel.closeAllConnections()
+    await new Promise((resolve) => kernel.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('API backend non-stream maps incomplete assistant hops to incomplete_response', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-api-incomplete-http-'))
+  const routingFile = path.join(root, 'routing.json')
+  const socketPath = path.join(root, 'run', 'api-kernel.sock')
+  fs.mkdirSync(path.dirname(socketPath), { recursive: true })
+  fs.writeFileSync(routingFile, JSON.stringify({ compatibility: { persona_preset: 'zero' } }))
+  const kernel = http.createServer((req, res) => {
+    req.resume()
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.end(messageStart())
+    })
+  })
+  await new Promise((resolve) => kernel.listen(socketPath, resolve))
+  const response = fakeResponse()
+  const handler = createHandleProtocol({
+    json: (_res, status, body) => {
+      response.status = status
+      response.body = body
+      return body
+    },
+    writeSSEHeaders() {},
+    readBody: async () => ({
+      model: 'claude-haiku-4-5',
+      stream: false,
+      max_tokens: 32,
+      messages: [{ role: 'user', content: 'hello' }],
+    }),
+    requireAuth: () => true,
+    cfg: {
+      rewrite: { enabled: false },
+      intercept: { rules: [] },
+      distill: { enabled: false },
+      limits: { max_body_bytes: 1024 * 1024, upstream_timeout_ms: 2000 },
+      paths: { data: root },
+    },
+    requestLog: { start: () => ({ request_id: 'api-incomplete-test' }), finish() {} },
+    stickyRouter: {},
+    accountQuota: {},
+    apiKeyStore: { acquire: () => ({ ok: true }), release() {} },
+    apiScheduler: {
+      pick: () => ({
+        ok: true,
+        endpoint: { id: 'ep-test', kind: 'claude', protocol: 'anthropic', base_url: 'https://upstream.invalid' },
+        upstream_model: 'claude-haiku-4-5',
+        key: { id: 'key-test', api_key: 'secret' },
+      }),
+    },
+    apiEndpointStore: {},
+    stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },
+    routingConfigPath: routingFile,
+    routingConfig: { compatibility: { persona_preset: 'zero' }, failover: {} },
+    groupsRepo: { rateMultiplier: () => 1 },
+  })
+  const req = {
+    method: 'POST',
+    url: '/v1/messages',
+    headers: { authorization: 'Bearer sk-vm-api', 'user-agent': 'test-client' },
+    apiKeyKind: 'managed',
+    apiKeyRecord: { category: 'api' },
+    once() {},
+    off() {},
+  }
+  try {
+    await handler.handleProtocol(req, response, 'anthropic.messages', '/v1/messages')
+    assert.equal(response.status, 502)
+    assert.equal(response.body.error.code, 'incomplete_response')
+  } finally {
+    await new Promise((resolve) => kernel.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('Responses API backend returns 502 for conflicting tool arguments when the client is not streaming', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-api-tools-ns-'))
   const socket = path.join(root, 'run', 'api-kernel.sock')
@@ -1169,4 +1474,106 @@ test('Responses API backend returns 502 for conflicting tool arguments when the 
     await new Promise((resolve) => kernel.close(resolve))
     fs.rmSync(root, { recursive: true, force: true })
   }
+})
+test('OpenAI Responses lifecycle metadata does not commit downstream output', () => {
+  for (const type of [
+    'response.created',
+    'response.queued',
+    'response.in_progress',
+    'response.metadata',
+    'keepalive',
+  ]) {
+    assert.equal(isOpenAIResponsesCommitEvent({ type }), false, type)
+  }
+  assert.equal(isOpenAIResponsesCommitEvent({ type: 'error', error: { code: 'server_is_overloaded' } }), false)
+  assert.equal(isOpenAIResponsesCommitEvent({ type: 'response.failed' }), false)
+  assert.equal(
+    isOpenAIResponsesCommitEvent({ type: 'response.output_item.added', item: { type: 'reasoning', summary: [] } }),
+    false,
+  )
+  assert.equal(isOpenAIResponsesCommitEvent({ type: 'response.output_text.delta', delta: 'hello' }), true)
+})
+
+async function runOpenAIResponsesFixture(events) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-openai-metadata-'))
+  const socket = path.join(root, 'run', 'api-kernel.sock')
+  fs.mkdirSync(path.dirname(socket), { recursive: true })
+  const kernel = http.createServer((req, response) => {
+    req.resume()
+    req.on('end', () => {
+      response.writeHead(200, { 'content-type': 'text/event-stream' })
+      response.end(events.map((event) => 'data: ' + JSON.stringify(event) + '\n\n').join('') + 'data: [DONE]\n\n')
+    })
+  })
+  await new Promise((resolve) => kernel.listen(socket, resolve))
+  let wire = ''
+  const res = {
+    headersSent: false,
+    write(chunk) {
+      wire += chunk
+    },
+  }
+  try {
+    const result = await runApiInference({
+      cfg: { paths: { data: root } },
+      res,
+      protocol: 'openai.responses',
+      clientStream: true,
+      deliveryMode: 'verified',
+      convertedBody: { model: 'gpt-5.4', messages: [{ role: 'user', content: 'hello' }] },
+      inbound: {},
+      converters: {
+        writeSSEHeaders: () => {
+          res.headersSent = true
+        },
+      },
+      scheduler: {
+        pick: () => ({
+          ok: true,
+          endpoint: { id: 'ep', kind: 'openai', protocol: 'openai', base_url: 'https://fixture.invalid' },
+          key: { id: 'key', api_key: 'fixture' },
+          upstream_model: 'gpt-5.4',
+        }),
+      },
+    })
+    return { result, wire, headersSent: res.headersSent }
+  } finally {
+    kernel.closeAllConnections()
+    await new Promise((resolve) => kernel.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+}
+
+unixTest('API OpenAI metadata followed by overload remains uncommitted for failover', async () => {
+  const run = await runOpenAIResponsesFixture([
+    { type: 'response.created', response: { id: 'resp_meta' } },
+    { type: 'response.queued', response: { id: 'resp_meta' } },
+    { type: 'response.metadata', response: { id: 'resp_meta' } },
+    { type: 'error', error: { type: 'server_error', code: 'server_is_overloaded', status: 503, message: 'busy' } },
+    {
+      type: 'response.failed',
+      response: { error: { type: 'server_error', code: 'server_is_overloaded', status: 503, message: 'busy' } },
+    },
+  ])
+  assert.equal(run.result.ok, false)
+  assert.equal(run.result.status, 503)
+  assert.equal(run.result.committed, false)
+  assert.equal(run.headersSent, false)
+  assert.equal(run.wire, '')
+})
+
+unixTest('API OpenAI flushes buffered metadata with the first real output', async () => {
+  const run = await runOpenAIResponsesFixture([
+    { type: 'response.created', response: { id: 'resp_ok' } },
+    { type: 'response.queued', response: { id: 'resp_ok' } },
+    { type: 'response.output_text.delta', delta: 'hello' },
+    { type: 'response.completed', response: { id: 'resp_ok', output: [] } },
+  ])
+  assert.equal(run.result.ok, true)
+  assert.equal(run.result.committed, true)
+  assert.equal(run.result.terminalState, 'verified')
+  assert.match(run.wire, /response\.created/)
+  assert.match(run.wire, /response\.queued/)
+  assert.match(run.wire, /response\.output_text\.delta/)
+  assert.match(run.wire, /response\.completed/)
 })

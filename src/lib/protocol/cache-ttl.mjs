@@ -81,6 +81,48 @@ export function resolveCacheTtl({ headers = {}, body, routing, routingFile } = {
   return cacheTtlFromRoutingFile(routingFile)
 }
 
+/** Native passthrough validates caller markers; it never repairs their budget or TTL. */
+export function validateCacheBreakpoints(body) {
+  let count = 0
+  let short = false
+  const invalid = (message) => {
+    const error = new Error(message)
+    error.status = 400
+    error.body = { type: 'error', error: { type: 'invalid_request_error', code: 'invalid_cache_control', message } }
+    throw error
+  }
+  const check = (node) => {
+    const control = node?.cache_control
+    if (control == null) return
+    if (node.type === 'thinking' || node.type === 'redacted_thinking') {
+      invalid('Cache breakpoints are not allowed on thinking blocks.')
+    }
+    if (control.type !== 'ephemeral' || (control.ttl != null && !['5m', '1h'].includes(control.ttl))) {
+      invalid('Cache control must be ephemeral with an optional 5m or 1h TTL.')
+    }
+    if (short && control.ttl === '1h') invalid('Cache TTL must place 1h before 5m (including missing TTL).')
+    if (control.ttl !== '1h') short = true
+    if (++count > 4) invalid('Cache control exceeds four breakpoints.')
+  }
+  for (const tool of body?.tools || []) check(tool)
+  for (const block of Array.isArray(body?.system) ? body.system : []) check(block)
+  for (const message of body?.messages || []) {
+    if (Array.isArray(message?.content)) for (const block of message.content) check(block)
+  }
+  // Automatic caching applies at the message tail, after explicit block markers.
+  check(body)
+}
+
+/** Only call for a rewritten native body: every surviving marker is Node-owned. */
+export function fillMissingCacheTtl(body, ttl = DEFAULT_CACHE_TTL) {
+  const target = normalizeCacheTtl(ttl)
+  return walkCacheNodes(body, (node) => {
+    const control = node?.cache_control
+    if (!control || control.type !== 'ephemeral' || control.ttl != null) return node
+    return { ...node, cache_control: { ...control, ttl: target } }
+  })
+}
+
 const CACHE_TTL_MS = Object.freeze({ '5m': 5 * 60_000, '1h': 60 * 60_000 })
 const CONVERSATION_TTL_LIMIT = 10_000
 const conversationTtls = new Map()
@@ -167,7 +209,7 @@ export function stripIllegalCacheControlFields(body) {
   return out
 }
 /** Drop caller cache_control so Node can restamp last + penultimate user. */
-export function removeCacheControlFields(body, { keepSystem = false } = {}) {
+export function removeCacheControlFields(body) {
   if (!body || typeof body !== 'object') return body
   const out = { ...body }
   delete out.cache_control
@@ -178,7 +220,7 @@ export function removeCacheControlFields(body, { keepSystem = false } = {}) {
     return next
   }
   if (Array.isArray(out.tools)) out.tools = out.tools.map(clearNode)
-  if (!keepSystem && Array.isArray(out.system)) out.system = out.system.map(clearNode)
+  if (Array.isArray(out.system)) out.system = out.system.map(clearNode)
   if (Array.isArray(out.messages)) {
     out.messages = out.messages.map((message) => {
       if (!Array.isArray(message?.content)) return message
@@ -559,10 +601,11 @@ function dropMessageBreakpoints(messages) {
 function stampMessageTail(messages, idx, ttl) {
   const message = messages[idx]
   if (!message || typeof message !== 'object') return messages
+  const marker = ttl == null ? { type: 'ephemeral' } : { type: 'ephemeral', ttl }
   const content = message.content
   if (typeof content === 'string') {
     const next = messages.slice()
-    next[idx] = { ...message, content: [{ type: 'text', text: content, cache_control: { type: 'ephemeral', ttl } }] }
+    next[idx] = { ...message, content: [{ type: 'text', text: content, cache_control: marker }] }
     return next
   }
   if (!Array.isArray(content) || content.length === 0) return messages
@@ -573,7 +616,7 @@ function stampMessageTail(messages, idx, ttl) {
     break
   }
   if (target < 0) return messages
-  const stamped = stampNode(content[target], ttl)
+  const stamped = ttl == null ? { ...content[target], cache_control: marker } : stampNode(content[target], ttl)
   if (stamped === content[target]) return messages
   const nextContent = content.slice()
   nextContent[target] = stamped
@@ -713,8 +756,8 @@ export function applyCacheTtlToUsage(usage, ttl = DEFAULT_CACHE_TTL) {
   const five = n(out.cache_creation_5m_tokens ?? out.cache_creation?.ephemeral_5m_input_tokens)
   const hour = n(out.cache_creation_1h_tokens ?? out.cache_creation?.ephemeral_1h_input_tokens)
   const create = n(out.cache_creation_input_tokens ?? out.cache_creation_tokens)
-  let total = five + hour
-  if (!total && create) total = create
+  // message_delta can raise the total without resending the message_start split.
+  const total = Math.max(five + hour, create)
   if (!total) return out
   if (target === '1h') {
     out.cache_creation_1h_tokens = total

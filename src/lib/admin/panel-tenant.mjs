@@ -1,7 +1,7 @@
 import { getVm } from '../vm/vm-registry.mjs'
 import { makeError, ErrorType, ErrorCode } from '../core/errors.mjs'
 import { panelIdentity } from './panel-acl.mjs'
-import { canUserDeleteVm, normalizeOwnerId, proxyOwnerId, vmOwnerId } from './resource-owner.mjs'
+import { normalizeOwnerId, proxyOwnerId, vmOwnerId } from './resource-owner.mjs'
 
 const VM_COLLECTION = new Set([
   'create',
@@ -21,13 +21,17 @@ export function panelVmIdFromPath(path) {
   return id
 }
 
+/** Tenant (role=user) asking for a slot it does not own; missing and foreign look the same. */
+export function userMissesVmId(req, projectRoot, id) {
+  if (panelIdentity(req).role !== 'user') return false
+  const vm = id ? getVm(projectRoot, String(id)) : null
+  return !vm || vmOwnerId(vm) !== normalizeOwnerId(req.panelUserId)
+}
+
 export function denyIfUserMissesVm(req, res, { projectRoot, json, path }) {
-  const ident = panelIdentity(req)
-  if (ident.role !== 'user') return false
   const id = panelVmIdFromPath(path)
   if (!id) return false
-  const vm = getVm(projectRoot, id)
-  if (!vm || vmOwnerId(vm) !== normalizeOwnerId(req.panelUserId)) {
+  if (userMissesVmId(req, projectRoot, id)) {
     json(
       res,
       404,
@@ -46,7 +50,7 @@ export function denyIfUserMissesVm(req, res, { projectRoot, json, path }) {
 export function denyIfUserCannotDeleteVm(req, res, vm, json) {
   const ident = panelIdentity(req)
   if (ident.role === 'admin') return false
-  if (ident.role === 'user' && canUserDeleteVm(vm, req.panelUserId)) return false
+  void vm
   json(
     res,
     403,

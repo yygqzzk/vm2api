@@ -4,11 +4,14 @@ import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 import { promisify } from 'node:util'
 import { slotContainerName } from '../transport/rust-kernel-supervisor.mjs'
+import { isMissingContainerMessage, logTelemetryContainerSkip, telemetryContainerSkip } from './docker-container.mjs'
+import { inspectContainerOutcome } from './vm-runtime.mjs'
 import { slotHost } from './slot-host.mjs'
 import { runtimeKind } from './runtime-kind.mjs'
 import { slotExecArgv } from './slot-exec.mjs'
 
 const exec = promisify(execFile)
+export const SLOT_WORKER_BIN = '/usr/local/bin/kin-worker'
 const PROBE = String.raw`
 set -eu
 main=$(tr '\000' '\n' < /proc/1/cmdline | sed -n '1p')
@@ -48,8 +51,10 @@ export async function readSlotProcessStatus({ projectRoot, vm, run = exec, timeo
   }
   const kind = runtimeKind(vm)
   if (kind !== 'docker' && kind !== 'kvm') return { ...unknown, telemetry: { enabled, running: null } }
+  const host = slotHost(vm)
+  if (host.native) return { ...unknown, telemetry: { enabled, running: await host.telemetryRunning(vm) } }
   try {
-    const env = slotHost(vm).dockerEnv()
+    const env = host.dockerEnv()
     const target = { ...vm, runtime: { ...(vm.runtime || {}), container: slotContainerName({ vm }), type: kind } }
     const { stdout } = await run('docker', slotExecArgv(target, ['sh', '-c', PROBE]), {
       timeout: timeoutMs,
@@ -80,13 +85,20 @@ export async function ensureTelemetrySidecar({ projectRoot, vm, run = exec, time
   if (status.telemetry.enabled !== true || status.telemetry.running !== false) {
     return { ok: true, action: 'unchanged' }
   }
+  const host = slotHost(vm)
+  if (host.native) {
+    const restarted = await host.restartTelemetry(vm, { enabled: true })
+    return restarted.ok
+      ? { ok: true, action: 'started' }
+      : { ok: false, action: 'start_failed', error: restarted.error }
+  }
   try {
     const env = slotHost(vm).dockerEnv()
     const kind = runtimeKind(vm)
     const target = { ...vm, runtime: { ...(vm.runtime || {}), container: slotContainerName({ vm }), type: kind } }
     await run(
       'docker',
-      slotExecArgv(target, ['/usr/local/bin/kin-worker', 'telemetry', '--config', '/run/kin/worker.json'], {
+      slotExecArgv(target, [SLOT_WORKER_BIN, 'telemetry', '--config', '/run/kin/worker.json'], {
         detach: true,
       }),
       { timeout: timeoutMs, maxBuffer: 4096, encoding: 'utf8', ...(env ? { env } : {}) },
@@ -94,5 +106,65 @@ export async function ensureTelemetrySidecar({ projectRoot, vm, run = exec, time
     return { ok: true, action: 'started' }
   } catch (error) {
     return { ok: false, action: 'start_failed', error: String(error?.message || error) }
+  }
+}
+
+/** Replace only the Go telemetry child; the slot container and Rust process stay up. */
+export async function restartTelemetrySidecar({
+  projectRoot,
+  vm,
+  enabled,
+  run = exec,
+  timeoutMs = 15_000,
+  inspectContainerOutcome: inspectOutcome = inspectContainerOutcome,
+} = {}) {
+  if (!projectRoot || !isSafeSlotId(vm?.id)) return { ok: false, action: 'invalid_vm' }
+  const kind = runtimeKind(vm)
+  if (kind !== 'docker' && kind !== 'kvm') return { ok: false, action: 'unsupported_runtime' }
+  const host = slotHost(vm)
+  if (host.native) return host.restartTelemetry(vm, { enabled })
+  const env = host.dockerEnv()
+  const container = slotContainerName({ vm })
+  const target = { ...vm, runtime: { ...(vm.runtime || {}), container, type: kind } }
+  const inspected = inspectOutcome(container)
+  if (inspected.status === 'missing') {
+    logTelemetryContainerSkip('fleet', vm.id, container)
+    return telemetryContainerSkip(container)
+  }
+  if (inspected.status === 'error') {
+    return {
+      ok: false,
+      action: 'inspect_failed',
+      code: 'docker_inspect_failed',
+      error: inspected.error,
+    }
+  }
+  const stop = 'pkill -TERM -x kin-worker 2>/dev/null || true'
+  try {
+    await run('docker', slotExecArgv(target, ['sh', '-c', stop]), {
+      timeout: timeoutMs,
+      maxBuffer: 4096,
+      encoding: 'utf8',
+      ...(env ? { env } : {}),
+    })
+    if (enabled !== true) return { ok: true, action: 'stopped' }
+    await run(
+      'docker',
+      slotExecArgv(target, [SLOT_WORKER_BIN, 'telemetry', '--config', '/run/kin/worker.json'], { detach: true }),
+      {
+        timeout: timeoutMs,
+        maxBuffer: 4096,
+        encoding: 'utf8',
+        ...(env ? { env } : {}),
+      },
+    )
+    return { ok: true, action: 'restarted' }
+  } catch (error) {
+    const message = String(error?.message || error)
+    if (isMissingContainerMessage(message)) {
+      logTelemetryContainerSkip('fleet', vm.id, container, message)
+      return telemetryContainerSkip(container, message)
+    }
+    return { ok: false, action: 'restart_failed', error: message }
   }
 }

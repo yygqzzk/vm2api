@@ -18,8 +18,12 @@ import {
   pricingQueryOptions,
 } from '@/features/models/queries'
 import { EntryStrip } from './entry-strip'
+import { ImageToolSection } from './image-tool-section'
 import { ModelAdvanced } from './model-advanced'
+import { mappingTargets } from './model-mapping'
+import { ModelMappingCard } from './model-mapping-card'
 import { ModelRow } from './model-row'
+import { resetConfirmText, syncConfirmText } from './page-messages'
 import {
   type BetaFilter,
   type CatalogMode,
@@ -214,6 +218,14 @@ export function ModelsPage() {
     setExpanded((cur) => (cur === id ? null : id))
   }
 
+  function setImageTool(id: string, on: boolean) {
+    setDraft((prev) => {
+      const next = cloneJson(prev)
+      next.image_tools = { ...(next.image_tools || {}), [id]: { enabled: on } }
+      return next
+    })
+  }
+
   function setPass1m(id: string, mode: Pass1mMode) {
     patchModel(id, (rec) => applyPassContext1m(rec, mode))
   }
@@ -250,6 +262,10 @@ export function ModelsPage() {
   }
 
   const claudePool = catalogPlatform === 'anthropic'
+  const imageTools = q.data?.image_tools || []
+  // Mapping targets follow the saved policy: the server validates against it.
+  const gptTargets = claudePool ? [] : mappingTargets(q.data?.models || [])
+  const imageIds = imageTools.flatMap((m) => [m.id, ...m.snapshots])
   const poolHint = claudePool
     ? 'Claude 号池。同一会话只占一个 VM session 窗口，不和 GPT 混调度。'
     : 'GPT 号池。粘性独立，不占用 Claude 原生 session 槽。'
@@ -266,7 +282,11 @@ export function ModelsPage() {
               <Button
                 variant='outline'
                 className='cursor-pointer'
-                onClick={() => sync.mutate()}
+                onClick={() => {
+                  const ask = syncConfirmText(dirty, ' Worker ')
+                  if (ask && !window.confirm(ask)) return
+                  sync.mutate()
+                }}
                 disabled={sync.isPending}
               >
                 {sync.isPending ? '同步中…' : '同步 Worker'}
@@ -275,7 +295,11 @@ export function ModelsPage() {
               <Button
                 variant='outline'
                 className='cursor-pointer'
-                onClick={() => syncGpt.mutate()}
+                onClick={() => {
+                  const ask = syncConfirmText(dirty, ' GPT ')
+                  if (ask && !window.confirm(ask)) return
+                  syncGpt.mutate()
+                }}
                 disabled={syncGpt.isPending}
               >
                 {syncGpt.isPending ? '同步中…' : '同步 GPT'}
@@ -285,14 +309,7 @@ export function ModelsPage() {
               variant='outline'
               className='cursor-pointer'
               onClick={() => {
-                if (
-                  dirty &&
-                  !window.confirm(
-                    '恢复官方默认模型矩阵？自定义开关与参数将丢失。'
-                  )
-                ) {
-                  return
-                }
+                if (!window.confirm(resetConfirmText(dirty))) return
                 reset.mutate()
               }}
               disabled={reset.isPending}
@@ -399,6 +416,10 @@ export function ModelsPage() {
                   </div>
                 </div>
               </section>
+
+              {claudePool ? null : (
+                <ModelMappingCard targets={gptTargets} imageIds={imageIds} />
+              )}
 
               {dirty ? (
                 <p
@@ -520,7 +541,7 @@ export function ModelsPage() {
                       pol={draft}
                       pricing={pricingQ.data?.policy?.[m.id]}
                       open={expanded === m.id}
-                      showBeta={claudePool}
+                      platform={catalogPlatform}
                       onToggleOpen={() => requestExpand(m.id)}
                       onToggleEnabled={(on) =>
                         patchModel(m.id, (rec) => {
@@ -535,12 +556,20 @@ export function ModelsPage() {
                 </div>
               )}
 
-              <ModelAdvanced
-                pol={draft}
-                claudePool={claudePool}
-                onCatalogMode={setCatalog}
-                onDefaults={patchDefaults}
-              />
+              {claudePool ? (
+                <ModelAdvanced
+                  pol={draft}
+                  onCatalogMode={setCatalog}
+                  onDefaults={patchDefaults}
+                />
+              ) : (
+                <ImageToolSection
+                  models={imageTools}
+                  enabled={draft.image_tools}
+                  pricing={pricingQ.data?.policy}
+                  onToggle={setImageTool}
+                />
+              )}
             </div>
           </QueryGate>
         </TabsContent>

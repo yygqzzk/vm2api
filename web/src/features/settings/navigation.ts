@@ -2,11 +2,11 @@ import {
   Activity,
   Archive,
   BellRing,
+  Bot,
   Fingerprint,
   Gauge,
   Info,
   Layers,
-  ListChecks,
   Magnet,
   Network,
   PackageCheck,
@@ -19,9 +19,9 @@ export const SETTINGS_TABS = [
   ['sticky', '粘性'],
   ['pool', '账号池'],
   ['quota', '配额'],
+  ['openai', 'OpenAI'],
   ['logs', '日志'],
   ['protocol', '协议'],
-  ['whitelist', '白名单'],
   ['init', '初装'],
   ['health', '探测'],
   ['notify', '通知'],
@@ -35,7 +35,7 @@ export type SettingsTabId = (typeof SETTINGS_TABS)[number][0]
 
 /**
  * 设置页左侧分组导航。id 必须来自 SETTINGS_TABS（类型层面约束），
- * 分组只改呈现顺序，不改路由与合法 tab 集合。
+ * 分组只改呈现顺序，不改路由与合法 tab 集合。每个 tab 只出现一次。
  */
 export const SETTINGS_NAV_GROUPS: {
   label: string
@@ -47,14 +47,12 @@ export const SETTINGS_NAV_GROUPS: {
       { id: 'sticky', icon: Magnet },
       { id: 'pool', icon: Layers },
       { id: 'quota', icon: Gauge },
+      { id: 'openai', icon: Bot },
     ],
   },
   {
     label: '协议',
-    items: [
-      { id: 'protocol', icon: Fingerprint },
-      { id: 'whitelist', icon: ListChecks },
-    ],
+    items: [{ id: 'protocol', icon: Fingerprint }],
   },
   {
     label: '槽位',
@@ -86,3 +84,7 @@ export function settingsTabId(tab: string | undefined): SettingsTabId {
     ? (tab as SettingsTabId)
     : 'sticky'
 }
+
+export const SETTINGS_NAV_ITEMS = SETTINGS_NAV_GROUPS.flatMap(
+  (group) => group.items
+)

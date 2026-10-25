@@ -4,8 +4,14 @@
  * Official Claude Code may send assistant prefill and incomplete tool turns on purpose.
  * These fixes run on unofficial clients, plus always-on output_config schema fill.
  */
+import { createHash } from 'node:crypto'
 import { stripIllegalCacheControlFields } from './cache-ttl.mjs'
-import { blockHasEncryptedContent, isWebSearchArtifactBlock } from './web-search.mjs'
+import {
+  blockHasEncryptedContent,
+  hasClaudeWebSearch,
+  historyHasWebSearchArtifacts,
+  isWebSearchArtifactBlock,
+} from './web-search.mjs'
 
 export const CONTINUE_USER_TEXT = 'continue'
 export const MISSING_TOOL_RESULT_TEXT = 'Tool result unavailable.'
@@ -225,8 +231,24 @@ function messageNeedsFlatten(content, depth = 0) {
   return content.some((block) => isWebSearchArtifactBlock(block) || messageNeedsFlatten(block?.content, depth + 1))
 }
 
+/** Match only the same search-bearing history and tool contract, never later conversation turns. */
+export function searchHistoryFingerprint(body = {}) {
+  if (!Array.isArray(body.messages)) return null
+  let hash = null
+  for (let index = 0; index < body.messages.length; index++) {
+    const message = body.messages[index]
+    if (!messageNeedsFlatten(message?.content)) continue
+    hash ??= createHash('sha256')
+    hash.update(JSON.stringify([index, message.role, message.content]))
+    hash.update('\n')
+  }
+  if (!hash) return null
+  hash.update(JSON.stringify(body.tools || []))
+  return hash.digest('hex')
+}
+
 /**
- * Retry-only: replayed search history the current account cannot decrypt
+ * Retry or confirmed replay: search history the current account cannot decrypt
  * ("Invalid `encrypted_content` in `search_result` block") becomes plain text.
  * server_tool_use is flattened together with its result so no call is orphaned.
  */
@@ -247,6 +269,16 @@ export function flattenSearchResultHistory(body = {}) {
   return { ...body, messages }
 }
 
+/**
+ * Replayed server search with no native web_search left in tools (the caller ships its
+ * own client web_search, or search is switched off): Anthropic rejects the replayed
+ * server_tool_use as "not defined in `tools` as a server tool", so it becomes text.
+ */
+export function flattenUndeclaredSearchHistory(body = {}) {
+  if (hasClaudeWebSearch(body.tools) || !historyHasWebSearchArtifacts(body)) return body
+  return flattenSearchResultHistory(body)
+}
+
 function placeholderContent(role) {
   return [
     {
@@ -256,9 +288,9 @@ function placeholderContent(role) {
   ]
 }
 
-/** First-pass unofficial fix: schema only. Do not invent tool_result / continue. */
+/** First-pass unofficial fix: schema, plus replayed server search the caller no longer declares. */
 export function rectifyUnofficialRequest(body = {}) {
-  return ensureOutputConfigSchema(stripIllegalCacheControlFields(clone(body)))
+  return flattenUndeclaredSearchHistory(ensureOutputConfigSchema(stripIllegalCacheControlFields(clone(body))))
 }
 
 /** Retry-only (upstream 400 prefill / unpaired tool_use). sub2api does not do this on first hop. */

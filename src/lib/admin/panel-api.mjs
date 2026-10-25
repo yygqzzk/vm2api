@@ -6,6 +6,7 @@
  *   { ok: false, error: { type, code, message, ... } }
  */
 
+import { THINKING_DISPLAY_MODES } from '../protocol/thinking.mjs'
 import { readSlotProcessStatus } from '../vm/slot-process-status.mjs'
 import os from 'node:os'
 import path from 'node:path'
@@ -24,6 +25,7 @@ import {
   resolveInferenceEngine,
   resolveKernelDataplane,
   normalizeSessionSlots,
+  normalizeSessionIdleTtlSeconds,
   resolveSessionSlots,
   resolveSlotPersonaPreset,
 } from '../vm/slot-engine.mjs'
@@ -86,11 +88,12 @@ import {
 } from '../identity/persona-template.mjs'
 import { PERSONA_STANDING_MAX } from '../identity/crs-persona.mjs'
 import { MESSAGES_BREAKPOINT_MODES } from '../protocol/cache-ttl.mjs'
-import { normalizeCodexRouting } from '../protocol/codex-route.mjs'
+import { normalizeCodexRouting, normalizeInferenceWebsocket } from '../protocol/codex-route.mjs'
 import { effectiveOpenAIPolicy, normalizeOpenAIQuotaPolicy } from '../pool/openai-quota-policy.mjs'
 import { openAIRuntimeSignals } from '../pool/openai-account-runtime.mjs'
 import { normalizeVmConfig, memoryMiB } from '../vm/machine-spec.mjs'
 import { runtimeKind } from '../vm/runtime-kind.mjs'
+import { telemetryUploadInterval } from '../vm/worker-telemetry.mjs'
 
 export function ok(data, meta) {
   const out = { ok: true, data }
@@ -461,6 +464,41 @@ export function validatePersonaRoutingPatch(body = {}) {
       }
     }
   }
+  const blockMap = compat.persona_block_presets
+  if (blockMap != null) {
+    if (typeof blockMap !== 'object' || Array.isArray(blockMap)) {
+      problems.push('persona_block_presets 必须是对象')
+    } else {
+      for (const [preset, selected] of Object.entries(blockMap)) {
+        if (!PERSONA_PRESETS.includes(preset)) {
+          problems.push(`persona_block_presets.${preset} 不是已知方案`)
+          continue
+        }
+        if (!selected || typeof selected !== 'object' || Array.isArray(selected)) {
+          problems.push(`persona_block_presets.${preset} 必须是对象`)
+          continue
+        }
+        for (const [id, on] of Object.entries(selected)) {
+          if (!id.trim() || id.length > 64) problems.push(`persona_block_presets.${preset}.${id} id 非法`)
+          else if (typeof on !== 'boolean') problems.push(`persona_block_presets.${preset}.${id} 必须是布尔`)
+        }
+      }
+    }
+  }
+  const extras = compat.model_env_extra
+  if (extras != null) {
+    if (typeof extras !== 'object' || Array.isArray(extras)) {
+      problems.push('model_env_extra 必须是对象')
+    } else if (Object.keys(extras).length > 64) {
+      problems.push('model_env_extra 最多 64 个模型')
+    } else {
+      for (const [id, text] of Object.entries(extras)) {
+        if (!/^[a-z0-9][a-z0-9._-]{0,127}$/i.test(id)) problems.push(`model_env_extra.${id} 模型 id 非法`)
+        else if (typeof text !== 'string') problems.push(`model_env_extra.${id} 必须是字符串`)
+        else if (text.length > 4000) problems.push(`model_env_extra.${id} 超过 4000 字符`)
+      }
+    }
+  }
   if (compat.cache_ttl != null && !['5m', '1h'].includes(String(compat.cache_ttl).trim())) {
     problems.push(`cache_ttl 必须是 5m / 1h，收到 ${compat.cache_ttl}`)
   }
@@ -469,6 +507,22 @@ export function validatePersonaRoutingPatch(body = {}) {
   }
   if (compat.official_cc_passthrough != null && typeof compat.official_cc_passthrough !== 'boolean') {
     problems.push('official_cc_passthrough 必须是布尔')
+  }
+  if (Object.prototype.hasOwnProperty.call(compat, 'cch_enabled') && typeof compat.cch_enabled !== 'boolean') {
+    problems.push('cch_enabled 必须是布尔')
+  }
+  if (Object.prototype.hasOwnProperty.call(compat, 'auto_compact_window') && compat.auto_compact_window != null) {
+    const windowTokens = Number(compat.auto_compact_window)
+    if (!Number.isInteger(windowTokens) || windowTokens < 100_000 || windowTokens > 1_000_000) {
+      problems.push('auto_compact_window 必须是 100000–1000000 的整数')
+    }
+  }
+  if (
+    compat.thinking_display != null &&
+    compat.thinking_display !== '' &&
+    !THINKING_DISPLAY_MODES.includes(String(compat.thinking_display).trim().toLowerCase())
+  ) {
+    problems.push(`thinking_display 必须是 ${THINKING_DISPLAY_MODES.join(' / ')}，收到 ${compat.thinking_display}`)
   }
   if (compat.cache_breakpoints != null) {
     const bp = compat.cache_breakpoints
@@ -1068,6 +1122,7 @@ export async function buildProbeOne({
       },
       quota: result.quota,
       reset_credits: result.reset_credits || null,
+      credits: result.credits || null,
       windows: result.windows || [],
       probed_at: result.fetched_at || new Date().toISOString(),
       ok: true,
@@ -1386,6 +1441,25 @@ export function buildUsage({ accountQuota, cfg, requestLog = null }) {
   })
 }
 
+function presentCompatibility(compat) {
+  const out = compat && typeof compat === 'object' && !Array.isArray(compat) ? { ...compat } : {}
+  out.cch_enabled = out.cch_enabled !== false
+  const display = String(out.thinking_display ?? '')
+    .trim()
+    .toLowerCase()
+  out.thinking_display = display === 'passthrough' ? 'passthrough' : 'summarized'
+  const windowTokens = Number(out.auto_compact_window)
+  out.auto_compact_window =
+    Number.isInteger(windowTokens) && windowTokens >= 100_000 && windowTokens <= 1_000_000 ? windowTokens : null
+  return out
+}
+
+function presentInference(inference) {
+  const out = inference && typeof inference === 'object' && !Array.isArray(inference) ? { ...inference } : {}
+  out.session_idle_ttl_seconds = normalizeSessionIdleTtlSeconds(out.session_idle_ttl_seconds)
+  return out
+}
+
 export function buildRouting({ routingConfig, stickyRouter }) {
   const tiers = normalizeTiers(routingConfig?.tiers, routingConfig?.quota, routingConfig?.concurrency)
   return ok({
@@ -1396,14 +1470,16 @@ export function buildRouting({ routingConfig, stickyRouter }) {
     logging: routingConfig?.logging || {},
     pool: normalizePoolRouting(routingConfig?.pool),
     failover: routingConfig?.failover || {},
-    compatibility: routingConfig?.compatibility || {},
-    inference: routingConfig?.inference || {},
+    compatibility: presentCompatibility(routingConfig?.compatibility),
+    inference: presentInference(routingConfig?.inference),
+    websocket: normalizeInferenceWebsocket(routingConfig?.websocket),
     codex: normalizeCodexRouting(routingConfig?.codex),
     official_cc: normalizeOfficialCcConfig(routingConfig?.official_cc),
     health_probe: normalizeHealthProbeConfig(routingConfig?.health_probe),
     usage_probe: normalizeUsageProbeConfig(routingConfig?.usage_probe),
     notify: publicNotifyConfig(routingConfig?.notify),
     vm: normalizeVmConfig(routingConfig?.vm),
+    telemetry: { upload_interval_seconds: telemetryUploadInterval(routingConfig) },
     sessions: stickyRouter.stats(),
   })
 }
@@ -1477,7 +1553,7 @@ function hostStats() {
     load1,
     load5,
     load15,
-    cpu_pct: Math.round(Math.min(100, (load1 / n) * 1000) / 10),
+    cpu_pct: Math.round(Math.min(1000, (load1 / n) * 1000)) / 10,
     mem_total: total,
     mem_free: free,
     mem_used: used,
@@ -1861,6 +1937,8 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     note: v.note || null,
     region: v.region || null,
     node_id: v.node_id || null,
+    owner_user_id: v.owner_user_id || null,
+    origin: v.origin || null,
     ...(canRevealClusterNodes(extras.role || 'admin') && v.node_id
       ? { node_name: nodeNameOf(extras.clusterNodes, v.node_id) }
       : {}),
@@ -1932,6 +2010,7 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     status_7d_oi: isCodex ? null : q.status_7d_oi,
     codex_usage: v.codex_usage || null,
     reset_credits: isCodex ? v.reset_credits || v.codex?.reset_credits || null : null,
+    codex_credits: isCodex ? v.codex_credits || v.codex?.credits || null : null,
     claude_reset_credits: isCodex ? null : v.claude_reset_credits || null,
     plan_type: isCodex ? v.plan_type || null : null,
     ...(q.weekly_split ? { weekly_split: q.weekly_split } : {}),

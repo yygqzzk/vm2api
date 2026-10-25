@@ -6,6 +6,8 @@ import {
   clearConversationCacheTtls,
   DEFAULT_CACHE_TTL,
   enforceCacheTtlOrder,
+  fillMissingCacheTtl,
+  validateCacheBreakpoints,
   normalizeCacheTtl,
   pinConversationCacheTtl,
   resolveCacheTtl,
@@ -41,6 +43,41 @@ test('ttl-less markers (official Claude Code) take the settings menu value', () 
   const out = applyCacheTtlToBody(body, '1h')
   assert.deepEqual(out.system[0].cache_control, { type: 'ephemeral', ttl: '1h' })
   assert.deepEqual(out.messages[0].content[0].cache_control, { type: 'ephemeral', ttl: '1h' })
+})
+
+test('owned TTL completion preserves explicit mixed TTLs and scope without mutating input', () => {
+  const input = {
+    system: [
+      { type: 'text', text: 'hour', cache_control: { type: 'ephemeral', ttl: '1h', scope: 'global' } },
+      { type: 'text', text: 'missing', cache_control: { type: 'ephemeral', scope: 'org' } },
+    ],
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'short', cache_control: { type: 'ephemeral', ttl: '5m' } }] },
+    ],
+  }
+  const before = structuredClone(input)
+  const output = fillMissingCacheTtl(input, '5m')
+  assert.deepEqual(
+    output.system.map((block) => block.cache_control),
+    [
+      { type: 'ephemeral', ttl: '1h', scope: 'global' },
+      { type: 'ephemeral', ttl: '5m', scope: 'org' },
+    ],
+  )
+  assert.deepEqual(output.messages, input.messages)
+  assert.deepEqual(input, before)
+})
+
+test('native validation counts automatic caching against the explicit marker budget', () => {
+  const input = {
+    system: Array.from({ length: 4 }, (_, index) => ({
+      type: 'text',
+      text: String(index),
+      cache_control: { type: 'ephemeral', ttl: '1h' },
+    })),
+    cache_control: { type: 'ephemeral' },
+  }
+  assert.throws(() => validateCacheBreakpoints(input), /four breakpoints/)
 })
 
 test('a conversation keeps its first TTL until that cache would have expired', () => {
@@ -222,6 +259,19 @@ test('applyCacheTtlToUsage reclassifies a 5m report after we sent 1h', () => {
   assert.equal(out.cache_creation_1h_tokens, 2000)
   assert.equal(out.cache_creation_5m_tokens, 0)
   assert.equal(out.cache_ttl, '1h')
+})
+
+test('applyCacheTtlToUsage keeps a message_delta total above the stale start split (#678)', () => {
+  const out = applyCacheTtlToUsage(
+    {
+      cache_creation_input_tokens: 14890,
+      cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 119 },
+    },
+    '1h',
+  )
+  assert.equal(out.cache_creation_1h_tokens, 14890)
+  assert.equal(out.cache_creation_5m_tokens, 0)
+  assert.equal(out.cache_creation.ephemeral_1h_input_tokens, 14890)
 })
 
 test('default 5m usage stays in the 1.25x bucket', () => {

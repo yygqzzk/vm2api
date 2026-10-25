@@ -6,14 +6,18 @@
  * rust 下 official_cc inference 强制 cli-hop。
  * Setup Token 换票走 sessionKey/PKCE 脚本，不启 claude setup-token PTY；
  * 推理仍跟槽位 engine：配 rust 就 cli-hop。
- * persona_preset official|official_full|zero on a VM overrides the global protocol;
+ * persona_preset official|official_full|zero|official_303 on a VM overrides the global protocol;
  * empty inherits routing.compatibility.persona_preset.
  */
-import { normalizePersonaPreset, personaPresetFromLegacyMode } from '../identity/persona-template.mjs'
+import {
+  normalizePersonaPreset,
+  OFFICIAL_303_PRESET,
+  personaPresetFromLegacyMode,
+} from '../identity/persona-template.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 
 export const INFERENCE_ENGINES = Object.freeze(['rust'])
-export const SLOT_PERSONA_PRESETS = Object.freeze(['official', 'official_full', 'zero'])
+export const SLOT_PERSONA_PRESETS = Object.freeze(['official', 'official_full', 'zero', OFFICIAL_303_PRESET])
 export const OFFICIAL_CC_INFERENCES = Object.freeze(['http', 'cli-hop'])
 export const KERNEL_DATAPLANES = Object.freeze(['wrap', 'cc', 'crag'])
 export const CONTAINER_CLI_NODE_BIN = '/home/kincli/.kin/cli-node'
@@ -29,6 +33,22 @@ export const REMOTE_CC_NODE_BIN = `${REMOTE_KIN_DIR}/cc-node`
 export const KERNEL_NATIVE_SLOT_COUNT = 20
 export const SESSION_SLOT_MIN = 1
 export const SESSION_SLOT_MAX = KERNEL_NATIVE_SLOT_COUNT
+export const SESSION_IDLE_TTL_MIN = 1
+export const SESSION_IDLE_TTL_MAX = 86400
+export const SESSION_IDLE_TTL_DEFAULT = 600
+
+export function normalizeSessionIdleTtlSeconds(value, fallback = SESSION_IDLE_TTL_DEFAULT) {
+  const fallbackValue = Number(fallback)
+  const safeFallback =
+    Number.isInteger(fallbackValue) && fallbackValue >= SESSION_IDLE_TTL_MIN && fallbackValue <= SESSION_IDLE_TTL_MAX
+      ? fallbackValue
+      : SESSION_IDLE_TTL_DEFAULT
+  if (value == null || value === '') return safeFallback
+  const n = value
+  if (typeof n !== 'number' || !Number.isInteger(n) || n < SESSION_IDLE_TTL_MIN || n > SESSION_IDLE_TTL_MAX)
+    return safeFallback
+  return n
+}
 
 export function normalizeSessionSlots(value, fallback = SESSION_SLOT_MAX) {
   const fallbackValue = Number(fallback)
@@ -81,6 +101,7 @@ export function normalizeSlotPersonaPreset(value, { inherit = false } = {}) {
   )
     return 'official'
   if (raw === 'zero' || raw === 'zero_inject' || raw === '0inject' || raw === '0-inject') return 'zero'
+  if (raw === OFFICIAL_303_PRESET || raw === '303' || raw === 'official-303') return OFFICIAL_303_PRESET
   return inherit ? '' : null
 }
 
@@ -105,6 +126,7 @@ export function normalizeInferenceConfig(raw = {}) {
     health_ttl_ms: optionalTtlMs(raw.health_ttl_ms, 2000),
     tcp_nodelay: optionalBool(raw.tcp_nodelay, true),
     session_slots: normalizeSessionSlots(raw.session_slots),
+    session_idle_ttl_seconds: normalizeSessionIdleTtlSeconds(raw.session_idle_ttl_seconds),
     dataplane: normalizeKernelDataplane(raw.dataplane),
   }
 }
@@ -204,6 +226,7 @@ export function personaModeFromPreset(preset) {
   if (preset === 'zero') return 'zero'
   if (preset === 'official') return 'official_prompt'
   if (preset === 'official_full') return 'official_full'
+  if (preset === OFFICIAL_303_PRESET) return OFFICIAL_303_PRESET
   return null
 }
 
@@ -244,22 +267,9 @@ export function parseSlotPersonaPresetPatch(value) {
   if (!raw || raw === 'inherit' || raw === 'global' || raw === 'default') {
     return { ok: true, value: '' }
   }
-  if (raw === 'official_full' || raw === 'full' || raw === 'agent_official') {
-    return { ok: true, value: 'official_full' }
-  }
-  if (
-    raw === 'official' ||
-    raw === 'official_prompt' ||
-    raw === 'prompt' ||
-    raw === 'agent_prompt' ||
-    raw === 'cc_prompt'
-  ) {
-    return { ok: true, value: 'official' }
-  }
-  if (raw === 'zero' || raw === 'zero_inject' || raw === '0inject' || raw === '0-inject') {
-    return { ok: true, value: 'zero' }
-  }
-  return { ok: false, error: 'persona_preset must be official, official_full, zero, or empty' }
+  const preset = normalizeSlotPersonaPreset(raw)
+  if (preset) return { ok: true, value: preset }
+  return { ok: false, error: 'persona_preset must be official, official_full, zero, official_303, or empty' }
 }
 
 export function parseSlotEnginePolicyPatch(body = {}) {
@@ -334,6 +344,12 @@ export function validateInferenceRoutingPatch(body = {}) {
     const n = Number(body.inference.session_slots)
     if (!Number.isInteger(n) || n < SESSION_SLOT_MIN || n > SESSION_SLOT_MAX) {
       errors.push(`inference.session_slots 必须是 ${SESSION_SLOT_MIN}–${SESSION_SLOT_MAX} 的整数`)
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(body.inference, 'session_idle_ttl_seconds')) {
+    const n = body.inference.session_idle_ttl_seconds
+    if (typeof n !== 'number' || !Number.isInteger(n) || n < SESSION_IDLE_TTL_MIN || n > SESSION_IDLE_TTL_MAX) {
+      errors.push(`inference.session_idle_ttl_seconds 必须是 ${SESSION_IDLE_TTL_MIN}–${SESSION_IDLE_TTL_MAX} 的整数`)
     }
   }
   if (Object.prototype.hasOwnProperty.call(body.inference, 'health_ttl_ms')) {

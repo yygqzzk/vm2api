@@ -1,5 +1,5 @@
-# Control plane. Only source is in git: the console and Go helpers build here, and the
-# prebuilt slot payloads come from the release pinned in deploy/payload.json.
+# Control plane. Only source is in git: the console and kin-api-kernel build here; the
+# slot payloads and Go helpers come from the release pinned in deploy/payload.json.
 
 FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS web
 RUN npm install -g pnpm@10
@@ -11,12 +11,11 @@ RUN pnpm build
 
 FROM --platform=$BUILDPLATFORM golang:1.25-bookworm AS helpers
 ENV CGO_ENABLED=0 GOOS=linux GOARCH=amd64
-WORKDIR /src/worker
-COPY worker/go.mod worker/go.sum ./
-RUN go mod download
-COPY worker/ ./
-RUN go build -buildvcs=false -trimpath -o /out/kin-worker ./cmd/kin-worker \
-  && go build -buildvcs=false -trimpath -o /out/kin-egress ./cmd/kin-egress
+WORKDIR /src
+COPY api-kernel/go.mod api-kernel/go.sum ./api-kernel/
+RUN cd api-kernel && go mod download
+COPY api-kernel/ ./api-kernel/
+RUN cd api-kernel && go build -buildvcs=false -trimpath -o /out/kin-api-kernel ./cmd/kin-api-kernel
 
 FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS payload
 WORKDIR /src
@@ -58,6 +57,7 @@ ENV NODE_ENV=production \
     KIN_WORKER_BIN=/opt/vm2api/bin/kin-worker \
     KIN_CODEX_KERNEL_BIN=/opt/vm2api/bin/kin-codex-kernel \
     KIN_OAUTH_AUTH_BIN=/opt/vm2api/bin/kin-oauth-auth \
-    KIN_COMPUTER_BIN=/opt/vm2api/bin/kin-computer
+    KIN_COMPUTER_BIN=/opt/vm2api/bin/kin-computer \
+    KIN_API_KERNEL_BIN=/opt/vm2api/bin/kin-api-kernel
 EXPOSE 8787
 ENTRYPOINT ["/usr/local/bin/vm2api-entrypoint"]
