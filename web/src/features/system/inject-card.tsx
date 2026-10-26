@@ -230,7 +230,7 @@ export function InjectCard({
           </span>
         </div>
       </div>
-      {preset === 'official_full' ? (
+      {['zero', 'official', 'official_full'].includes(preset) ? (
         <div className='space-y-1 border-t border-border/60 px-4 py-3'>
           <div className='text-sm font-medium'>块选择</div>
           {selectedPreviewBlocks(blocks, undefined, preset).map((block) => {

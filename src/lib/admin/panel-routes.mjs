@@ -230,6 +230,7 @@ import {
 import { collectSlotIdentity } from '../vm/guest-identity.mjs'
 import { applyOfficialFingerprintToVm, reconcileOfficialFingerprints } from '../identity/official-fingerprint.mjs'
 import { personaPreviewVars } from '../identity/crs-persona.mjs'
+import { canonicalPersonaCompat } from '../identity/persona-template.mjs'
 import { buildOutboundProfile } from './outbound-profile.mjs'
 import {
   applyGeneratedFingerprint,
@@ -253,7 +254,7 @@ import {
   syncWrapSample,
   wrapCliHomeDir,
 } from '../vm/wrap-cli-runtime.mjs'
-import { refreshClusterSlotPayloads } from '../cluster/remote-slot.mjs'
+import { inspectClusterPayloadChanges, refreshClusterSlotPayloads } from '../cluster/remote-slot.mjs'
 import { readRawBody as defaultReadRawBody } from '../http/respond.mjs'
 import { corsHeadersForRequest } from '../http/cors.mjs'
 import { restartRustKernel, writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
@@ -555,23 +556,7 @@ async function syncInstalledKernels({
   }
   const cluster = clusterVms.length
     ? checkOnly
-      ? {
-          ok: true,
-          changed: true,
-          total: clusterVms.length,
-          ok_count: clusterVms.length,
-          failed_count: 0,
-          changed_count: clusterVms.length,
-          items: clusterVms
-            .filter((vm) => !isCodexVm(vm))
-            .map((vm) => ({
-              id: vm.id,
-              node_id: vm.node_id,
-              ok: true,
-              kernel_changed: true,
-              baked: true,
-            })),
-        }
+      ? await inspectClusterPayloadChanges(project, clusterVms, { routing: routingConfig })
       : await refreshCluster(project, clusterVms, { routing: routingConfig, recreate: true })
     : null
   const failed = (local.items || []).filter((item) => !item.ok)
@@ -5167,7 +5152,11 @@ export function createPanelHandler(ctx) {
 
       // GET /api/panel/routing
       if (req.method === 'GET' && p === '/api/panel/routing') {
-        return json(res, 200, panel.buildRouting({ routingConfig: ctx.routingConfig, stickyRouter }))
+        const routingConfig = {
+          ...ctx.routingConfig,
+          compatibility: canonicalPersonaCompat(ctx.routingConfig?.compatibility),
+        }
+        return json(res, 200, panel.buildRouting({ routingConfig, stickyRouter }))
       }
       // GET /api/panel/outbound-profile — read-only outbound reference for the global preset
       if (req.method === 'GET' && p === '/api/panel/outbound-profile') {
@@ -5181,6 +5170,7 @@ export function createPanelHandler(ctx) {
       // PUT /api/panel/routing
       if (req.method === 'PUT' && p === '/api/panel/routing') {
         const body = await readBody(req, cfg.limits.max_body_bytes)
+        if (body?.compatibility) body.compatibility = canonicalPersonaCompat(body.compatibility)
         const previousRoutingConfig = structuredClone(ctx.routingConfig)
         try {
           if (body?.codex && Object.prototype.hasOwnProperty.call(body.codex, 'quota')) {
