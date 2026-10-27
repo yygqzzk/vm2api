@@ -266,7 +266,7 @@ export async function evaluateProtocolIntercept({
   }
 
   if (jev?.enabled) {
-    const verdict = await classifyJev(modelDocument, jev, fetchImpl)
+    const verdict = await classifyJev(modelDocument, { ...jev, policy_request_id: requestId }, fetchImpl)
     if (verdict.action === 'block') {
       const unavailable = verdict.reason === 'unavailable'
       const error = policyBlockError(requestId)

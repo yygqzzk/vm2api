@@ -24,6 +24,7 @@ import {
   publicJevConfig,
   readJevConfig,
 } from '../protocol/jev-intercept.mjs'
+import { JevUsageRepo } from '../db/repos/jev-usage-repo.mjs'
 import { RefusalGuardsRepo } from '../db/repos/refusal-guards-repo.mjs'
 import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
@@ -66,6 +67,7 @@ import { officialCcHome, readOfficialCcStatus, scheduleOfficialCcBootstrap } fro
 import { invalidateLiveCredentialCache } from './panel-live-credentials.mjs'
 import { ensureCodexKernel, stopCodexKernel } from '../transport/codex-kernel-supervisor.mjs'
 import { listOfficialModels, seedModelCatalog } from '../protocol/models.mjs'
+import { jevUsageStorageErrors } from '../protocol/jev-usage.mjs'
 import { getModelPolicy, saveModelPolicy, resetModelPolicy, listPolicyModels } from '../protocol/model-policy.mjs'
 import {
   getGptModelPolicy,
@@ -5359,6 +5361,26 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'GET' && p === '/api/panel/protocol-entry') {
         return json(res, 200, panel.ok(requestLog.protocolEntryStats()))
+      }
+      if (req.method === 'GET' && p === '/api/panel/jev-usage') {
+        if (panelIdentity(req).role !== 'admin')
+          return json(res, 403, { ok: false, error: { code: 'forbidden', message: '仅管理员可查看审核用量' } })
+        try {
+          const repo = new JevUsageRepo()
+          const page = repo.list(Object.fromEntries(url.searchParams))
+          return json(
+            res,
+            200,
+            panel.ok({ ...repo.overview(), ...page, storage_errors_since_start: jevUsageStorageErrors() }),
+          )
+        } catch (error) {
+          if (error instanceof TypeError)
+            return json(res, 400, {
+              ok: false,
+              error: { code: 'invalid_jev_usage_query', message: '用量查询参数不正确' },
+            })
+          throw error
+        }
       }
       if (req.method === 'GET' && p === '/api/panel/jev-intercept') {
         return json(res, 200, panel.ok(jevInterceptSnapshot()))

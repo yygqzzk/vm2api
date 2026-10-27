@@ -1447,6 +1447,7 @@ export function personaTemplateSettingsFromRouting(routing = {}) {
       persona_env_instructions_presets: compat.persona_env_instructions_presets,
       persona_timezone_presets: compat.persona_timezone_presets,
       persona_locale_presets: compat.persona_locale_presets,
+      persona_guidance_presets: compat.persona_guidance_presets,
     },
   }
 }
@@ -1761,6 +1762,8 @@ function rewriteOfficialSystem(
   const indexes = billingIndexesFromMessages(messages)
   const extras = park ? collectParkedStanding(routingFile) : []
   const { env, sourceTexts, facts } = personaEnvForBody(body, { identity, model, overwrite })
+  // Slot locale is opt-in for templates; rewrite keeps only the caller's own Locale line (overwrite writes the slot's).
+  if (!overwrite) env.locale = facts.locale || ''
   // Legacy rewrite keeps mid-conversation role=system in the message list.
   const harness = thirdPartyClientPrompt(body.system)
   const leftover = harness ? '' : parkableSystemTexts(body.system).join('\n\n')
@@ -1879,7 +1882,10 @@ function applyTemplatePersona(
     const environment = renderPersonaTemplate(officialBlocks, vars, { role: 'system' })
       .map((block) => block.text)
       .join('\n\n')
-    if (environment) {
+    if (environment && !modelSupportsMidConversationSystem(modelId)) {
+      // Haiku 4.5 / Sonnet 5 / Claude 4.x reject mid-conversation role=system: keep it in top-level system.
+      system = [...system, { type: 'text', text: environment }]
+    } else if (environment) {
       const at = messages.findLastIndex((message) => message?.role === 'user')
       if (at >= 0)
         outMessages = [

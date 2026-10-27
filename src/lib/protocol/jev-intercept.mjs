@@ -14,6 +14,7 @@ import { refusalUserDocument } from '../core/refusal-similarity.mjs'
 import { normalizeText } from '../core/distill-detect.mjs'
 import { hasAccessPresence } from '../oauth/oauth-credentials.mjs'
 import { prepareInterceptText, stripEnvironmentSection, stripReminders } from './jev-prepare.mjs'
+import { isOfficialTypeSafeUrl, jevKeyFingerprint, recordJevUsage } from './jev-usage.mjs'
 import { inferClaudeTier } from '../pool/claude-tier.mjs'
 
 export const JEV_SETTING = 'jev_intercept'
@@ -1305,6 +1306,17 @@ export async function classifyJev(text, cfg, fetchImpl = globalThis.fetch, now =
   for (let i = 0; i < targets.length; i++) {
     const target = targets[(start + i) % targets.length]
     if (skipUrl.has(target.url)) continue
+    // One row per real provider attempt; dedup replays return before this loop.
+    const attemptStarted = Date.now()
+    const attemptUsage = {
+      created_at: new Date(attemptStarted).toISOString(),
+      request_id: cfg?.policy_request_id,
+      provider: config.provider,
+      model,
+      key_fingerprint: jevKeyFingerprint(target.apiKey),
+      official_typesafe: isOfficialTypeSafeUrl(target.url),
+      outcome: 'network_error',
+    }
     try {
       const response = await fetchImpl(target.url, {
         method: 'POST',
@@ -1315,6 +1327,8 @@ export async function classifyJev(text, cfg, fetchImpl = globalThis.fetch, now =
         body: JSON.stringify(payload),
         signal: AbortSignal.timeout(config.timeout_ms),
       })
+      attemptUsage.http_status = Number(response?.status) || null
+      attemptUsage.outcome = response?.ok ? 'invalid_response' : 'http_error'
       if (!response?.ok) {
         const status = Number(response?.status) || 0
         if (status === 401 || status === 429 || status === 529) {
@@ -1325,8 +1339,12 @@ export async function classifyJev(text, cfg, fetchImpl = globalThis.fetch, now =
         if (!http) http = `上游 ${status || '失败'}`
         continue
       }
-      const decision = parsePolicyDecision(await response.json(), config)
+      const responsePayload = await response.json()
+      attemptUsage.usage = responsePayload?.usage
+      attemptUsage.response_model = responsePayload?.model
+      const decision = parsePolicyDecision(responsePayload, config)
       if (!decision) return { action: 'pass', reason: 'invalid', state: document }
+      attemptUsage.outcome = 'success'
       const verdict = decision.hits.length
         ? {
             action: 'block',
@@ -1341,6 +1359,9 @@ export async function classifyJev(text, cfg, fetchImpl = globalThis.fetch, now =
       // Host-level. Do not retire keys, and do not walk the rest of this host.
       skipUrl.add(target.url)
       network = true
+    } finally {
+      attemptUsage.duration_ms = Date.now() - attemptStarted
+      recordJevUsage(attemptUsage)
     }
   }
   return unavailable(config, network ? '网络异常' : http || '密钥失效')
