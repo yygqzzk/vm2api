@@ -385,7 +385,7 @@ test('GPT on anthropic.messages converts and pins a GPT slot', async () => {
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-test('nested Responses cached_tokens reaches the request log cache column', async () => {
+test('Codex merges SSE cache read/write details with totals without adding reasoning twice', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-cache-'))
   writeGptVm(root, 'vm-gpt-a')
   const res = {
@@ -420,21 +420,52 @@ test('nested Responses cached_tokens reaches the request log cache column', asyn
       writeCodexKernelConfig() {},
       ensureCodexKernel: async () => ({ ok: true }),
       streamCodexKernel: async ({ onEvent }) => {
-        await onEvent('data: {"type":"response.completed"}')
+        await onEvent(
+          'data: {"type":"response.completed","response":{"usage":{"input_tokens_details":{"cached_tokens":8,"cache_creation_tokens":4},"output_tokens_details":{"reasoning_tokens":6}}}}',
+        )
         return {
           ok: true,
           status: 200,
           terminalState: 'verified',
-          // merged trailer + SSE usage: totals flat, cache read nested
-          usage: { input_tokens: 120, output_tokens: 9, input_tokens_details: { cached_tokens: 8 } },
+          // The trailer reports only totals; cache details came from the SSE snapshot.
+          usage: { input_tokens: 120, output_tokens: 9 },
         }
       },
     },
   })
-  assert.equal(logBag.input_tokens, 112)
+  assert.equal(logBag.input_tokens, 108)
   assert.equal(logBag.output_tokens, 9)
   assert.equal(logBag.cache_read_tokens, 8)
+  assert.equal(logBag.cache_creation_tokens, 4)
+  assert.equal(logBag.usage.reasoning_tokens, 6)
   fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('Codex keeps already-disjoint cache counters instead of re-extracting inclusive usage', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-disjoint-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  writeGptVm(root, 'vm-gpt-a')
+  const logBag = {}
+  await handleCodexProtocol(
+    codexArgs(
+      root,
+      {
+        ensureCodexKernel: async () => ({ ok: true }),
+        streamCodexKernel: async () => ({
+          ok: true,
+          status: 200,
+          terminalState: 'verified',
+          body: { id: 'resp_disjoint', output: [] },
+          usage: { input_tokens: 108, output_tokens: 9, cache_read_input_tokens: 8, cache_creation_input_tokens: 4 },
+        }),
+      },
+      { logBag },
+    ),
+  )
+  assert.equal(logBag.input_tokens, 108)
+  assert.equal(logBag.output_tokens, 9)
+  assert.equal(logBag.cache_read_tokens, 8)
+  assert.equal(logBag.cache_creation_tokens, 4)
 })
 
 test('request log first_token_ms uses firstTokenAt minus injected ingress t0', async () => {

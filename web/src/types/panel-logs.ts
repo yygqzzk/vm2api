@@ -13,8 +13,10 @@ export type RequestLogItem = {
   input_tokens?: number
   output_tokens?: number
   cache_read_tokens?: number
-  cache_creation_tokens?: number
+  cache_creation_tokens?: number | null
   first_token_ms?: number
+  first_byte_ms?: number | null
+  generation_ms?: number | null
   stop_reason?: string
   /** 读出时派生、不落库；非错误行为 null。 */
   error_class?: string

@@ -84,23 +84,85 @@ describe('cache TTL split', () => {
 })
 
 describe('latency segments', () => {
-  it('splits wait / ttft / generation and keeps a minimum width', () => {
+  it('splits queue / prefill / visible-wait / output / finalization', () => {
     const segments = latencySegments({
       waitMs: 10,
+      firstByteMs: 200,
+      ttftMs: 15565,
+      generationMs: 15488,
+      durationMs: 15688,
+    })
+    expect(segments?.map((s) => [s.key, s.ms])).toEqual([
+      ['wait', 10],
+      ['prefill', 190],
+      ['tokenWait', 15365],
+      ['generation', 123],
+      ['finalization', 0],
+    ])
+    expect(segmentWidth(segments![0])).toBe(3)
+  })
+
+  it('keeps trailing time as finalization instead of generation', () => {
+    const segments = latencySegments({
+      waitMs: 0,
+      firstByteMs: 200,
+      ttftMs: 500,
+      generationMs: 1000,
+      durationMs: 1500,
+    })
+    expect(segments?.map((s) => [s.key, s.ms])).toEqual([
+      ['wait', 0],
+      ['prefill', 200],
+      ['tokenWait', 300],
+      ['generation', 700],
+      ['finalization', 300],
+    ])
+  })
+
+  it('does not estimate generation from duration minus TTFT', () => {
+    const segments = latencySegments({
+      waitMs: 10,
+      firstByteMs: null,
       ttftMs: 1000,
+      generationMs: null,
       durationMs: 5000,
     })
-    expect(segments?.map((s) => s.ms)).toEqual([10, 990, 4000])
-    expect(segmentWidth(segments![0])).toBe(3)
+    expect(segments?.find((s) => s.key === 'generation')?.ms).toBe(0)
+    expect(segments?.find((s) => s.key === 'tokenWait')?.ms).toBe(990)
+    expect(segments?.find((s) => s.key === 'finalization')?.ms).toBe(0)
   })
 
   it('drops an out-of-range wait and rejects impossible ttft', () => {
     expect(
-      latencySegments({ waitMs: 2000, ttftMs: 1000, durationMs: 5000 })?.[0].ms
+      latencySegments({
+        waitMs: 2000,
+        firstByteMs: 200,
+        ttftMs: 1000,
+        generationMs: 800,
+        durationMs: 5000,
+      })?.[0].ms
     ).toBe(0)
     expect(
-      latencySegments({ waitMs: 0, ttftMs: 6000, durationMs: 5000 })
+      latencySegments({
+        waitMs: 0,
+        firstByteMs: null,
+        ttftMs: 6000,
+        generationMs: null,
+        durationMs: 5000,
+      })
     ).toBeNull()
+  })
+
+  it('ignores a zero generation window', () => {
+    const segments = latencySegments({
+      waitMs: 0,
+      firstByteMs: 200,
+      ttftMs: 500,
+      generationMs: 0,
+      durationMs: 1000,
+    })
+    expect(segments?.find((s) => s.key === 'generation')?.ms).toBe(0)
+    expect(segments?.find((s) => s.key === 'finalization')?.ms).toBe(0)
   })
 })
 

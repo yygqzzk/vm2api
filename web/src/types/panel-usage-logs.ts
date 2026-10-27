@@ -120,11 +120,13 @@ export type UsageLogRow = {
   logMode: 'normal' | 'debug' | null
   inputTokens: number
   outputTokens: number
-  cacheCreationInputTokens: number
+  /** null = 上游未报告写入量，不等于明确写入 0。 */
+  cacheCreationInputTokens: number | null
   cacheReadInputTokens: number
   cacheCreation5mInputTokens: number
   cacheCreation1hInputTokens: number
   cacheTtlApplied: CacheTtlApplied
+  /** 实际总量：cache-exclusive input + output + 读 + 写，不是 input+output。 */
   totalTokens: number
   /** 官方标准价合计（`total_cost`）；null = 未计价。 */
   costUsd: number | null
@@ -133,8 +135,20 @@ export type UsageLogRow = {
   groupCostMultiplier: number | null
   costBreakdown: CostBreakdown | null
   durationMs: number | null
-  /** 首 token 耗时（`first_token_ms`）。 */
+  /**
+   * 首字节 / 首个协议事件（`first_byte_ms`），相对入口。
+   * 历史行或未观测到上游协议事件为 `null`，不用别的时间估。
+   */
+  firstByteMs: number | null
+  /** 首个生成内容/进度（`first_token_ms`），包括 thinking、工具名称和参数。 */
   ttftMs: number | null
+  /**
+   * 上游输出窗口（`generation_ms`）：首个协议事件到终止生成事件
+   *（Claude `message_delta.stop_reason` / Responses `response.completed`）。
+   * 含不可见推理，不含 HTTP/trailer/cleanup。历史行 / 单包窗口为 `null`，
+   * 禁止用总耗时减 TTFT 估。
+   */
+  generationMs: number | null
   stopReason: string | null
   attemptCount: number | null
   finalState: string | null
@@ -155,6 +169,9 @@ export type UsageLogRow = {
   errorOwner: 'client' | 'provider' | 'platform' | null
   errorCode: string | null
   errorMessage: string | null
+  /** classifyJev 实际 POST 的 state。送审上下文，不是模型指出的命中句。 */
+  jevState: string | null
+
   /** 平台侧拦截（distill / refusal / guard …），由 errorClass/finalState 映射。 */
   blockedBy: string | null
   blockedReason: string | null

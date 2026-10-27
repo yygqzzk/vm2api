@@ -34,6 +34,8 @@ import {
   isWrapConnectionError,
 } from '../core/errors.mjs'
 import { extraHeadersFromLimitError } from '../pool/quota-window.mjs'
+import { createStreamTiming } from '../protocol/stream-timing.mjs'
+import { mergeUsage } from '../protocol/openai-usage.mjs'
 
 const MAX_BODY = 64 * 1024 * 1024
 const credentialRefreshTail = new Map()
@@ -231,19 +233,6 @@ function streamMetaFromHeaders(headers = {}) {
   }
 }
 
-function mergeUsage(current, next) {
-  if (!next || typeof next !== 'object') return current
-  const out = { ...(current || {}) }
-  for (const [key, value] of Object.entries(next)) {
-    if (value && typeof value === 'object' && !Array.isArray(value)) {
-      out[key] = { ...(typeof out[key] === 'object' && out[key] ? out[key] : {}), ...value }
-    } else {
-      out[key] = value
-    }
-  }
-  return out
-}
-
 /** First user-visible assistant output — never transport/terminal metadata alone. */
 export function isDownstreamCommitEvent(event) {
   if (!event || typeof event !== 'object') return false
@@ -271,54 +260,6 @@ export function isDownstreamCommitEvent(event) {
     )
   }
   return t.startsWith('response.output_')
-}
-
-/**
- * Timing starts at generated content, independently of downstream commitment.
- * A generated tool name is first output: name-only tools often never send a
- * parameter delta. Omitted thinking reports generated tokens without text.
- * Connection metadata, empty blocks, and trailers are not TTFT.
- * Shared Claude/Codex kernel stream path only; API transport still stamps the
- * first `data:` line in api-protocol.mjs.
- */
-function hasGeneratedContent(block) {
-  if (!block || typeof block !== 'object') return false
-  const nonempty = (value) => typeof value === 'string' && value.length > 0
-  if ([block.text, block.thinking, block.refusal].some(nonempty)) return true
-  if (block.type === 'redacted_thinking') return nonempty(block.data)
-  return (
-    (block.type === 'function_call' ||
-      block.type === 'custom_tool_call' ||
-      String(block.type || '').endsWith('tool_use')) &&
-    (nonempty(block.name) || nonempty(block.arguments) || nonempty(block.input))
-  )
-}
-
-function isFirstTokenEvent(event) {
-  if (!event || typeof event !== 'object') return false
-  const type = String(event.type || '')
-  if (type === 'content_block_delta') {
-    const delta = event.delta || {}
-    return (
-      [delta.text, delta.thinking, delta.partial_json, delta.refusal].some(
-        (value) => typeof value === 'string' && value.length > 0,
-      ) ||
-      (delta.type === 'thinking_delta' && Number.isFinite(delta.estimated_tokens) && delta.estimated_tokens > 0)
-    )
-  }
-  if (type === 'content_block_start') return hasGeneratedContent(event.content_block)
-  if (type.startsWith('response.') && type.endsWith('.delta')) {
-    return typeof event.delta === 'string' && event.delta.length > 0
-  }
-  if (type === 'response.content_part.added' || type === 'response.content_part.done')
-    return hasGeneratedContent(event.part)
-  if (type === 'response.output_item.added' || type === 'response.output_item.done') {
-    return (
-      hasGeneratedContent(event.item) ||
-      (Array.isArray(event.item?.content) && event.item.content.some(hasGeneratedContent))
-    )
-  }
-  return false
 }
 
 /** Anthropic SSE: message_start.message.usage + message_delta.usage. OpenAI Responses: response.usage. */
@@ -722,12 +663,11 @@ export async function streamGoWorker({
         committed: false,
       }
     }
-    let mockTtftMs = null
+    const mockTiming = createStreamTiming(mockStartedAt)
     await emitMockSse(async (line) => {
       if (line.startsWith('data:')) {
         try {
-          if (mockTtftMs == null && isFirstTokenEvent(JSON.parse(line.slice(5))))
-            mockTtftMs = Date.now() - mockStartedAt
+          mockTiming.observe(JSON.parse(line.slice(5)))
         } catch {}
         if (typeof onCommit === 'function') onCommit()
       }
@@ -741,14 +681,11 @@ export async function streamGoWorker({
       usage: payload.body?.usage || null,
       model: payload.body?.model || null,
       stopReason: payload.body?.stop_reason || null,
-      ttftMs: mockTtftMs,
-      firstTokenAt: mockTtftMs == null ? null : mockStartedAt + mockTtftMs,
+      ...mockTiming.snapshot(),
     }
   }
   let committed = false
-  // Hop-relative TTFT. firstTokenAt is epoch ms so request logs subtract ingress t0.
-  const startedAt = Date.now()
-  let ttftMs = null
+  const timing = createStreamTiming()
   const requestId = randomUUID()
   const stopCancel = cancelOnAbort(exec, signal, requestId)
   try {
@@ -795,6 +732,7 @@ export async function streamGoWorker({
       })
     }
     let buffer = ''
+    let receivedAt = null
     let lastError = null
     let dataBuf = ''
     let sseUsage = null
@@ -830,7 +768,7 @@ export async function streamGoWorker({
     }
     const observeSseEvent = (event) => {
       if (!event) return event
-      if (ttftMs == null && isFirstTokenEvent(event)) ttftMs = Date.now() - startedAt
+      timing.observe(event, receivedAt)
       if (event.type === 'response_headers' && event.headers && typeof event.headers === 'object') {
         sseRateHeaders = { ...sseRateHeaders, ...event.headers }
       }
@@ -868,6 +806,7 @@ export async function streamGoWorker({
       // job_done and its trailers afterward. Keep reading until the worker
       // closes the response so a normal completion is not mistaken for cancel.
       for await (const chunk of response) {
+        receivedAt = Date.now()
         buffer += Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk)
         let newline
         while ((newline = buffer.indexOf('\n')) >= 0) {
@@ -925,6 +864,14 @@ export async function streamGoWorker({
       }
       if (buffer && !outboundHeadersFrame) {
         applyClaudeSSELineToMessage(buffer, assembler)
+        if (buffer.startsWith('data:')) {
+          const piece = buffer.slice(5).trim()
+          if (piece && piece !== '[DONE]') {
+            dataBuf = dataBuf ? `${dataBuf}\n${piece}` : piece
+            const event = observeSseEvent(takeSseEvent())
+            if (isDownstreamCommitEvent(event)) await flushCommit()
+          }
+        }
         await emitLine(buffer)
       }
       if (dataBuf) {
@@ -952,8 +899,7 @@ export async function streamGoWorker({
         model: meta.model || sseModel || assembled?.model || null,
         stopReason,
         sawMessageStop,
-        ttftMs,
-        firstTokenAt: ttftMs == null ? null : startedAt + ttftMs,
+        ...timing.snapshot(),
         committed,
         terminalState,
         transportError: false,
@@ -966,8 +912,7 @@ export async function streamGoWorker({
     if (signal?.aborted) {
       return clientCancelledResult({
         via: 'go-worker-stream',
-        ttftMs,
-        firstTokenAt: ttftMs == null ? null : startedAt + ttftMs,
+        ...timing.snapshot(),
         committed,
       })
     }
@@ -984,8 +929,7 @@ export async function streamGoWorker({
         },
       },
       headers: {},
-      ttftMs,
-      firstTokenAt: ttftMs == null ? null : startedAt + ttftMs,
+      ...timing.snapshot(),
       committed,
       terminalState: committed ? 'incomplete' : 'transport_error',
       transportError: true,
