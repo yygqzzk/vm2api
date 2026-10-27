@@ -4,6 +4,7 @@
  */
 import path from 'node:path'
 import { callGoWorker, streamGoWorker, workerHealth, workerPaths } from './go-worker-client.mjs'
+import { isCodexStreamCommitEvent } from './codex-stream-policy.mjs'
 
 export function codexKernelPaths(exec = {}) {
   const base = workerPaths(exec)
@@ -51,10 +52,11 @@ export async function callCodexKernel(opts = {}) {
   )
 }
 
-export async function streamCodexKernel(opts = {}) {
+export async function streamCodexKernel({ forwardLifecycle = false, ...opts } = {}) {
   return remapVia(
     await streamGoWorker({
       ...opts,
+      commitEvent: forwardLifecycle ? isCodexStreamCommitEvent : undefined,
       exec: withCodexKernelExec(opts.exec),
       requestPath: '/internal/v1/codex/responses',
     }),

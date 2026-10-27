@@ -1,0 +1,24 @@
+# Explicit -f avoids the repository's WSL docker-compose.override.yml.
+services:
+  vm2api:
+    platform: linux/amd64
+    image: local/vm2api:fork-early-sse
+    build:
+      context: ../..
+      dockerfile: deploy/fork/Dockerfile
+    init: true
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:18787:8787"
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8787"
+      VM2API_API_KEY: ${VM2API_LOCAL_API_KEY:?set VM2API_LOCAL_API_KEY}
+      VM2API_ADMIN_PASSWORD: ${VM2API_LOCAL_ADMIN_PASSWORD:?required}
+      VM2API_DB_SECRET: ${VM2API_LOCAL_DB_SECRET:?set VM2API_LOCAL_DB_SECRET}
+      KIN_AUTO_SYNC_WRAP: "0"
+    volumes:
+      - ../../.local/fork-docker/data:/opt/vm2api/data
+      - ../../.local/fork-docker/vms:/opt/vm2api/vms
+      - ../../.local/fork-docker/config:/opt/vm2api/src/config
+    # No host docker.sock and no production accounts in this isolated instance.

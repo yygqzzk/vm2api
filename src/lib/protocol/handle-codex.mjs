@@ -790,6 +790,7 @@ export async function handleCodexProtocol({
               signal: gone.signal,
               body: outboundBody,
               reqHeaders: req.headers,
+              forwardLifecycle: stream && protocol === 'openai.responses',
               envelope: {
                 body: outboundBody,
                 headers: outboundHeaders,

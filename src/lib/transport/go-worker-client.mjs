@@ -594,6 +594,7 @@ export async function streamGoWorker({
   deliveryMode = 'realtime',
   onEvent,
   onCommit,
+  commitEvent = isDownstreamCommitEvent,
   want1m = false,
   cacheTtl = null,
   preserveCacheBreakpoints = null,
@@ -844,19 +845,19 @@ export async function streamGoWorker({
             if (piece && piece !== '[DONE]') {
               dataBuf = dataBuf ? `${dataBuf}\n${piece}` : piece
               const event = observeSseEvent(takeSseEvent())
-              if (isDownstreamCommitEvent(event)) await flushCommit()
+              if (commitEvent(event)) await flushCommit()
             }
           } else if (line === '') {
             if (dataBuf) {
               const event = takeSseEvent()
               dataBuf = ''
               observeSseEvent(event)
-              if (isDownstreamCommitEvent(event)) await flushCommit()
+              if (commitEvent(event)) await flushCommit()
             }
           } else if (dataBuf && !line.startsWith('event:') && !line.startsWith(':')) {
             dataBuf = `${dataBuf}\n${line}`
             const event = observeSseEvent(takeSseEvent())
-            if (isDownstreamCommitEvent(event)) await flushCommit()
+            if (commitEvent(event)) await flushCommit()
           }
           await emitLine(line)
         }
@@ -869,14 +870,14 @@ export async function streamGoWorker({
           if (piece && piece !== '[DONE]') {
             dataBuf = dataBuf ? `${dataBuf}\n${piece}` : piece
             const event = observeSseEvent(takeSseEvent())
-            if (isDownstreamCommitEvent(event)) await flushCommit()
+            if (commitEvent(event)) await flushCommit()
           }
         }
         await emitLine(buffer)
       }
       if (dataBuf) {
         const event = observeSseEvent(takeSseEvent())
-        if (isDownstreamCommitEvent(event)) await flushCommit()
+        if (commitEvent(event)) await flushCommit()
       }
       const trailers = mergeRateLimitHeaders(publicHeaders(response.trailers))
       const meta = streamMetaFromHeaders({ ...headers, ...trailers })

@@ -1,0 +1,5 @@
+# Keep the server's existing mounts and environment; load this file last.
+services:
+  vm2api:
+    image: ${VM2API_FORK_IMAGE:?set an immutable fork image tag}
+    pull_policy: never
