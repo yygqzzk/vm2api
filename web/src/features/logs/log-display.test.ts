@@ -1,6 +1,7 @@
 import type { ProviderChainItem } from '@/types/panel-usage-logs'
 import { describe, expect, it } from 'vitest'
 import {
+  queueWaitMs,
   cacheCostSplit,
   cacheWriteSplit,
   chainItemStatus,
@@ -38,6 +39,8 @@ function attempt(over: Partial<ProviderChainItem>): ProviderChainItem {
     action: null,
     downstreamCommitted: false,
     waitMs: null,
+    queueWaitMs: null,
+    schedulingMs: null,
     ttftMs: null,
     latencyMs: null,
     startedAt: null,
@@ -93,13 +96,16 @@ describe('latency segments', () => {
       durationMs: 15688,
     })
     expect(segments?.map((s) => [s.key, s.ms])).toEqual([
+      ['scheduling', 0],
       ['wait', 10],
       ['prefill', 190],
       ['tokenWait', 15365],
       ['generation', 123],
       ['finalization', 0],
     ])
-    expect(segmentWidth(segments![0])).toBe(3)
+    expect(
+      segmentWidth(segments!.find((segment) => segment.key === 'wait')!)
+    ).toBe(3)
   })
 
   it('keeps trailing time as finalization instead of generation', () => {
@@ -111,6 +117,7 @@ describe('latency segments', () => {
       durationMs: 1500,
     })
     expect(segments?.map((s) => [s.key, s.ms])).toEqual([
+      ['scheduling', 0],
       ['wait', 0],
       ['prefill', 200],
       ['tokenWait', 300],
@@ -266,5 +273,43 @@ describe('logs search', () => {
 
   it('counts a time range as one active filter', () => {
     expect(activeFilterCount({ startTime: 1, endTime: 2, model: 'm' })).toBe(2)
+  })
+})
+
+describe('scheduler versus capacity queue timings', () => {
+  it('does not relabel historical selection elapsed time as actual queue residence', () => {
+    expect(queueWaitMs([attempt({ waitMs: 5500 })])).toBeNull()
+    expect(
+      queueWaitMs([attempt({ waitMs: 250, queueWaitMs: 0, schedulingMs: 250 })])
+    ).toBe(0)
+    const parts = latencySegments({
+      waitMs: 5500,
+      firstByteMs: 6000,
+      ttftMs: 6200,
+      generationMs: 2000,
+      durationMs: 8500,
+    })
+    expect(parts?.find((part) => part.key === 'wait')?.label).toBe(
+      '调度与排队（未拆分）'
+    )
+  })
+  it('shows measured scheduling and queue time as separate non-overlapping segments', () => {
+    const parts = latencySegments({
+      waitMs: 500,
+      queueWaitMs: 300,
+      schedulingMs: 200,
+      firstByteMs: 1000,
+      ttftMs: 1100,
+      generationMs: 500,
+      durationMs: 1600,
+    })
+    expect(parts?.map((part) => [part.key, part.ms])).toEqual([
+      ['scheduling', 200],
+      ['wait', 300],
+      ['prefill', 500],
+      ['tokenWait', 100],
+      ['generation', 400],
+      ['finalization', 100],
+    ])
   })
 })

@@ -412,3 +412,56 @@ test('guest locale and amd64 arch map onto outbound /v1 headers', () => {
   assert.equal(identity.fingerprint.timezone, 'America/Los_Angeles')
   fs.rmSync(dir, { recursive: true, force: true })
 })
+
+test('official agent ids pass through and are not stored', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cc-agent-'))
+  const identity = {
+    userAgent: 'claude-cli/2.1.234 (external, cli)',
+    callerSessionId: 'slot-session',
+    fingerprint: { x_app: 'cli' },
+  }
+  const model = 'claude-sonnet-5'
+  const out = resolveCrsHeaders(
+    {
+      'user-agent': 'claude-cli/2.1.234 (external, cli)',
+      'anthropic-beta': 'oauth-2025-04-20,claude-code-20250219',
+      'x-claude-code-agent-id': 'agent-a',
+      'X-Claude-Code-Parent-Agent-Id': 'agent-parent',
+    },
+    dir,
+    identity,
+    model,
+  )
+  assert.equal(out['x-claude-code-agent-id'], 'agent-a')
+  assert.equal(out['x-claude-code-parent-agent-id'], 'agent-parent')
+  const stored = JSON.parse(fs.readFileSync(path.join(dir, '.claude', 'kin-cc-headers.json'), 'utf8'))
+  assert.equal(stored.headers['x-claude-code-agent-id'], undefined)
+  assert.equal(stored.headers['x-claude-code-parent-agent-id'], undefined)
+
+  const absent = resolveCrsHeaders(
+    {
+      'user-agent': 'claude-cli/2.1.234 (external, cli)',
+      'anthropic-beta': 'oauth-2025-04-20,claude-code-20250219',
+      'x-claude-code-agent-id': '',
+    },
+    dir,
+    identity,
+    model,
+  )
+  assert.equal(absent['x-claude-code-agent-id'], undefined)
+  assert.equal(absent['x-claude-code-parent-agent-id'], undefined)
+
+  const unofficial = resolveCrsHeaders(
+    {
+      'user-agent': 'Go-http-client/2.0',
+      'x-claude-code-agent-id': 'agent-a',
+      'x-claude-code-parent-agent-id': 'agent-parent',
+    },
+    dir,
+    identity,
+    model,
+  )
+  assert.equal(unofficial['x-claude-code-agent-id'], undefined)
+  assert.equal(unofficial['x-claude-code-parent-agent-id'], undefined)
+  fs.rmSync(dir, { recursive: true, force: true })
+})

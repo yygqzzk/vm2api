@@ -1515,7 +1515,7 @@ test('Environment rejects casual paths and newline cwd injection', () => {
   assert.ok(firstUserContent(casual).endsWith(`${callerReminder('please look at /tmp/secret and then answer')}hi`))
 })
 
-test('zero inject writes only billing with prompt_version; caller system is not in system', () => {
+test('zero inject keeps caller system after billing with prompt_version', () => {
   const out = applyCrsUnofficialPersona(
     {
       system: '你是一个高速收费员。',
@@ -1528,14 +1528,14 @@ test('zero inject writes only billing with prompt_version; caller system is not 
       identity: { timezone: 'Asia/Shanghai' },
     },
   )
-  assert.equal(out.system.length, 1)
+  assert.equal(out.system.length, 2)
   assert.match(out.system[0].text, /^x-anthropic-billing-header: /)
   assert.match(out.system[0].text, /prompt_version=<You are Claude Code, Anthropic's official CLI for Claude\.>/)
   assert.ok(!/\n/.test(out.system[0].text))
   assert.equal(out.system[0].cache_control, undefined)
   assert.ok(!out.system.some((b) => b?.text === CRS_EMPTY_IDENTITY_TEXT))
   assert.ok(!JSON.stringify(out.system).includes('# Environment'))
-  assert.ok(!JSON.stringify(out.system).includes('你是一个高速收费员。'))
+  assert.deepEqual(out.system[1], { type: 'text', text: '你是一个高速收费员。' })
   assert.equal(firstUserContent(out), '你好呀。')
   assert.equal(
     out.messages.some((message) => message.role === 'system'),
@@ -1553,10 +1553,10 @@ test('zero inject no longer appends standing constraints even when enabled', () 
       },
       { mode: 'zero', routingFile },
     )
-    assert.equal(out.system.length, 1)
+    assert.equal(out.system.length, 2)
     assert.match(out.system[0].text, /prompt_version=</)
     assert.ok(!JSON.stringify(out).includes(DEFAULT_AGENT_STANDING.split('\n')[0]))
-    assert.ok(!JSON.stringify(out.system).includes(agent))
+    assert.deepEqual(out.system[1], { type: 'text', text: agent })
   })
 })
 
@@ -1603,13 +1603,14 @@ test('refreshOfficialSystemEnvironment leaves zero inject untouched: it has no E
   assert.ok(!JSON.stringify(refreshed).includes('Europe/London'))
 })
 
-test('zero env off still writes billing only', () => {
+test('zero env off keeps caller system without generating Environment', () => {
   withRoutingCompat({ persona_preset: 'zero', persona_env_presets: { zero: false } }, (routingFile) => {
     const out = applyCrsUnofficialPersona(
       { system: 'caller', messages: [{ role: 'user', content: 'hi' }] },
       { routingFile, identity: { timezone: 'Asia/Tokyo' } },
     )
-    assert.equal(out.system.length, 1)
+    assert.equal(out.system.length, 2)
+    assert.deepEqual(out.system[1], { type: 'text', text: 'caller' })
     assert.match(out.system[0].text, /prompt_version=</)
     assert.ok(!JSON.stringify(out).includes('# Environment'))
     assert.ok(!JSON.stringify(out).includes('Asia/Tokyo'))

@@ -94,9 +94,13 @@ function PerformanceGauge({
 export function PerformanceTab({ row }: { row: UsageLogRow }) {
   const { ttftMs, durationMs, outputTokens, firstByteMs, generationMs } = row
   const rate = calculateOutputRate(outputTokens, generationMs)
-  const wait = queueWaitMs(row.providerChain)
+  const wait = row.providerChain[0]?.waitMs ?? null
+  const queued = queueWaitMs(row.providerChain)
+  const scheduling = row.providerChain[0]?.schedulingMs ?? null
   const breakdown = latencySegments({
     waitMs: wait,
+    queueWaitMs: queued,
+    schedulingMs: scheduling,
     firstByteMs,
     ttftMs,
     generationMs,
@@ -146,7 +150,10 @@ export function PerformanceTab({ row }: { row: UsageLogRow }) {
     breakdown?.find((s) => s.key === 'finalization')?.ms ?? 0
 
   const rows: [string, string][] = []
-  if (wait != null) rows.push(['排队等待', formatDuration(wait)])
+  if (scheduling != null) rows.push(['调度处理', formatDuration(scheduling)])
+  if (queued != null) rows.push(['排队等待', formatDuration(queued)])
+  if (scheduling == null && wait != null)
+    rows.push(['调度与排队（未拆分）', formatDuration(wait)])
   if (firstByteMs != null)
     rows.push(['首字节时间（TTFB）', formatDuration(firstByteMs)])
   if (ttftMs != null)
@@ -193,6 +200,8 @@ export function PerformanceTab({ row }: { row: UsageLogRow }) {
           <div className='rounded-lg border bg-card p-4'>
             <LatencyBreakdownBar
               waitMs={wait}
+              queueWaitMs={queued}
+              schedulingMs={scheduling}
               firstByteMs={firstByteMs}
               ttftMs={ttftMs}
               generationMs={generationMs}

@@ -826,9 +826,9 @@ test('agent standing: default off, explicit per-preset on, and custom text repla
     { persona_preset: 'zero', agent_standing: 'Stay terse.', agent_standing_presets: { zero: true } },
     (file) => {
       const out = applyCrsUnofficialPersona(body(), { routingFile: file })
-      assert.equal(out.system.length, 1)
+      assert.equal(out.system.length, 2)
       assert.equal(out.system[0].text.includes('Stay terse.'), false)
-      assert.equal(out.system.at(-1).text.includes(caller), false)
+      assert.deepEqual(out.system.at(-1), { type: 'text', text: caller })
     },
   )
   withRoutingFile({ persona_preset: 'zero' }, (file) => {
@@ -1073,7 +1073,7 @@ test('routing persona_guidance_presets turns the 303 guidance block on; default 
       const out = applyCrsUnofficialPersona({ messages: [{ role: 'user', content: 'hi' }] }, { routingFile: file })
       const [block] = guidance(out)
       assert.equal(block?.text, renderOfficial303Guidance())
-      assert.deepEqual(block.cache_control, { type: 'ephemeral' })
+      assert.deepEqual(block.cache_control, { type: 'ephemeral', ttl: '5m' })
       assert.equal(
         out.system.indexOf(block),
         out.system.findIndex((b) => b.text === '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__') + 1,

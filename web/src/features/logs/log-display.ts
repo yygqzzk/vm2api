@@ -319,18 +319,24 @@ export function finalProviderName(row: UsageLogRow): string {
   return row.vmName || row.vmId || row.providerName || '未知'
 }
 
-/** 队列等待取首次尝试：后续尝试的 wait 只是重试间隔，不是排队。 */
+/** 首次尝试的实测队列等待。历史总调度时间不能当作排队。 */
 export function queueWaitMs(
   chain: readonly ProviderChainItem[]
 ): number | null {
-  const wait = chain[0]?.waitMs
+  const wait = chain[0]?.queueWaitMs
   return wait != null && wait >= 0 ? wait : null
 }
 
 // ---------- 延迟分解 ----------
 
 export type LatencySegment = {
-  key: 'wait' | 'prefill' | 'tokenWait' | 'generation' | 'finalization'
+  key:
+    | 'wait'
+    | 'scheduling'
+    | 'prefill'
+    | 'tokenWait'
+    | 'generation'
+    | 'finalization'
   label: string
   ms: number
   percent: number
@@ -348,6 +354,8 @@ function measuredNonNeg(n: number | null | undefined): number | null {
  */
 export function latencySegments(input: {
   waitMs: number | null
+  queueWaitMs?: number | null
+  schedulingMs?: number | null
   firstByteMs: number | null
   ttftMs: number | null
   generationMs: number | null
@@ -367,6 +375,10 @@ export function latencySegments(input: {
 
   const cap = firstByteMs ?? ttftMs
   const wait = waitMs != null && cap != null && waitMs <= cap ? waitMs : 0
+  const queue = measuredNonNeg(input.queueWaitMs)
+  const scheduling = measuredNonNeg(input.schedulingMs)
+  const split =
+    queue != null && scheduling != null && queue + scheduling <= wait + 1
   const prefill = firstByteMs != null ? firstByteMs - wait : 0
   const tokenWait =
     firstByteMs != null && ttftMs != null
@@ -394,7 +406,13 @@ export function latencySegments(input: {
   const generationLabel =
     firstByteMs != null && ttftMs != null ? '内容输出' : '上游输出时间'
   const parts: Array<[LatencySegment['key'], string, number, string]> = [
-    ['wait', '排队等待', wait, 'bg-blue-500'],
+    ['scheduling', '调度处理', split ? scheduling : 0, 'bg-indigo-500'],
+    [
+      'wait',
+      split ? '排队等待' : '调度与排队（未拆分）',
+      split ? queue : wait,
+      'bg-blue-500',
+    ],
     ['prefill', '上游响应等待', prefill, 'bg-sky-500'],
     ['tokenWait', '首 Token 等待', tokenWait, 'bg-violet-500'],
     ['generation', generationLabel, generation, 'bg-emerald-500'],

@@ -174,6 +174,24 @@ for (const kind of ['Codex default', 'shared Claude']) {
   })
 }
 
+for (const forwardLifecycle of [false, true]) {
+  unixTest(`Codex envelope limit is preserved with forwardLifecycle=${forwardLifecycle}`, options, async (t) => {
+    const fx = await fixture(t, () => assert.fail('oversized envelope must not reach the kernel'))
+    const result = await streamCodexKernel({
+      exec: fx.exec,
+      envelope: { ...envelope, body: { ...envelope.body, input: 'x'.repeat(9 * 1024 * 1024) } },
+      routing: { failover: { max_request_mib: 8 } },
+      forwardLifecycle,
+      onEvent: () => assert.fail('request rejection must not reach SSE'),
+    })
+    assert.equal(result.status, 413)
+    assert.equal(result.body.error.code, 'body_too_large')
+    assert.equal(result.body.error.details.retryable, false)
+    assert.equal(result.committed, false)
+    assert.equal(fx.calls, 0)
+  })
+}
+
 unixTest('a silent HTTP rejection stays retryable even with early SSE enabled', options, async (t) => {
   const fx = await fixture(t, (_req, res) => {
     res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '30' })

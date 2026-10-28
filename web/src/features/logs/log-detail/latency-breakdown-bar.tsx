@@ -8,12 +8,16 @@ import { latencySegments, segmentWidth } from '../log-display'
  */
 export function LatencyBreakdownBar({
   waitMs,
+  queueWaitMs,
+  schedulingMs,
   firstByteMs,
   ttftMs,
   generationMs,
   durationMs,
 }: {
   waitMs: number | null
+  queueWaitMs: number | null
+  schedulingMs: number | null
   firstByteMs: number | null
   ttftMs: number | null
   generationMs: number | null
@@ -21,6 +25,8 @@ export function LatencyBreakdownBar({
 }) {
   const segments = latencySegments({
     waitMs,
+    queueWaitMs,
+    schedulingMs,
     firstByteMs,
     ttftMs,
     generationMs,

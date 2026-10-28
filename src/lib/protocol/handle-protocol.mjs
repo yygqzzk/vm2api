@@ -57,6 +57,7 @@ import {
 } from '../admin/health-probe.mjs'
 import { resolveInferenceBackend, runApiInference } from '../pool/api-protocol.mjs'
 import { classifyClaudeRequestPurpose, prepareClassifierBody, classifierRequestSummary } from './request-purpose.mjs'
+import { agentSummarySession } from './agent-summary.mjs'
 import { summarizeBody, redactHeaders, presentedApiKeyForLog } from '../admin/request-log.mjs'
 import { reasoningEffortOf, sessionIdForLog } from './log-fields.mjs'
 import { ownerScopeFromRequest } from '../admin/resource-owner.mjs'
@@ -84,7 +85,8 @@ import {
 } from '../core/errors.mjs'
 import { resolveWorkspaceMode, isOfficialClaudeClient } from './workspace-mode.mjs'
 import { officialMessagesBody } from './anthropic-messages.mjs'
-import { prepareOutboundEnvelope, prepareCliHopBody } from './outbound-attempt.mjs'
+import { prepareOutboundEnvelope, prepareCliHopBody, prepareCliPersonaInput } from './outbound-attempt.mjs'
+import { repairAnthropicRequest } from '../pool/upstream-error-policy.mjs'
 import { profileForPreset } from '../identity/official-profiles.mjs'
 import { loadVmIdentity, OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
 import { touchTelemetrySession } from '../vm/worker-telemetry.mjs'
@@ -216,6 +218,56 @@ export function createHandleProtocol(deps) {
         officialCost: priced.total_cost,
       })
     } catch {}
+  }
+
+  function keyGateErrorBody(gate) {
+    return makeError({
+      type: gate.status === 429 ? ErrorType.RATE_LIMIT : ErrorType.PERMISSION,
+      code: gate.code,
+      message: gate.message,
+      status: gate.status,
+      details: gate.detail || undefined,
+    }).body
+  }
+
+  // Codex handlers write usage onto logBag themselves. The key is charged the
+  // official cost usage_logs prices for the same row (image generation
+  // included) times the group rate; logBag is left as is so the row is too.
+  function billCodexKey(managedKey, logBag) {
+    if (logBag.final_state !== 'verified') return
+    const model = logBag.upstream_model || logBag.model
+    const image = logBag.image_usage
+      ? { usage: logBag.image_usage, model: logBag.image_model || null, only: logBag.protocol === 'openai.images' }
+      : null
+    try {
+      const priced = costColumnsFromUsage(logBag.usage || {}, model, image)
+      apiKeyStore.recordUsage(managedKey, logBag.usage || {}, {
+        model,
+        rateMultiplier: deps.groupsRepo.rateMultiplier(managedKey.group_id ?? 1),
+        officialCost: priced.total_cost,
+      })
+    } catch {}
+  }
+
+  /** Codex handlers take the same managed-key acquire / release / spend as the Claude paths. */
+  async function runWithCodexKey(req, res, logBag, run) {
+    const managedKey = req.apiKeyRecord || null
+    if (!managedKey) return run()
+    const gate = apiKeyStore.acquire(managedKey)
+    if (!gate.ok) {
+      stats.errors++
+      logBag.error_code = gate.code
+      logBag.error_message = gate.message
+      return json(res, gate.status, keyGateErrorBody(gate))
+    }
+    try {
+      return await run()
+    } finally {
+      try {
+        apiKeyStore.release(managedKey)
+      } catch {}
+      billCodexKey(managedKey, logBag)
+    }
   }
 
   function finishClientCancel(res, result, logBag) {
@@ -748,6 +800,7 @@ export function createHandleProtocol(deps) {
     if (platform.platform === 'openai') {
       const routing = getRouting() || {}
       const codexSticky = {
+        cfg,
         requestStartedAt: logCtx.t0,
         stickyRouter,
         sessions: accountQuota?.sessions || null,
@@ -769,7 +822,38 @@ export function createHandleProtocol(deps) {
         })
       if (protocol === 'anthropic.messages') {
         const codex = normalizeCodexRouting(routing.codex)
-        return handleCodexProtocol({
+        return runWithCodexKey(req, res, logBag, () =>
+          handleCodexProtocol({
+            req,
+            res,
+            protocol,
+            ctx,
+            inbound,
+            logBag,
+            stats,
+            json,
+            writeSSEHeaders,
+            routing: {
+              ...routing,
+              codex: {
+                ...codex,
+                protocols: {
+                  ...codex.protocols,
+                  'anthropic.messages': { mode: 'convert', enabled: true },
+                },
+                convert: { ...codex.convert, anthropic_to_codex: true },
+              },
+            },
+            projectRoot: cfg.paths.project,
+            captureOutbound: logCtx.capture_outbound === true,
+            accountGate,
+            ops: deps.codexOps || {},
+            ...codexSticky,
+          }),
+        )
+      }
+      return runWithCodexKey(req, res, logBag, () =>
+        handleCodexProtocol({
           req,
           res,
           protocol,
@@ -779,41 +863,14 @@ export function createHandleProtocol(deps) {
           stats,
           json,
           writeSSEHeaders,
-          routing: {
-            ...routing,
-            codex: {
-              ...codex,
-              protocols: {
-                ...codex.protocols,
-                'anthropic.messages': { mode: 'convert', enabled: true },
-              },
-              convert: { ...codex.convert, anthropic_to_codex: true },
-            },
-          },
+          routing,
           projectRoot: cfg.paths.project,
           captureOutbound: logCtx.capture_outbound === true,
           accountGate,
           ops: deps.codexOps || {},
           ...codexSticky,
-        })
-      }
-      return handleCodexProtocol({
-        req,
-        res,
-        protocol,
-        ctx,
-        inbound,
-        logBag,
-        stats,
-        json,
-        writeSSEHeaders,
-        routing,
-        projectRoot: cfg.paths.project,
-        captureOutbound: logCtx.capture_outbound === true,
-        accountGate,
-        ops: deps.codexOps || {},
-        ...codexSticky,
-      })
+        }),
+      )
     }
     if (protocol === 'openai.responses') {
       stats.errors++
@@ -893,6 +950,8 @@ export function createHandleProtocol(deps) {
     }
     const officialClient = isOfficialClaudeClient(fp.client_class)
     const callerSession = extractCallerSession({ inbound, body: ctx.body, headers: req.headers })
+    const summarySession = agentSummarySession(inbound, { officialTraffic })
+    const executionSession = summarySession || callerSession
     const firstUserText = extractFirstUserText(ctx.body?.messages) || extractFirstUserText(inbound?.messages)
     // Seed identity skips a leading <system-reminder>; firstUserText stays billing-only.
     const firstUserIdentity =
@@ -937,17 +996,23 @@ export function createHandleProtocol(deps) {
     // Seat = this client session. Same device, other session = other slot.
     const seatKey = seatless
       ? null
-      : resolveSeatIdentity({ inbound, body: ctx.body, headers: req.headers, clientIp: clientIp(req) }).key
-    const sessionKeys = stickyRouter?.sessionPoolKeys
-      ? stickyRouter.sessionPoolKeys(req, inbound, {
-          sessionId: inboundIdentity.sessionId,
-          deviceId: stickyDeviceId,
-          migrate: !isProbe,
-        })
-      : {
-          stickyKey: stickyRouter?.extractPoolKey?.(req, inbound, { platform: 'anthropic' }) || null,
-          stickyKeys: stickyRouter?.collectPoolKeys?.(req, inbound, { platform: 'anthropic' }) || [],
-        }
+      : summarySession
+        ? `seat:sess:${summarySession}`
+        : resolveSeatIdentity({ inbound, body: ctx.body, headers: req.headers, clientIp: clientIp(req) }).key
+    // Summary forks retain parent affinity, but must not migrate/bind its
+    // aliases or join its serialization queue while the parent is streaming.
+    const sessionKeys = summarySession
+      ? { stickyKey: null, stickyKeys: [] }
+      : stickyRouter?.sessionPoolKeys
+        ? stickyRouter.sessionPoolKeys(req, inbound, {
+            sessionId: inboundIdentity.sessionId,
+            deviceId: stickyDeviceId,
+            migrate: !isProbe,
+          })
+        : {
+            stickyKey: stickyRouter?.extractPoolKey?.(req, inbound, { platform: 'anthropic' }) || null,
+            stickyKeys: stickyRouter?.collectPoolKeys?.(req, inbound, { platform: 'anthropic' }) || [],
+          }
     const stickyKey = sessionKeys.stickyKey || null
     const stickyKeys = sessionKeys.stickyKeys || []
     const deviceKey = stickyDeviceId ? stickyRouter?.canonicalDeviceKey?.(stickyDeviceId) || null : null
@@ -963,7 +1028,7 @@ export function createHandleProtocol(deps) {
     const familyVmId = familyKey ? stickyRouter?.resolve?.(familyKey)?.vmId || null : null
     const stickyBound =
       stickyKey && typeof stickyRouter?.resolve === 'function' ? stickyRouter.resolve(stickyKey) : null
-    const outboundSessionId = resolveOutboundSessionId(callerSession, {
+    const outboundSessionId = resolveOutboundSessionId(executionSession, {
       ...sessionContext,
       accountId: stickyBound?.accountId || '',
       boundSessionId: stickyBound?.sessionId || '',
@@ -996,10 +1061,22 @@ export function createHandleProtocol(deps) {
     // leftover OpenAI-shaped tools are still marked (rewrite / mixed inbound).
     ctx.body = applyEagerToolStreaming(ctx.body, getRouting())
     const personaIn = ctx.body
+    // Capture ownership before rendering supplies gateway markers or projects
+    // the caller's automatic cache policy onto a CLI message block.
+    const preserveMessageCache =
+      personaIn.cache_control != null ||
+      // A zero template can interpolate cached caller system blocks into a
+      // message. Those boundaries must remain caller-owned after rendering.
+      (Array.isArray(personaIn.system) && personaIn.system.some((block) => block?.cache_control != null)) ||
+      (Array.isArray(personaIn.messages) &&
+        personaIn.messages.some(
+          (message) => Array.isArray(message?.content) && message.content.some((block) => block?.cache_control != null),
+        ))
     if (!requestContext)
       ctx.body = applyCrsUnofficialPersona(ctx.body, {
         officialClient: officialTraffic,
         routingFile: routingConfigPath,
+        cacheTtl: requestedCacheTtl,
         headers: req.headers,
         sessionId: outboundSessionId,
         model: ctx.body?.model,
@@ -1024,6 +1101,7 @@ export function createHandleProtocol(deps) {
         officialClient: false,
         forceConfigured: true,
         routingFile: routingConfigPath,
+        cacheTtl: requestedCacheTtl,
         headers: req.headers,
         sessionId: outboundSessionId,
         model: ctx.body?.model,
@@ -1055,17 +1133,7 @@ export function createHandleProtocol(deps) {
         const gate = apiKeyStore.acquire(managedKey)
         if (!gate.ok) {
           stats.errors++
-          return json(
-            res,
-            gate.status,
-            makeError({
-              type: gate.status === 429 ? ErrorType.RATE_LIMIT : ErrorType.PERMISSION,
-              code: gate.code,
-              message: gate.message,
-              status: gate.status,
-              details: gate.detail || undefined,
-            }).body,
-          )
+          return json(res, gate.status, keyGateErrorBody(gate))
         }
       }
       const clientAbort = bindClientAbort(req, res)
@@ -1077,6 +1145,9 @@ export function createHandleProtocol(deps) {
       // stream:false only changes the client response shape (assembled JSON).
       const deliveryMode = requestedDelivery === 'verified' ? 'verified' : 'realtime'
       logBag.via = 'api-kernel'
+      // This backend forwards caller cache controls unchanged. Billing must
+      // use the upstream 5m/1h split, not the TTL requested for template fills.
+      cacheTtl = null
       let result
       try {
         result = await runApiInference({
@@ -1176,17 +1247,7 @@ export function createHandleProtocol(deps) {
       const gate = apiKeyStore.acquire(managedKey)
       if (!gate.ok) {
         stats.errors++
-        return json(
-          res,
-          gate.status,
-          makeError({
-            type: gate.status === 429 ? ErrorType.RATE_LIMIT : ErrorType.PERMISSION,
-            code: gate.code,
-            message: gate.message,
-            status: gate.status,
-            details: gate.detail || undefined,
-          }).body,
-        )
+        return json(res, gate.status, keyGateErrorBody(gate))
       }
     }
 
@@ -1236,7 +1297,10 @@ export function createHandleProtocol(deps) {
     const noteCachePrefix = (selected, sessionId, body) => {
       if (!sessionId) return body
       const key = `${selected.accountId}:${sessionId}`
-      const { body: prepared, ...prefix } = prepareCachePrefix(key, body, Date.now(), { imageKey }) || { body }
+      const { body: prepared, ...prefix } = prepareCachePrefix(key, body, Date.now(), {
+        imageKey,
+        preserveMessageCache,
+      }) || { body }
       logBag.cache_prefix = prefix
       logBag.cache_prefix_key = key
       if (prefix.image_floor_moved) {
@@ -1277,7 +1341,7 @@ export function createHandleProtocol(deps) {
         stickyDeviceId,
         deviceKey,
         skipSessionSeat: seatless,
-        familyKey,
+        familyKey: summarySession ? null : familyKey,
         seatKey,
         familyVmId,
         pinVmId,
@@ -1287,6 +1351,7 @@ export function createHandleProtocol(deps) {
         quotaRequest: {
           body: canonicalBody,
           sessionId: outboundSessionId || callerSession || stickyKey,
+          preserveMessageCache,
         },
         stream: upstreamStream,
         deliveryMode,
@@ -1321,7 +1386,7 @@ export function createHandleProtocol(deps) {
             }
           }
           try {
-            touchTelemetrySession(cfg.paths.project, selected.vmId, selected.exec?.vm)
+            touchTelemetrySession(cfg.paths.project, selected.vmId, selected.exec?.vm, body?.model)
           } catch {}
           const identity = loadVmIdentity(selected.exec)
           const attemptStartedAt = extra.attemptStartedAt ?? Date.now()
@@ -1330,7 +1395,7 @@ export function createHandleProtocol(deps) {
           const keptSession = extra.freshSlot ? '' : attemptBound?.sessionId || ''
           const keptAccount = extra.freshSlot ? '' : attemptBound?.accountId || ''
           const keptVm = extra.freshSlot ? '' : attemptBound?.vmId || ''
-          const attemptSessionId = resolveOutboundSessionId(callerSession, {
+          const attemptSessionId = resolveOutboundSessionId(executionSession, {
             ...sessionContext,
             accountId: selected.accountId,
             boundSessionId: keptSession,
@@ -1373,9 +1438,10 @@ export function createHandleProtocol(deps) {
             const outboundProfile = profileForPreset(resolvedPersona)
             // Render once from caller input with the selected slot's identity, not the pre-selection environment.
             if (!requestContext && !officialTraffic) {
-              hopBody = applyCrsUnofficialPersona(structuredClone(personaIn), {
+              hopBody = applyCrsUnofficialPersona(prepareCliPersonaInput(structuredClone(personaIn), resolvedPersona), {
                 forceConfigured: true,
                 routingFile: routingConfigPath,
+                cacheTtl: requestedCacheTtl,
                 mode: resolvedPersona,
                 sessionId: attemptSessionId,
                 model: hopBody?.model,
@@ -1385,8 +1451,9 @@ export function createHandleProtocol(deps) {
               })
               // The re-render starts from the raw caller body; re-apply this account's thinking ownership to it.
               hopBody = filterThinkingForAccount(hopBody, selected.accountId, thinkingOwnerStore).body
+              for (const policy of extra.repairs || []) hopBody = repairAnthropicRequest(hopBody, policy)
             }
-            hopBody = prepareCliHopBody(repaired ? body : hopBody, {
+            hopBody = prepareCliHopBody(hopBody, {
               stream: upstreamStream,
               repaired,
               cacheTtl: requestedCacheTtl,
@@ -1396,6 +1463,7 @@ export function createHandleProtocol(deps) {
               preserveCallerEnvironment,
               autoCompactWindow: ctx.autoCompactWindow,
               routing: routingNow,
+              personaPreset: !requestContext && !officialTraffic ? resolvedPersona : null,
             })
             if (!requestContext) {
               hopBody = ensureBillingAttribution(hopBody, {
@@ -1456,6 +1524,7 @@ export function createHandleProtocol(deps) {
               officialClient: false,
               forceConfigured: true,
               routingFile: routingConfigPath,
+              cacheTtl: requestedCacheTtl,
               mode: configuredMode,
               sessionId: attemptSessionId,
               model: personaIn?.model,
@@ -1463,6 +1532,7 @@ export function createHandleProtocol(deps) {
               identity,
             })
             hopBody = officialMessagesBody(rewritten)
+            for (const policy of extra.repairs || []) hopBody = repairAnthropicRequest(hopBody, policy)
             personaHideTokens = personaHideForUnofficial(personaIn, rewritten, {
               officialClient: false,
               mode: configuredMode,
@@ -1844,18 +1914,20 @@ export function createHandleProtocol(deps) {
     }
     logBag.model = typeof body?.model === 'string' ? body.model : null
     logBag.inbound_summary = summarizeBody(body)
-    return handleCodexSearch({
-      req,
-      res,
-      body,
-      logBag,
-      stats,
-      json,
-      routing: getRouting() || {},
-      projectRoot: cfg.paths.project,
-      stickyRouter,
-      ownerScope: ownerScopeFromRequest(req, apiKeyStore?.users),
-    })
+    return runWithCodexKey(req, res, logBag, () =>
+      handleCodexSearch({
+        req,
+        res,
+        body,
+        logBag,
+        stats,
+        json,
+        routing: getRouting() || {},
+        projectRoot: cfg.paths.project,
+        stickyRouter,
+        ownerScope: ownerScopeFromRequest(req, apiKeyStore?.users),
+      }),
+    )
   }
 
   /** Field names and image count only: Images bodies carry base64 uploads. */
@@ -1954,19 +2026,21 @@ export function createHandleProtocol(deps) {
     }
     logBag.model = typeof body?.model === 'string' ? body.model : null
     logBag.inbound_summary = summarizeImagesBody(body)
-    return handleCodexImages({
-      req,
-      res,
-      kind,
-      body,
-      logBag,
-      stats,
-      json,
-      routing: getRouting() || {},
-      projectRoot: cfg.paths.project,
-      stickyRouter,
-      ownerScope: ownerScopeFromRequest(req, apiKeyStore?.users),
-    })
+    return runWithCodexKey(req, res, logBag, () =>
+      handleCodexImages({
+        req,
+        res,
+        kind,
+        body,
+        logBag,
+        stats,
+        json,
+        routing: getRouting() || {},
+        projectRoot: cfg.paths.project,
+        stickyRouter,
+        ownerScope: ownerScopeFromRequest(req, apiKeyStore?.users),
+      }),
+    )
   }
 
   return {

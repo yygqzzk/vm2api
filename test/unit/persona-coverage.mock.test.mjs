@@ -50,9 +50,10 @@ function assertOfficial(body, { caller = '' } = {}) {
   assert.match(String(env?.content || ''), /^# Environment\n/)
 }
 
-function assertZero(body) {
+function assertZero(body, { caller = '' } = {}) {
   const blocks = texts(body)
-  assert.equal(blocks.length, 1)
+  assert.equal(blocks.length, caller ? 2 : 1)
+  if (caller) assert.equal(blocks[1], caller)
   assert.match(blocks[0], /x-anthropic-billing-header:/)
   assert.match(blocks[0], /prompt_version=<You are Claude Code, Anthropic's official CLI for Claude\.>/)
   assert.ok(!blocks.some((text) => text === '\u200b' || text.startsWith('# Environment')))
@@ -103,11 +104,11 @@ test('official-looking traffic still gets the configured prompt when force-confi
   })
 })
 
-test('zero preset stays zero-inject: billing only, no placeholders or official prompt', () => {
+test('zero preset adds only billing and retains caller text without an official prompt', () => {
   withRouting({ persona_preset: 'zero', overlay_preset: 'off' }, (file) => {
-    for (const [, body] of SHAPES) {
+    for (const [name, body] of SHAPES) {
       const out = applyCrsUnofficialPersona(structuredClone(body), { routingFile: file })
-      assertZero(out)
+      assertZero(out, { caller: name === 'caller leftover' ? 'keep-this-caller' : '' })
     }
   })
 })

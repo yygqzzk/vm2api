@@ -79,6 +79,8 @@ export type RequestAttempt = {
   terminal_state?: string | null
   usage?: Record<string, unknown> | null
   wait_ms?: number | null
+  queue_wait_ms?: number | null
+  scheduling_ms?: number | null
   ttft_ms?: number | null
   latency_ms?: number | null
   [key: string]: unknown

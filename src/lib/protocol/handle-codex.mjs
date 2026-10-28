@@ -2,6 +2,8 @@
  * Codex hop from handle-protocol. Claude convert/pool/CRS never runs here.
  */
 import path from 'node:path'
+import { resolveStreamIdleTimeoutMs } from '../core/config.mjs'
+import { isClientStream, fromClaudeToOpenAIChat, fromClaudeToOpenAICompletions } from './convert.mjs'
 import { getVm, listVms, persistCodexUsage, syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
 import { isValidVmId } from '../vm/vm-file.mjs'
 import { isCodexProtocolAllowed, isCodexVm, normalizeCodexRouting } from './codex-route.mjs'
@@ -336,13 +338,19 @@ export function codexFailureHold(result, now = Date.now()) {
 }
 
 /** Idle SOCKS / first hop 502 is retryable only before any SSE byte is committed. */
+/** Lowercased tier; empty, oversized or control-character values are not a tier. */
+function normalizeServiceTier(raw) {
+  if (typeof raw !== 'string') return null
+  const tier = raw.trim().toLowerCase()
+  return tier && tier.length <= 64 && !/[\x00-\x1f\x7f]/.test(tier) ? tier : null
+}
+
 /** `response.service_tier` from a Responses SSE data line, if present. */
 export function serviceTierFromSseLine(line) {
   if (typeof line !== 'string' || !line.startsWith('data:') || !line.includes('service_tier')) return null
   try {
     const ev = JSON.parse(line.slice(5).trim())
-    const tier = ev?.response?.service_tier ?? ev?.service_tier
-    return typeof tier === 'string' && tier ? tier : null
+    return normalizeServiceTier(ev?.response?.service_tier ?? ev?.service_tier)
   } catch {
     return null
   }
@@ -544,6 +552,7 @@ export async function handleCodexProtocol({
   requestStartedAt = Date.now(),
   accountGate = null,
   ownerScope = null,
+  cfg = null,
 }) {
   const codex = normalizeCodexRouting(routing.codex)
   const allowed = isCodexProtocolAllowed(protocol, { codex })
@@ -605,7 +614,8 @@ export async function handleCodexProtocol({
       },
     })
   }
-  const stream = inbound?.stream !== false && ctx.body?.stream !== false
+  // Upstream Codex always streams; the caller still chooses JSON versus SSE.
+  const stream = isClientStream(inbound || ctx.body, req.headers) && ctx.body?.stream !== false
   const inboundSession = sessionFrom(req, converted.body)
   const sessionMode = outboundSessionMode(routing)
   const callerSession = extractCallerSession({
@@ -788,6 +798,9 @@ export async function handleCodexProtocol({
             args: {
               exec: execFor(projectRoot, vm),
               signal: gone.signal,
+              timeoutMs: cfg?.limits?.upstream_timeout_ms ?? 600_000,
+              idleTimeoutMs: resolveStreamIdleTimeoutMs(routing, cfg),
+              routing,
               body: outboundBody,
               reqHeaders: req.headers,
               forwardLifecycle: stream && protocol === 'openai.responses',
@@ -891,8 +904,11 @@ export async function handleCodexProtocol({
         if (delivered) {
           attemptKind = 'succeeded'
           bindSticky(outboundSessionId)
-          const serviceTier = responseServiceTier || converted.body?.service_tier || usage?.service_tier || null
-          const logged = disjointOpenaiUsage(usage && serviceTier ? { ...usage, service_tier: serviceTier } : usage)
+          // Billing follows the tier actually sent (codex-proxy-rs contract). The upstream
+          // echo is kept apart: `priority` answered with `default` is a Fast downgrade (#777).
+          const serviceTier = normalizeServiceTier(outboundBody.service_tier)
+          logBag.upstream_service_tier = responseServiceTier
+          const logged = disjointOpenaiUsage(usage ? { ...usage, service_tier: serviceTier } : usage)
           logBag.usage = logged
           const imageUsage =
             result.body?.tool_usage?.image_gen || result.body?.response?.tool_usage?.image_gen || streamedImageUsage
@@ -909,10 +925,16 @@ export async function handleCodexProtocol({
             let body
             try {
               const assembled = assembleCodexBodyFromSse(chunks, result.body || {})
-              body =
-                protocol === 'anthropic.messages'
-                  ? codexBodyToAnthropicMessage(assembled, converted.body.model)
-                  : assembled
+              body = assembled
+              if (protocol !== 'openai.responses') {
+                const message = codexBodyToAnthropicMessage(assembled, converted.body.model)
+                body =
+                  protocol === 'openai.chat'
+                    ? fromClaudeToOpenAIChat(message, converted.body.model)
+                    : protocol === 'openai.completions'
+                      ? fromClaudeToOpenAICompletions(message, converted.body.model)
+                      : message
+              }
             } catch (error) {
               if (!isToolArgumentsError(error)) throw error
               stats.errors++

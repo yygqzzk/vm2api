@@ -511,13 +511,14 @@ export function describeCacheContinuity({
  * Compare `body` with the stored turn of `sessionKey` without recording.
  * `confirmed` is true only after a successful hop called confirmCachePrefix.
  */
-export function peekCachePrefix(sessionKey, body, now = Date.now()) {
+export function peekCachePrefix(sessionKey, body, now = Date.now(), { preserveMessageCache = null } = {}) {
   const key = String(sessionKey || '').trim()
   if (!key || !body || typeof body !== 'object') return null
   const previous = liveSession(key, now)
   // Compare what prepareCachePrefix would send, not the client's raw images.
   const images = liveImageState(previous?.image_key || key, now)
-  const current = snapshotBody(retainImages(images, body).body)
+  const preserve = preserveMessageCache ?? previous?.preserve_message_cache ?? false
+  const current = snapshotBody(preserve ? body : retainImages(images, body).body)
   const compared = comparePrefix(previous, current)
   return { ...compared, confirmed: !!previous?.confirmed }
 }
@@ -733,21 +734,31 @@ function placeMarkers(body, { br, writes, previousTail }) {
  * snapshot is the body before markers move, since markers are not history. It
  * stays unconfirmed until confirmCachePrefix: a failed/rejected hop must not
  * make the next estimate treat the session as warm.
+ * `preserveMessageCache` is determined before gateway markers are added. Caller
+ * policy makes this observer-only: even image trimming can move/drop markers.
  */
-export function prepareCachePrefix(sessionKey, body, now = Date.now(), { imageKey = null } = {}) {
+export function prepareCachePrefix(
+  sessionKey,
+  body,
+  now = Date.now(),
+  { imageKey = null, preserveMessageCache = false } = {},
+) {
   const key = String(sessionKey || '').trim()
   if (!key || !body || typeof body !== 'object') return null
   const imagesAt = String(imageKey || '').trim() || key
   const previous = liveSession(key, now)
-  const retained = retainImages(liveImageState(imagesAt, now), body)
+  const retained = preserveMessageCache
+    ? { body, floor: 0, active: false, moved: false }
+    : retainImages(liveImageState(imagesAt, now), body)
   const current = snapshotBody(retained.body)
   const compared = comparePrefix(previous, current)
   const br = compared.break
   const writes = liveWrites(previous, br, now)
   const previousTail = previous?.tail ?? -1
-  const placed = Array.isArray(retained.body.messages)
-    ? placeMarkers(retained.body, { br, writes, previousTail })
-    : null
+  const placed =
+    !preserveMessageCache && Array.isArray(retained.body.messages)
+      ? placeMarkers(retained.body, { br, writes, previousTail })
+      : null
   const sent = placed?.body ?? retained.body
   sessions.delete(key)
   sessions.set(key, {
@@ -756,6 +767,7 @@ export function prepareCachePrefix(sessionKey, body, now = Date.now(), { imageKe
     at: now,
     confirmed: false,
     image_key: imagesAt,
+    preserve_message_cache: preserveMessageCache,
     writes,
     pending: markerWrites(sent, now),
     // Where the caller's tail marker sat; a later turn reads it if it was written.

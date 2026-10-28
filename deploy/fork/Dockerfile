@@ -2,6 +2,10 @@
 FROM ghcr.io/dofastted/vm2api:v1.4.015@sha256:ff178d9229e5c363b71f0f55d83f1fcbc79ba7ae4c35682cfa32a88264fc71cf
 WORKDIR /opt/vm2api
 
+# Refuse newer source before overlaying it on the legacy 1.4.015 runtime.
+COPY VERSION /tmp/fork-source-version
+RUN cmp VERSION /tmp/fork-source-version
+
 # Refuse to overlay these modules on an incompatible upstream release.
 RUN printf '%s\n' \
     'd0e3e10bc6143e507580d016fccaa151a095b767231956421f5f986004ea306c  src/lib/transport/go-worker-client.mjs' \

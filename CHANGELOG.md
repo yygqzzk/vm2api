@@ -1,5 +1,67 @@
 # Changelog
 
+## Unreleased
+
+- #804：准入钩子期间释放后按实时 inflight 递增，避免占位复活。
+- #805：修复请求体省略 `stream`、`Accept: application/json, text/event-stream` 时 `/v1/messages` 等入口返回 SSE：Claude Code 2.1.311 起 auto 模式分类器以非流式发出、按 JSON 解析，SSE 回包让非流式网关（如 Sub2API）判为空消息 502，子代理工具调用全部失败。省略 `stream` 时仅当 `Accept` 对 `text/event-stream` 的偏好高于 `application/json`（q 值，同值算 JSON）才流式；只写 `text/event-stream` 及显式 `stream` 行为不变。
+
+## 1.4.023 — 2026-10-28
+
+- #791：识别官方 Claude Code 的 `agent_summary` 进度摘要请求（末尾完整摘要指令，含同消息 tool_result + text 与 token-budget 提醒），每次用临时出站会话和独立 seat，不进父会话串行队列、不绑定父会话 sticky / family；VM 亲和、槽位、并发与额度准入照常，容量耗尽时仍排队。普通同会话请求继续串行。此前摘要被父会话长请求挡住，观测到总 TTFT 185 秒（模型 TTFT 2.2 秒）。
+- #797：修复 zero 自定义模板重排调用方变量或插入中间 system 后产生 `5m → 1h` 非法顺序：仅对原本合法、被模板重排打乱的调用方策略，将过早出现的短时断点顺延到最后一个调用方 `1h` 断点后。保留正文布局、显式 / 隐式 TTL、标记字段与数量，断点仍覆盖原标记内容；模板断点随后按剩余预算合并。
+- #797：修复 Chat assistant 文本块转换丢失缓存标记，保留分块、显式 / 隐式 TTL 及工具调用顺序。zero 自定义模板展开调用方变量时保留原块与缓存所有权，重复引用不复制断点，完整组装后统一计算 TTL 顺序与四断点预算；插入消息的调用方 system 断点同样避开历史优化搬移。去重 token-budget 提醒时保留其缓存锚点，避免误触发默认 TTL 补点。
+- #797：修复消息内 system / developer 提升到顶层 system 时丢失缓存标记：保留前置消息的文本块、空白与显式 / 隐式 TTL，覆盖 Messages、Chat 及 Responses 转换。中间 system 必须提升时，正文仍保持 system 优先级，缓存标记通过独立文本锚点留在原历史边界，避免 5m 被移到已有 1h 前面；不覆盖原断点或打乱工具结果顺序。
+- #797：自定义提示词模板也统一合并缓存策略：缺失 TTL 按配置及前后顺序补齐，优先保留调用方断点，省略冲突或超出四断点预算的模板标记，保留模板正文；同时覆盖 CLI 与 API 路径。
+- #797：官方 / 完整官方不再因业务 system 提及 SDK、客户端名称、协议字段或使用相似章节标题而删除整段；仅清理明确的独立身份行、计费头与完整已知官方模板，保留相邻业务指令。
+- #797：历史缓存优化在模板组装前识别调用方消息 / 顶层缓存策略：此类请求只记录前缀诊断，不搬移消息断点或裁剪历史图片，保留原位置、显式 / 隐式 TTL 与同消息多标记；网关生成的消息断点继续优化，额度预估同步使用相同策略。
+- #797：官方 / 完整官方及自定义模板出站使用明确的组装状态，关闭或删除动态边界后也不再二次清理、重建 system 或覆盖调用方消息 TTL；缺少消息标记时继续按配置及剩余预算补齐。
+- #797：官方 / 完整官方与 zero 共用缓存合并约束，优先保留调用方断点；模板显式 TTL 冲突或超过四断点预算时仅省略模板标记、保留正文。CLI 在模板计算 TTL 前清理不出站的工具及顶层标记，避免已移除的工具隐式 5m 将配置的 1h 降级；API 仍按保留的工具标记约束顺序。
+- #797：zero 的顶层自动缓存转换为当前消息尾部断点，保留其显式 / 隐式 TTL，跳过 thinking，已有尾部标记不覆盖；随请求历史增长重新定位，不再因 system 已有断点而丢失消息缓存。
+- #797：已保存且仍匹配旧默认结构的官方模板自动补回 `caller_system` 段；编辑器与预览同步显示。用户明确关闭该段或编辑过的模板不被覆盖。
+- #797：zero 出站按当前槽位已解析的预设识别，不再依赖可关闭或编辑的 billing 文本；关闭 billing 后也保留调用方 system 与原缓存时长，缺少标记时继续按配置补消息断点。官方 / 完整官方模板补 TTL 时计入前置工具标记与顶层自动缓存；zero 自定义模板同时将顶层标记纳入四断点预算。
+- #797：修复 zero 档默认模板丢失调用方 system：保留原始文本块、顺序与缓存标记，仅替换 billing 行；已保存的仅含 billing 的模板同样生效。显式使用 `{{caller_system}}` 的自定义模板继续控制其位置，出站预览同步展示调用方示例。
+- #797：zero 自定义模板中已被 `caller_agent` / `agent_official` 使用的文本不再重复追加；未启用的模板位置不消耗调用方内容。调用方动态边界文本不再触发官方模板的工具缓存清理。合并缓存时优先保留调用方标记，模板缺失 TTL 按配置与前后约束补齐；冲突或超出四断点预算的模板标记被省略，文本仍保留。
+- #797：自动修复重试在当前槽位模板组装后重放修复策略，保留调用方 system、槽位覆盖与修复结果；已缓存的搜索历史修复同样生效。API 直连的日志与计费保留上游实际 5m / 1h 用量，不再按默认 TTL 重标；usage 隐藏排除调用方原有文本，包括与旧 billing 行同块的 Environment。
+- #797：官方 / 完整官方提示词已组装动态边界后，恢复对话历史的消息缓存断点：没有调用方消息断点时，按剩余四断点预算补最后及上一条 user（预算只剩一个时优先最后一条）。保留 system 文本和调用方消息断点；沿用官方档工具断点清理行为，在清理后计算消息断点预算。lean / preserveSystem / requestContext 路径不启用消息补点。
+- #797：默认缓存写入 TTL 同时用于网关生成的官方模板断点和新增消息断点。模板标记未声明 TTL 时在生成阶段补齐，使用请求覆盖及会话固定后的值；已有明确 TTL 和调用方消息标记保持不变，并约束新增 TTL 避免 5m 后出现 1h。不会仅凭调用方 system 的动态边界标记认定其为网关生成的模板。
+
+已部署机升级：更新 Node 控制面与 `web/dist` 后重启；cli-node 哈希未变，不必 `fetch:payload` / `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.4.022 — 2026-10-28
+
+- 官方 Claude Code 入站带 `x-claude-code-agent-id` 或 `x-claude-code-parent-agent-id` 时，出站原样保留；没有则不添加，也不写入槽位头文件。非官方入站不转发。cli-node 不生成这两个头。Go worker 与 kernel hop 放行同名头。
+- kernel hop 放行已有的 `x-claude-code-agent-id` / `x-claude-code-parent-agent-id`。新 ELF SHA256 `8a61aaa3cba06567a4c3b0039d357b341975e2495ec7fc7e8b5c3425cc53ec16`（12947192 字节），payload `payload-2026.10.28-kernel-agent-id`。`bin/kin-kernel` 与 `share/wrap-cli/kin-kernel.bin` 是同一份。其余 payload 附件哈希不变。
+- #777：Codex 用量的 `service_tier` 与费用改按网关实际发出的档位（`fast` 已改写为 `priority`），与 codex-proxy-rs 一致；上游 `response.service_tier` 回显另存到新列 `upstream_service_tier`（迁移 047），不再覆盖计费档。发出 `priority`、上游回显其他档位时，日志「特殊设置」显示「Fast 未生效：priority → default」。未发档位的请求不再拿上游回显当计费档。网关发出的请求体与 `x-codex-routing-hint` 不变；上游回 `default` 是账号或上游决定，网关不能强制 Fast。
+
+已部署机升级：更新 Node 控制面与 `web/dist` 后重启；启动应用迁移 047。kernel payload 更新，须 `npm run fetch:payload` 后 `wrap-cli/sync`（`restart:true`）。cli-node 哈希未变。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.4.021 — 2026-10-28
+
+- #795：池调度候选阶段一次联合查询复用账号与运行状态快照，健康写回与过期清理移出请求热路径；迁移 046 拆分 `queue_wait_ms` 与 `scheduling_ms`，`wait_ms` 总调度口径不变，历史行 NULL。
+
+已部署机升级：更新 Node 控制面与 `web/dist` 后重启；启动应用迁移 046。cli-node 哈希未变，不必 `fetch:payload` / `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.4.020 — 2026-10-28
+
+- #726（作者 eshao731，Closes #722 / #723 / #724 / #725）：Codex HTTP 省略 `stream` 且无 `Accept: text/event-stream` 时返回 JSON，非流式 Chat/Completions 返回对应格式而不是 Responses 对象；首事件等待用 `KIN_UPSTREAM_TIMEOUT`，之后按流空闲超时检查，不再在内核回头后无限等待；未输出时内核 `503 no_capacity` 在候选范围内换槽；按实际 envelope 检查槽内限额，内核纯文本 413 报 `413 body_too_large` 而非 `worker_invalid_json`。**行为变化**：未设 `failover.max_request_mib` 时入口请求体上限由进程天花板（默认 128 MiB）改为与槽内 kernel 一致的 32 MiB，32–128 MiB 请求现在在入口直接 413。
+- Fixes #768 / #789 / #793：槽终端交互式启动 `claude` 时 cli-node 在 REPL 渲染阶段报 `SandboxManager.isSupportedPlatform is not a function` 退出。构建用的 `@anthropic-ai/sandbox-runtime` 桩只有 `start/stop`，适配层转发的静态方法全为 undefined；补齐后平台报不支持沙箱，`isSandboxingEnabled` 为 false，Bash 不进沙箱。`CLAUDE_CODE_HOST_REFRESH` 下读写宿主 `credentials.json`，logout 不 unlink 宿主文件。源码 `cleanup/local-src` `cb65c855`（含 `8917b95a`）。payload 钉到 `payload-2026.10.28-cli-host-cred`，cli-node `4975763790088a0eba226f20152b3c45261a0654b8bbc038701757b7699ab4e1`（27789668）。
+- 遥测主路径对齐 Claude Code 2.1.303。`env` 始终带 `node_version`（`v26.3.0`）、`is_running_with_bun`（`true`）和构建时间 `2026-10-18T20:20:57Z`，不再用槽位安装时间；版本回退为 `2.1.303`。空的 distro、git、GitHub Actions 字段不再上传，`coworker_type` 不再出现。进程指标补上 `cpuWindowMs`。`tengu_api_success` 带本次请求的模型，`tengu_init` 不带。主路径和 GrowthBook 不再带邮箱。旧 `worker.json` 里残留的硬件和密钥字段仍会在发送前丢掉。
+
+已部署机升级：须 `npm run fetch:payload` 后 `wrap-cli/sync`（`restart:true`），并更新 `kin-worker`，再重启 Node；仅更新 Node 不够。需要 >32 MiB 请求体的部署须在设置里显式调大「请求体上限」。本机槽需重启遥测旁路后才按新字段上传；集群槽在下次槽位启动、重载或出口重建时推送新的 `kin-worker`。只读根文件系统的集群槽需按现有流程换镜像。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.4.019 — 2026-10-28
+
+- Fixes #738 / #763：GPT/Codex 请求（`/v1/responses`、Chat/Completions、`/v1/messages` 转 Codex、`/v1/alpha/search`、`/v1/images/*`）补上托管 API Key 的 acquire/release 与扣费：成功请求按与 `usage_logs` 同一官方价（含生图）× 分组倍率累计 `requests` / tokens / `quota_used` / 5h·1d·7d 窗口与 `last_used_at`；USD 额度、请求数额度、窗口限额、RPM 与 Key 并发对 GPT 流量生效，额度用尽返回 `429 api_key_quota_exhausted`。此前 GPT 路径直接跳过，Key 计数恒为 0。
+
+已部署机升级：仅更新 Node 控制面后重启。历史 GPT 用量不回填到 Key 计数（`usage_logs` 不变）。cli-node 哈希未变，不必 `fetch:payload` / `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.4.018 — 2026-10-27
+
+- #720：风控页新增「JEV 使用记录」（全部 / JEV 视图下，默认折叠）：每次真正发给审核模型的调用记一行，含北京时间今日次数、累计调用/成功、上游返回的输入/输出 tokens 和按官方 TypeSafe 公开价的费用估算；去重缓存命中不算调用，上游没报用量的记为未知而不是 0。只存 Key 指纹（sha256 前 12 位），不存密钥、正文、问题和响应；明细保留 30 天，按天汇总保留 90 天，累计汇总一直保留。接口 `GET /api/panel/jev-usage` 仅管理员可读。新增迁移 045。
+- #666：arm64 控制面 `deploy/Dockerfile.arm64-control` 的 `NODE_IMAGE` digest 升到 Node 22.23.4（`sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d`），覆盖 Node 10–21 安全更新；amd64 Dockerfile 用浮动标签，下次构建自然跟上。
+
+已部署机升级：更新 Node 控制面与 `web/dist` 后重启；启动应用迁移 045。arm64 部署须拉新控制面镜像重建（含 Node 22.23.4）。cli-node 哈希未变，不必 `fetch:payload` / `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
 ## 1.4.017 — 2026-10-27
 
 - #782：CI：main 自 1.3.154 起 `npm run test:unit` 一直红（20 个文件 80 项），后续 Go / web 步骤从未执行。本次逐项二分到引入提交，过时断言改为当前设计，下面几处是真回归，已修：
@@ -8,7 +70,6 @@
 - #782：人设：`official` 档丢掉调用方顶层 system（既不在 system 也不在 messages）；面板 `persona_guidance_presets` 不生效；旧 rewrite 路径总带槽位 ` - Locale:`；不支持 mid-conversation system 的模型（如 haiku-4-5）在 API 后端出站带 `role=system` Environment，会被上游 400。均为 e358143c 引入。
 - #782：面板：0注入档的 usage 遮罩显示与网关一致（网关按档默认遮罩）。
 - #782：已知未改：0注入档按 d917dd2a 设计不保留调用方顶层 system；人设重复渲染不幂等（生产只渲染一次）。
-- #720：风控页新增「JEV 使用记录」（全部 / JEV 视图下，默认折叠）：每次真正发给审核模型的调用记一行，含北京时间今日次数、累计调用/成功、上游返回的输入/输出 tokens 和按官方 TypeSafe 公开价的费用估算；去重缓存命中不算调用，上游没报用量的记为未知而不是 0。只存 Key 指纹（sha256 前 12 位），不存密钥、正文、问题和响应；明细保留 30 天，按天汇总保留 90 天，累计汇总一直保留。接口 `GET /api/panel/jev-usage` 仅管理员可读。新增迁移 045。
 
 已部署机升级：更新 Node 控制面与 `web/dist` 后重启。无迁移，不必 `fetch:payload` / `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
 

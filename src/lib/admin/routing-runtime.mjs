@@ -682,6 +682,7 @@ export function createRoutingRuntime(ctx) {
   }
 
   function initPoolRuntime() {
+    getPool()?.stopMaintenance()
     const routingConfig = getRouting()
     const runtimeRepo = new AccountRuntimeRepo()
     const attemptsRepo = new RequestAttemptsRepo()
@@ -700,6 +701,7 @@ export function createRoutingRuntime(ctx) {
       config: poolSchedulerConfig(),
     })
     setPool(poolScheduler)
+    poolScheduler.startMaintenance()
     configureUnitCircuit(routingConfig)
     ctx.accountQuota.onQuotaCooldownCleared = () => {
       try {

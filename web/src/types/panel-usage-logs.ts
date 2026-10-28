@@ -31,8 +31,10 @@ export type ProviderChainItem = {
   action: string | null
   /** 该次尝试是否已把响应提交给下游（= 最终服务方）。 */
   downstreamCommitted: boolean
-  /** 排队等槽耗时。 */
+  /** 调度总耗时，包含实际排队；历史记录没有拆分。 */
   waitMs: number | null
+  queueWaitMs: number | null
+  schedulingMs: number | null
   ttftMs: number | null
   latencyMs: number | null
   startedAt: string | null
@@ -156,8 +158,10 @@ export type UsageLogRow = {
   via: string | null
   stream: boolean | null
   hasTools: boolean | null
-  /** OpenAI service tier（原样小写）。 */
+  /** OpenAI service tier 发出值（原样小写），计费按此档。 */
   serviceTier: string | null
+  /** 上游 `response.service_tier` 回显；与 serviceTier 不同即档位被上游改写。 */
+  upstreamServiceTier: string | null
   /** Anthropic speed：`fast` | `standard`。 */
   speed: string | null
   /** 长上下文（1M）计价档是否生效；null = 未计价。 */

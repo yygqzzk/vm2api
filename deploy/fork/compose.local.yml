@@ -5,7 +5,11 @@ services:
     image: local/vm2api:fork-early-sse
     build:
       context: ../..
-      dockerfile: deploy/fork/Dockerfile
+      dockerfile: Dockerfile
+      labels:
+        org.opencontainers.image.source: https://github.com/yygqzzk/vm2api
+        org.opencontainers.image.revision: ${FORK_REVISION:-dev}
+        io.vm2api.fork.feature: codex-early-sse
     init: true
     restart: unless-stopped
     ports:

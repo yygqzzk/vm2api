@@ -40,28 +40,29 @@ Claude、非流式 JSON、Chat/Anthropic 协议转换保持上游原有提交边
 
 ## 构建 fork 镜像
 
-当前 `deploy/fork/Dockerfile` 是 **1.4.015 专用**的小型派生镜像：
-基础镜像固定 digest，覆盖四个开源模块；构建先检查基础模块的 SHA256。
-原上游 web、依赖、Go helpers 和闭源内核原样继承，不重新下载 payload。
-它不是适用于任意未来版本的通用补丁镜像。
+新版上游使用仓库根目录的 **完整源码 `Dockerfile`** 构建：它包含合并后的
+Node 模块、Web、源码构建的 API helper 与 `deploy/payload.json` 固定的 payload。
+完整源码会直接包含 fork 的三个接入点及独立策略模块，不需要覆盖运行时文件。
 
-未来合入新版上游后，必须重新选择匹配的基础镜像并更新原始模块校验值，
-检查新增导入文件/依赖；不能只换一个 tag 继续套用旧运行环境。
-若二开范围扩大，应使用仓库原有 `Dockerfile` 构建完整源码镜像，
-而不是继续扩大这份四模块覆盖清单。
+`deploy/fork/Dockerfile` 仅保留为历史 **1.4.015 专用**派生镜像入口，
+基础 digest、三个模块校验值和四模块覆盖清单均未适配新版。
+版本检查会拒绝将新版源码叠加到旧运行环境；不要改 tag 或绕过校验。
 
 从仓库根目录构建与线上同架构的镜像（线上为 linux/amd64）：
 
 ```bash
 REV=$(git rev-parse --short=12 HEAD)
 docker build --platform linux/amd64 \
-  -f deploy/fork/Dockerfile \
-  --build-arg FORK_REVISION="$REV" \
+  -f Dockerfile \
+  --label org.opencontainers.image.source=https://github.com/yygqzzk/vm2api \
+  --label org.opencontainers.image.revision="$(git rev-parse HEAD)" \
+  --label io.vm2api.fork.feature=codex-early-sse \
   -t "local/vm2api:fork-$REV" .
 ```
 
+构建前先提交并验收合并结果，确保镜像标签和 revision 对应完整源码。
 `VERSION` 继续表示兼容的上游版本，fork 身份以镜像标签和 OCI revision
-label 为准。面板显示 1.4.015 不代表没有本补丁。
+label 为准。本次同步的版本为 1.4.023，另含上游 main 尚未发布的后续修复。
 
 ## 本机隔离部署
 
@@ -102,7 +103,7 @@ npm ci
 node --test test/unit/fork-codex-stream.test.mjs
 ```
 
-在实际派生镜像中测试（生产镜像不打包测试文件）：
+在实际完整源码镜像中测试（生产镜像不打包测试文件）：
 
 ```bash
 docker run --rm --platform linux/amd64 --entrypoint node \
@@ -141,8 +142,15 @@ docker run --rm --platform linux/amd64 --entrypoint node \
    gunzip -c /tmp/fork-$REV.tar.gz | docker load
    ```
 
-3. 在服务器 `/opt/vm2api` 使用两个明确的 Compose 文件，避免自动载入
-   本机 WSL override；先验证配置，再只替换控制面：
+3. **跨版本升级前另行验收**：1.4.015 → 本次同步结果涉及迁移 045–047、
+   新 kernel / cli-node payload 和 worker 遥测变更；还包含托管 API Key 的
+   Codex 门禁扣费、缺省请求体上限 32 MiB、流式判定与计费档位变化。
+   详见 `CHANGELOG.md` 的 1.4.018–1.4.023 条目。先用隔离数据副本验证迁移，
+   再安排 payload / worker 更新与槽位刷新；不能沿用同版补丁“不刷新槽位”的前提。
+   下列命令仅替换控制面，不代表跨版本升级已经完成。
+
+   在服务器 `/opt/vm2api` 使用两个明确的 Compose 文件，避免自动载入
+   本机 WSL override；先验证配置，再替换控制面：
 
    ```bash
    cd /opt/vm2api
@@ -154,8 +162,8 @@ docker run --rm --platform linux/amd64 --entrypoint node \
    ```
 
    此操作会短暂中断控制面；先等在途请求结束。
-   不运行 install.sh、面板官方升级、wrap-cli/sync 或槽位重建。
-   同版基础镜像的入口仍会刷新程序二进制，应用也可能规范化配置，
+   不运行 install.sh、面板官方升级或未经验收的槽位重建。
+   入口会刷新程序二进制，应用也可能迁移数据库或规范化配置，
    所以必须有上一步备份并复核，而不是承诺整个运行目录字节永远不变。
 
 4. 核对新容器的镜像 label、数据库与账号数量、原有路由/出口/指纹，
@@ -170,7 +178,8 @@ docker compose -f docker-compose.yml up -d --no-deps --pull never vm2api
 ```
 
 这只回退程序，不恢复/清空数据库，不删除账号槽。
-本方案同版程序不新增数据库迁移；跨上游版本回滚必须另行核对迁移兼容性。
+本次同步新增迁移 045–047；跨版本回滚还须核对数据库、payload 和 worker
+兼容性，必要时按已验收的备份恢复流程操作，不能只换旧镜像就视为完成。
 
 后续重建/重启控制面都要明确带 `-f compose.fork.yml`。
 面板中的官方一键升级不知道 fork 镜像，可能覆盖回官方版，不要混用。
