@@ -86,6 +86,8 @@ import {
 
 import { runVmTestChat, resolveTestModels, syncCodexCatalog } from './vm-test-chat.mjs'
 import { VmTestScheduleError } from './vm-test-schedule.mjs'
+import { handleTestReports } from '../fork/test-reports/routes.mjs'
+import { runReportedTest } from '../fork/test-reports/store.mjs'
 import { readCatalogSync, syncClaudeCatalog, syncGptCatalog } from './catalog-monitor.mjs'
 import { setPriceOverride, listPriceOverrides, syncModelsDev } from './price-catalog.mjs'
 import { buildPricing } from './pricing-view.mjs'
@@ -3094,6 +3096,15 @@ export function createPanelHandler(ctx) {
         return json(res, 200, result)
       }
 
+      if (p.startsWith('/api/panel/fork/test-reports')) {
+        return await handleTestReports(req, res, url, {
+          reports: ctx.testReports,
+          visibleVms: () => keyScopeVms(req),
+          json,
+          readBody,
+        })
+      }
+
       if (req.method === 'GET' && /^\/api\/panel\/vms\/[^/]+\/test-schedule$/.test(p)) {
         return await handleVmTestSchedule(req, res, p.split('/')[4])
       }
@@ -3118,18 +3129,23 @@ export function createPanelHandler(ctx) {
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/test-chat$/.test(p)) {
         const id = p.split('/')[4]
         const body = await readBody(req, 64 * 1024).catch(() => ({}))
-        const result = await runVmTestChat({
-          projectRoot: cfg.paths.project,
-          vmId: id,
+        const params = {
           model: body.model || body.model_id || '',
           prompt: body.prompt || body.message || '',
           max_tokens: body.max_tokens,
           reasoning_effort: body.reasoning_effort || body.effort,
-          timeoutMs: body.timeout_ms || body.timeoutMs,
-          baseUrl: `http://127.0.0.1:${cfg.port}`,
-          apiKey: cfg.api_key,
-          accountQuota,
-        })
+        }
+        const result = await runReportedTest(ctx.testReports, id, params, () =>
+          runVmTestChat({
+            projectRoot: cfg.paths.project,
+            vmId: id,
+            ...params,
+            timeoutMs: body.timeout_ms || body.timeoutMs,
+            baseUrl: `http://127.0.0.1:${cfg.port}`,
+            apiKey: cfg.api_key,
+            accountQuota,
+          }),
+        )
         return json(res, 200, panel.ok(result))
       }
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/count-tokens$/.test(p)) {

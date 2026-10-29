@@ -343,12 +343,14 @@ export class VmTestScheduleRunner {
     projectRoot,
     settings = () => null,
     runTest,
+    testReports = null,
     list = () => listVms(projectRoot),
     now = () => Date.now(),
   } = {}) {
     this.projectRoot = projectRoot
     this.settingsFactory = typeof settings === 'function' ? settings : () => settings
     this.runTest = runTest
+    this.testReports = testReports
     this.listVms = list
     this.now = now
     this.jobs = new Map()
@@ -588,6 +590,7 @@ export class VmTestScheduleRunner {
     this.jobs.get(vmId)?.stop()
     this.jobs.delete(vmId)
     this._settings().remove?.(keyFor(vmId))
+    this.testReports?.remove(vmId, { slotDeleted: !this._vm(vmId) })
     return null
   }
 
@@ -611,7 +614,7 @@ export class VmTestScheduleRunner {
       const vmId = key.slice(VM_TEST_SCHEDULE_PREFIX.length)
       const vm = this._vm(vmId)
       if (!vm) {
-        this._settings().remove?.(key)
+        this.remove(vmId)
         continue
       }
       const schedule = this._stored(vmId)
@@ -637,8 +640,9 @@ export class VmTestScheduleRunner {
     }
     const schedule = this._stored(vmId)
     if (!schedule?.enabled) return
-    this.running.add(vmId)
     const startedAt = this.now()
+    const report = this.testReports?.begin(vmId, 'scheduled', schedule)
+    this.running.add(vmId)
     let result
     try {
       result = await this.runTest(vmId, {
@@ -660,6 +664,7 @@ export class VmTestScheduleRunner {
     const lastDuration =
       Number.isSafeInteger(duration) && duration >= 0 ? duration : Math.max(0, this.now() - startedAt)
     const lastOk = result?.ok === true
+    this.testReports?.finish(report, result)
     this._settings().set(keyFor(vmId), {
       ...current,
       last_run_at: new Date(startedAt).toISOString(),
