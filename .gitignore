@@ -73,6 +73,8 @@ patches/
 **/id_ed25519
 
 # local-only; not part of the published tree
+# WSL Docker Desktop console proxy; Compose loads this automatically.
+/docker-compose.override.yml
 /pnpm-lock.yaml
 /pnpm-workspace.yaml
 /web/pnpm-workspace.yaml
