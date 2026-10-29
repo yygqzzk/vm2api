@@ -37,7 +37,8 @@ import { createCatalogMonitor } from './lib/admin/catalog-monitor.mjs'
 import { normalizeOfficialCcConfig } from './lib/oauth/official-cc-bootstrap.mjs'
 import { invalidateLiveCredentialCache } from './lib/admin/panel-live-credentials.mjs'
 import { normalizeHealthProbeConfig, createHealthProbeMonitor, HEALTH_REAL_HEADER } from './lib/admin/health-probe.mjs'
-import { normalizeNotifyConfig, createNotifyMonitor, dispatchNotify } from './lib/admin/notify.mjs'
+import { normalizeNotifyConfig, createNotifyMonitor } from './lib/admin/notify.mjs'
+import { snapshotVmConnectivity } from './lib/admin/vm-connectivity.mjs'
 import { runVmTestChat } from './lib/admin/vm-test-chat.mjs'
 import { VmTestScheduleRunner } from './lib/admin/vm-test-schedule.mjs'
 import { StickyRouter } from './lib/pool/sticky-router.mjs'
@@ -509,14 +510,6 @@ kernelWatchdog = createKernelWatchdog({
   ensureTelemetry: (vm) => ensureTelemetrySidecar({ projectRoot: cfg.paths.project, vm }),
   revive: (vm) => bootSlot(vm.id),
   healBridges: createSlotBridgeHealer({ projectRoot: cfg.paths.project }),
-  onFault: (vm, reason) => {
-    const title = `槽内核故障 ${vm.id}`
-    dispatchNotify(routingConfig.notify, {
-      title,
-      text: `【KIN】${title}\n\n${reason}\n已停止调度该槽；内核恢复健康后自动恢复调度。`,
-      subject: `KIN · ${title}`,
-    }).catch((error) => console.warn('[kernel-watchdog] notify failed', error?.message || error))
-  },
 })
 
 usageProbeMonitor = createUsageProbeMonitor({
@@ -549,6 +542,7 @@ catalogMonitor = createCatalogMonitor({
   log: (event) => console.log(JSON.stringify(event)),
 })
 notifyMonitor = createNotifyMonitor({
+  vmSnapshot: () => snapshotVmConnectivity(listVms(cfg.paths.project)),
   config: routingConfig.notify,
   baseUrl: cfg.base_url,
   snapshot: () =>
