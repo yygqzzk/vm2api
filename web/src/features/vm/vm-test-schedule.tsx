@@ -29,6 +29,8 @@ import {
 } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { meQueryOptions } from '@/features/auth/queries'
+import { VmTestRunHistory } from '@/features/fork/test-reports/panel'
+import { REPORT_KEY } from '@/features/fork/test-reports/types'
 import { TimezonePicker } from '@/features/vm/timezone-picker'
 
 type ScheduleFrequency = 'hourly' | 'daily' | 'weekly'
@@ -220,6 +222,7 @@ export function VmTestSchedule({
     useState<ScheduleStructure>(defaultStructure)
   const [syncOpen, setSyncOpen] = useState(false)
   const [syncAllOpen, setSyncAllOpen] = useState(false)
+  const [deleteOpen, setDeleteOpen] = useState(false)
   const scheduleQuery = useQuery({
     queryKey,
     queryFn: ({ queryKey: key, signal }) =>
@@ -332,11 +335,13 @@ export function VmTestSchedule({
     mutationFn: () => api<SchedulePayload>(endpoint, { method: 'DELETE' }),
     onSuccess: (data) => {
       qc.setQueryData(queryKey, data)
+      void qc.invalidateQueries({ queryKey: REPORT_KEY })
       base.current = null
       setStale(false)
       setEnabled(false)
       setStructure(defaultStructure())
-      toast.success('测试计划已删除')
+      setDeleteOpen(false)
+      toast.success('测试计划及定时结果已删除，手动记录保留')
     },
     onError: (error: Error) => toast.error(error.message),
     onSettled: () => qc.invalidateQueries({ queryKey }),
@@ -594,9 +599,9 @@ export function VmTestSchedule({
                 size='icon'
                 variant='ghost'
                 className='size-8 text-muted-foreground'
-                aria-label='删除定时测试'
-                title='删除定时测试'
-                onClick={() => remove.mutate()}
+                aria-label='删除定时测试及结果历史'
+                title='删除定时测试及结果历史'
+                onClick={() => setDeleteOpen(true)}
                 disabled={busy}
               >
                 <Trash2 />
@@ -656,9 +661,34 @@ export function VmTestSchedule({
           ) : (
             <p className='text-xs text-muted-foreground'>尚未创建计划</p>
           )}
+          <VmTestRunHistory vmId={vm.id} />
         </>
       )}
 
+      <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>删除定时测试？</AlertDialogTitle>
+            <AlertDialogDescription>
+              本槽的计划及留存的定时测试记录将一起删除，无法恢复。手动测试记录、判定规则和普通请求日志保留。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={remove.isPending}>
+              取消
+            </AlertDialogCancel>
+            <AlertDialogAction
+              disabled={remove.isPending}
+              onClick={(event) => {
+                event.preventDefault()
+                remove.mutate()
+              }}
+            >
+              删除计划及结果
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
       <AlertDialog open={syncOpen} onOpenChange={setSyncOpen}>
         <AlertDialogContent>
           <AlertDialogHeader>

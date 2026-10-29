@@ -41,6 +41,7 @@ import { normalizeNotifyConfig, createNotifyMonitor } from './lib/admin/notify.m
 import { snapshotVmConnectivity } from './lib/admin/vm-connectivity.mjs'
 import { runVmTestChat } from './lib/admin/vm-test-chat.mjs'
 import { VmTestScheduleRunner } from './lib/admin/vm-test-schedule.mjs'
+import { TestReports } from './lib/fork/test-reports/store.mjs'
 import { StickyRouter } from './lib/pool/sticky-router.mjs'
 import { AccountQuota } from './lib/pool/account-quota.mjs'
 import { normalizeTiers } from './lib/pool/quota-tiers.mjs'
@@ -72,7 +73,7 @@ import { ensureProxyEgress, proxyEgressReady } from './lib/vm/egress.mjs'
 import { syncIpv6ProxyEgress } from './lib/vm/proxy-policy-runtime.mjs'
 import { GATEWAY_CAPABILITIES } from './lib/vm/execution-context.mjs'
 import { isTelemetryPath, telemetryInterceptResponse } from './lib/identity/telemetry-rewrite.mjs'
-import { openDatabase, closeDatabase } from './lib/db/database.mjs'
+import { openDatabase, closeDatabase, getDb } from './lib/db/database.mjs'
 import { JevUsageRepo } from './lib/db/repos/jev-usage-repo.mjs'
 import { installJevUsageRecorder } from './lib/protocol/jev-usage.mjs'
 import { runLegacyImport } from './lib/db/legacy-import.mjs'
@@ -465,7 +466,9 @@ healthMonitor = createHealthProbeMonitor({
       extraHeaders: { [HEALTH_REAL_HEADER]: '1' },
     }),
 })
+const testReports = new TestReports({ db: getDb(), projectRoot: cfg.paths.project })
 const vmTestSchedule = new VmTestScheduleRunner({
+  testReports,
   projectRoot: cfg.paths.project,
   settings: () => new SettingsRepo(),
   list: () => listVms(cfg.paths.project),
@@ -992,6 +995,7 @@ const handlePanel = createPanelHandler({
   panelUsers,
   requestLog,
   vmTestSchedule,
+  testReports,
   backupService,
   stats,
   persistRoutingPatch,

@@ -11,6 +11,7 @@ import {
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/utils'
+import { isCodexVm } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
@@ -28,6 +29,7 @@ import { PageHeader } from '@/components/page-header'
 import { SlotIdentity } from '@/components/platform-chip'
 import { QueryGate } from '@/components/query-gate'
 import { meQueryOptions } from '@/features/auth/queries'
+import { VmTestResultsDialog } from '@/features/fork/test-reports/panel'
 import { usageQueryOptions } from '@/features/overview/queries'
 import { planDeleteActiveVm } from '@/features/vm/active-vm'
 import { CreateVmDialog } from '@/features/vm/create-vm-dialog'
@@ -124,6 +126,7 @@ export function VmListPage() {
   const [deleteTarget, setDeleteTarget] = useState<Vm | null>(null)
   const [deleteInput, setDeleteInput] = useState('')
   const [createOpen, setCreateOpen] = useState(false)
+  const [testResultsOpen, setTestResultsOpen] = useState(false)
   const resetVm = useMutation({
     mutationFn: ({ id, mode }: { id: string; mode: 'keep' | 'traits' }) =>
       api(`/api/panel/vms/${encodeURIComponent(id)}/reset`, {
@@ -181,27 +184,39 @@ export function VmListPage() {
       description='槽位和账号用量。按服务器分机架、按状态分区；未探测的额度不会冒充可用。'
       fluid
       extra={
-        poolQueue || canCreate ? (
-          <div className='flex items-center gap-3'>
-            {poolQueue ? (
-              <span
-                className={cn(
-                  'text-xs text-muted-foreground tabular-nums',
-                  poolQueue.global_queue_depth > 0 &&
-                    'text-[color:var(--status-warn)]'
-                )}
-                title='还没落到任何 VM、在等新席位的 Claude 请求数 / 允许排队数量（上限按全部排队请求计，含各 VM 上的排队，见状态列）'
-              >
-                全局排队 {poolQueue.global_queue_depth}/{poolQueue.queue_max}
-              </span>
-            ) : null}
-            {canCreate ? (
-              <Button onClick={() => setCreateOpen(true)}>创建</Button>
-            ) : null}
-          </div>
-        ) : undefined
+        <div className='flex flex-wrap items-center gap-3'>
+          <Button variant='outline' onClick={() => setTestResultsOpen(true)}>
+            测试结果中心
+          </Button>
+          {poolQueue ? (
+            <span
+              className={cn(
+                'text-xs text-muted-foreground tabular-nums',
+                poolQueue.global_queue_depth > 0 &&
+                  'text-[color:var(--status-warn)]'
+              )}
+              title='还没落到任何 VM、在等新席位的 Claude 请求数 / 允许排队数量（上限按全部排队请求计，含各 VM 上的排队，见状态列）'
+            >
+              全局排队 {poolQueue.global_queue_depth}/{poolQueue.queue_max}
+            </span>
+          ) : null}
+          {canCreate ? (
+            <Button onClick={() => setCreateOpen(true)}>创建</Button>
+          ) : null}
+        </div>
       }
     >
+      {testResultsOpen ? (
+        <VmTestResultsDialog
+          open={testResultsOpen}
+          onOpenChange={setTestResultsOpen}
+          vms={vms.map((vm) => ({
+            id: vm.id,
+            name: vm.name,
+            platform: isCodexVm(vm) ? 'openai' : 'anthropic',
+          }))}
+        />
+      ) : null}
       <QueryGate
         loading={vmsQ.isLoading}
         error={vmsQ.error}
