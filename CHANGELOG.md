@@ -2,12 +2,16 @@
 
 ## Unreleased
 
+- Linux VM 遥测迁入同一 Rust 内核管理的常驻 cli-node，移除 Go 遥测服务及自愈/回退；仅使用目标 VM 身份、凭据、settings 与动态出口，缺有效 profile scope 或新鲜 geo 时暂停，401 不降级匿名发送。必要原生 1P 事件默认每 600 秒合批，队列按 1 小时 / 1000 条 / 1 MiB 有界落盘；关闭立即清队列，普通重启保留有效记录。
+- Linux 初登、重新授权工具进入目标 Docker/KVM guest，保留原 helper 和唯一 Go refresh 写者；实际换票阶段经受鉴权的 native 私有入口确认，缓存命中不制造事件。单 VM / 批量开关、间隔、状态和计数日志统一原生通路，远端必须确认 kernel 与 seed 均已发布；macOS 遥测明确不支持。升级须配套 Node / Go OAuth worker / kernel / cli-node 新产物，真实 KVM 验收仍需可访问的测试环境。
+- 已在另行授权的私有 `1.4.026` Docker 部署中完成五个本机、四个远端 Claude 槽原地升级，容器身份及原调度语义保持；10 条 Claude 遥测关闭策略保持，九槽 native ready / disabled / pending=0，11 个旧 Go 发送者退役。版本、认证、公网页面、容器身份及真实 `200 pong` 验收通过。未公开发布 payload/Release，未开启生产遥测；这不构成 KVM 或生产 1P 上传认证。
+- 决策模型收窄今天的误伤。综合、破限、逆向、渗透、网络攻击五题明确放过：修本机故障时的「所有权限都给你」和 tool loaded、抄进来的审查说明、阅读自己的或客户的源码、路径里的「反编译」、在自己的机器上搭中转并设置登录密码，以及排查已交付系统的 ssh、redis、kafka 和配置密码。色情、暴力伤害、破解授权、明确越狱、对未授权目标的渗透和窃取别人的凭据仍然拦。
+
 ## 1.4.025 — 2026-10-28
 
 - #812：新增默认开启的 notify.events.vm_down：节点 SSH 失联、watchdog 内核恢复预算耗尽，或运行中的 VM 变为 stopped/dead/error 时，经已启用的 Telegram / 企微 / 邮件通道告警（含设置页开关）；移除 server 独立 watchdog 通知路径，统一由通知监控处理。人工停调、维护、额度冷却及未知运行状态不告警；同一次下线只通知一次，失败通道可重试。
 
 ## 1.4.024 — 2026-10-28
-
 - #804：准入钩子期间释放后按实时 inflight 递增，避免占位复活。
 - #805：修复请求体省略 `stream`、`Accept: application/json, text/event-stream` 时 `/v1/messages` 等入口返回 SSE：Claude Code 2.1.311 起 auto 模式分类器以非流式发出、按 JSON 解析，SSE 回包让非流式网关（如 Sub2API）判为空消息 502，子代理工具调用全部失败。省略 `stream` 时仅当 `Accept` 对 `text/event-stream` 的偏好高于 `application/json`（q 值，同值算 JSON）才流式；只写 `text/event-stream` 及显式 `stream` 行为不变。
 - #809：ARM64 本机推理 CLI 改为原生运行（镜像内建 arm64 CLI overlay，`deploy/arm64-cli.json` 钉 cli-node），修复大请求 stdin 写入超时 / `native stdin write blocked`；Fixes #808。仅本机 ARM64 Docker Claude 槽；共享 amd64 模板、远程节点、KVM、Codex 不变。
