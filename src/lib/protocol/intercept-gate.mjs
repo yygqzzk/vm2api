@@ -94,7 +94,8 @@ export function commitProtocolBlock(decision, { repo, devices, policy, requestId
       /* the response still must not hop */
     }
   }
-  if (!decision.banDevice || !policy?.enabled || !policy?.device_block_enabled || !decision.deviceId) return
+  if (!decision.banDevice || !decision.deviceId || !policy?.enabled) return
+  if (!policy.device_block_enabled && !decision.forceDeviceBan) return
   try {
     deviceStore(devices)?.block?.({
       deviceId: decision.deviceId,
@@ -226,6 +227,7 @@ export async function evaluateProtocolIntercept({
         model: body?.model || inbound?.model || '',
         preview: refusalPreview(body, inbound),
         banDevice: true,
+        forceDeviceBan: hard.category === 'nsfw',
         remember: false,
         reason: `hard_regex:${hard.category}`,
       })
@@ -301,6 +303,7 @@ export async function evaluateProtocolIntercept({
         model: body?.model || inbound?.model || '',
         preview: refusalPreview(body, inbound),
         banDevice: !unavailable,
+        forceDeviceBan: !unavailable && (category === 'nsfw' || (verdict.categories || []).includes('nsfw')),
         remember: false,
         reason: unavailable ? 'jev:unavailable' : `jev:${category}`,
       })

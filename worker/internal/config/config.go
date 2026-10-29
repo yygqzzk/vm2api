@@ -104,7 +104,7 @@ func (c *Config) applyDefaults() {
 		c.MaxResponseBytes = 64 << 20
 	}
 	if c.MaxEventBytes <= 0 {
-		c.MaxEventBytes = 32 << 20
+		c.MaxEventBytes = 64 << 20
 	}
 	if c.DeliveryMode == "" {
 		c.DeliveryMode = "realtime"

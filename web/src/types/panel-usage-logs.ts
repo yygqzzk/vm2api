@@ -77,7 +77,7 @@ export type SpecialSetting = {
 /** 缓存写入 TTL 口径，由 5m / 1h 写入量派生。`mixed` = 两者都写了。 */
 export type CacheTtlApplied = '5m' | '1h' | 'mixed' | null
 
-/** 归一后的思考强度。原始字段见后端 `reasoningEffortOf()`。 */
+/** 发往槽位的思考强度。调用方值优先，否则模型缺省。见 `loggedReasoningEffort()`。 */
 export type ReasoningEffort =
   'none' | 'minimal' | 'auto' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 

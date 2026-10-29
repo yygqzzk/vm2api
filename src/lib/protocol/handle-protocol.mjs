@@ -59,6 +59,7 @@ import { resolveInferenceBackend, runApiInference } from '../pool/api-protocol.m
 import { classifyClaudeRequestPurpose, prepareClassifierBody, classifierRequestSummary } from './request-purpose.mjs'
 import { agentSummarySession } from './agent-summary.mjs'
 import { summarizeBody, redactHeaders, presentedApiKeyForLog } from '../admin/request-log.mjs'
+import { loggedReasoningEffort } from './thinking.mjs'
 import { reasoningEffortOf, sessionIdForLog } from './log-fields.mjs'
 import { ownerScopeFromRequest } from '../admin/resource-owner.mjs'
 import { keyScopeFromRequest, vmPoolDenial } from '../admin/key-scope.mjs'
@@ -307,9 +308,17 @@ export function createHandleProtocol(deps) {
       mapUpstreamError(result?.status || 503, result?.body, result?.headers || {}),
       result?.body,
     )
-    const summary = formatPoolSelectionSummary(details)
-    logBag.error_code = originalCode || mapped.body?.error?.code
-    logBag.error_message = summary || originalMessage || mapped.body?.error?.message || null
+    const mappedCode = mapped.body?.error?.code
+    if (mappedCode === ErrorCode.REFUSAL_GUARD) {
+      // The kernel often names an AUP refusal upstream_invalid_request. Keep
+      // the refusal code so the audit feed can see it, and the upstream sentence
+      // so the row still shows what was refused.
+      logBag.error_code = mappedCode
+      logBag.error_message = originalMessage || mapped.body?.error?.message || null
+    } else {
+      logBag.error_code = originalCode || mappedCode
+      logBag.error_message = summary || originalMessage || mapped.body?.error?.message || null
+    }
     if (logBag.classifier) {
       logBag.classifier.error = {
         status: result?.status || null,
@@ -606,7 +615,7 @@ export function createHandleProtocol(deps) {
         }).body,
       )
     }
-    logBag.inbound_body = inbound
+    logBag.inbound_body = logCtx.mode === 'debug' ? inbound : null
     logBag.inbound_summary = summarizeBody(inbound)
     logBag.model = inbound?.model || null
     logBag.requested_model = inbound?.model || null
@@ -1320,6 +1329,7 @@ export function createHandleProtocol(deps) {
     // Clear each attempt so a failed retry cannot retain the previous hop's snapshot.
     const noteOutboundEnvelope = (envelope) => {
       if (logCtx.capture_outbound) logBag.outbound_body = envelope?.body ?? null
+      if (envelope?.body) logBag.reasoning_effort = loggedReasoningEffort(envelope.body)
       logBag.worker_envelope_headers = envelope?.headers ? redactHeaders(envelope.headers) : null
       logBag.outbound_headers = null
       logBag.outbound_headers_source = 'unavailable'

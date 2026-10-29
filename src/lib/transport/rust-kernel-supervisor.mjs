@@ -830,7 +830,7 @@ export function writeKernelConfig(
     session_idle_ttl_seconds: sessionIdleTtlSeconds,
     max_request_bytes: requestBytes,
     max_response_bytes: 64 * 1024 * 1024,
-    max_event_bytes: 32 * 1024 * 1024,
+    max_event_bytes: 64 * 1024 * 1024,
     runtime_kind: kind,
     test_endpoints: testEndpoints,
     provider: 'local_cli',
