@@ -1176,7 +1176,10 @@ export class PoolScheduler extends EventEmitter {
     }
     let headroom = null
     if (!pinned) {
-      if (account && (account.status !== 'active' || !account.schedulable)) {
+      // Panel switch is vm.schedulable (evaluateSlotGate). accounts.schedulable
+      // is a legacy column nothing writes; a leftover 0 must not hide a slot
+      // the panel still shows as participating.
+      if (account && account.status !== 'active') {
         return { ok: false, reason: 'account_disabled' }
       }
       const modelGate = await slotAllowsModel({ vm, account, model })
@@ -1738,7 +1741,7 @@ export class PoolScheduler extends EventEmitter {
     if (!noRefreshPin && isCredentialRuntimeBlocked(state, now, vm)) return null
     if (!pinned) {
       if (hardBlockOf(state, now)) return null
-      if (account && (account.status !== 'active' || !account.schedulable)) return null
+      if (account && account.status !== 'active') return null
       if (account) {
         const availability = evaluateAccount({
           vm,

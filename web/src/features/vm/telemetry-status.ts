@@ -40,7 +40,7 @@ export function telemetryStatusLabel(
       return '上传失败'
     case 'idle':
       return telemetry.pending_events
-        ? `待合批 · ${telemetry.pending_events} 条`
+        ? `待发送 · ${telemetry.pending_events} 条`
         : '空闲 · 无待发事件'
   }
 }

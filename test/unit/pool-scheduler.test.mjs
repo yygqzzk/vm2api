@@ -157,6 +157,46 @@ test('scheduler keeps a slot whose access is expired but refresh remains', async
   selected.release()
 })
 
+test('legacy accounts.schedulable false does not hide a panel-on slot', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const repo = new RuntimeRepo()
+  repo.schedulingSnapshot = (ids) =>
+    new Map(
+      ids.map((id) => [
+        id,
+        {
+          state: repo.get(id),
+          account: { status: 'active', schedulable: false, account_id: id },
+        },
+      ]),
+    )
+  const pool = scheduler(root, { runtimeRepo: repo })
+  const selected = await pool.selectAndReserve({ model: 'claude-test', allowWait: false })
+  assert.equal(selected.ok, true)
+  assert.equal(selected.vmId, 'vm-01')
+  selected.release()
+})
+
+test('inactive account status still excludes the slot', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const repo = new RuntimeRepo()
+  repo.schedulingSnapshot = (ids) =>
+    new Map(
+      ids.map((id) => [
+        id,
+        {
+          state: repo.get(id),
+          account: { status: 'disabled', schedulable: true, account_id: id },
+        },
+      ]),
+    )
+  const pool = scheduler(root, { runtimeRepo: repo })
+  const selected = await pool.selectAndReserve({ model: 'claude-test', allowWait: false })
+  assert.equal(selected.ok, false)
+})
+
 test('scheduler skips excluded account and reserves the next one', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))

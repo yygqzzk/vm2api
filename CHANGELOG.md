@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- #815：取消 Opus/Sonnet 5.5 将强制 `tool_choice` 静默改写为 `auto` 并强加 `strict:true` 的行为；入口 `validateToolChoice`，不兼容请求明确 400（`tool_choice_incompatible` / `invalid_tool_choice`），兼容模型保留调用方 `tool_choice` 与 `strict`。**行为破坏**：原先静默降级为 auto 的强制工具请求，现返回 400。
+
+## 1.4.028 — 2026-10-30
+
+- #818：缓存前缀快照过期即删，不再等到 1 万条。查询判定不变。
+- #814：CLI 路径不再剥掉 `eager_input_streaming`；最终组装再按面板开关补。只清 tool `cache_control`。
+- #819：`/v1/messages` 转 Codex 时保留数组形式的 `system`（含 `cache_control`），不再只接受字符串。
+- #807：调度不再读取无人写入的 `accounts.schedulable`。面板「参与调度」仍只看槽位开关；`account.status !== 'active'` 不变。
+- #817：官方初装的 hello 与 `/usage` 追加官方 CLI 身份句。这条路径清空 `ANTHROPIC_BASE_URL`，网关 persona 不参与；缺身份句时上游回 429 `rate_limit_error`。
+- #672：账号列表和机架卡片显示订阅到期。GPT 只用凭证里的 `chatgpt_subscription_active_until`；没有该字段或 Claude 显示「未知」，不用 access token 到期或额度重置推算。
+- #665：GPT 等待队列按账号定向唤醒，消除满载时的唤醒空转。
+
+已部署机升级：更新 Node 控制面与 web/dist 后重启。不要覆盖 routing.json、vms/、data/、.env。
+
+## 1.4.027 — 2026-10-29
+
+- `kin-kernel` / `kin-kernel.bin` 换成会在健康检查里报 `vm_telemetry`、`telemetry_ready`、`telemetry` 的 `f57d4e71081b`（13228472 字节）。cli-node 仍是单次 slot 开始发送端 `8484c4c58f4b`（27933052 字节），槽内不拨代理。`payload-2026.10.29-telemetry-kernel`。`v1.4.026` 镜像烘焙时还是旧内核 `8a61aaa3cba0`，新装要这一版才会带上这三个字段。
+
+已部署机升级：更新 Node 控制面与 `web/dist` 后重启；须 `npm run fetch:payload` 后 `wrap-cli/sync`（`restart:true`）。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
 
 ## 1.4.026 — 2026-10-29
 
