@@ -309,6 +309,7 @@ export function createHandleProtocol(deps) {
       result?.body,
     )
     const mappedCode = mapped.body?.error?.code
+    const summary = formatPoolSelectionSummary(details)
     if (mappedCode === ErrorCode.REFUSAL_GUARD) {
       // The kernel often names an AUP refusal upstream_invalid_request. Keep
       // the refusal code so the audit feed can see it, and the upstream sentence
