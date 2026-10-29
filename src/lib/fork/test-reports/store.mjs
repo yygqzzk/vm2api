@@ -24,7 +24,7 @@ function decode(row) {
 
 function summary(record) {
   const { request, rule, evaluation, text, ...rest } = record
-  return { ...rest, reason: evaluation.reason, text_preview: text?.slice(0, 160) || null }
+  return { ...rest, rule_enabled: rule.enabled, reason: evaluation.reason, text_preview: text?.slice(0, 160) || null }
 }
 
 export class TestReports {
@@ -154,12 +154,25 @@ export class TestReports {
   }
 
   overview(vms) {
-    return vms.map((vm) => ({
-      vm_id: vm.id,
-      vm_name: vm.name || vm.id,
-      platform: isCodexVm(vm) ? 'openai' : 'anthropic',
-      latest: this.list([vm.id], { limit: 1 }).items[0] || null,
-    }))
+    if (!vms.length) return []
+    const histories = new Map(vms.map((vm) => [vm.id, []]))
+    const rows = this.db.prepare(
+      `SELECT id, vm_id, record_json FROM fork_test_reports
+       WHERE vm_id IN (${vms.map(() => '?').join(',')}) ORDER BY started_at DESC, id DESC`,
+    ).all(...vms.map((vm) => vm.id))
+    for (const row of rows) histories.get(row.vm_id).push(decode(row))
+    return vms.map((vm) => {
+      const records = histories.get(vm.id).slice(0, REPORT_LIMIT_PER_VM)
+      return {
+        vm_id: vm.id,
+        vm_name: vm.name || vm.id,
+        platform: isCodexVm(vm) ? 'openai' : 'anthropic',
+        latest: records[0] ? summary(records[0]) : null,
+        history: records.reverse().map(({ id, started_at, ok, verdict, rule }) => ({
+          id, started_at, ok, verdict, rule_enabled: rule.enabled,
+        })),
+      }
+    })
   }
 
   remove(vmId, { slotDeleted = false } = {}) {

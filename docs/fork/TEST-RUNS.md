@@ -2,9 +2,9 @@
 
 ## 功能
 
-虚拟机列表的「测试结果中心」默认展示全部可见槽的定时、面板手动测试记录，按开始时间倒序。支持槽位、来源、内容判定、精确模型 ID 筛选及服务端分页（每页50条）；每槽最多留存30条，两种来源合计。另有「按槽摘要与规则」页签看最新结果、配置规则。槽位测试页也能查看本槽记录和配置规则。
+虚拟机列表的「测试结果中心」按槽展示最近30次定时、面板手动测试。每条记录一个色块，左旧右新，不足30条不补空块。支持搜索槽位名称或ID；未测试的槽仍可见。槽位测试页使用同一色块视图，规则设置位于各槽旁的次要操作。
 
-点击记录行的「查看」就地展开正文、调用指标、命中/缺失字符串、请求参数与规则版本快照。列表不传完整正文、Prompt和规则快照，展开才加载详情。模型输出按纯文本显示，不执行 HTML。时间按浏览器时区显示，不改变计划原有调度时区。打开的列表每30秒刷新，也可手动刷新。
+悬停或键盘聚焦色块显示时间和结果，点击在侧栏加载正文、耗时、判定原因；调用指标、请求参数与规则版本快照折叠。模型输出按纯文本显示，不执行 HTML。时间按浏览器时区显示。打开的面板每30秒刷新，也可手动刷新。色块含符号和可访问标签，不只依赖颜色。
 
 ## 判定规则
 
@@ -15,7 +15,13 @@
 - 没启用规则、调用失败、空回答、token截断、缺少可信终止原因、无法确认完整的截断样本：始终待定，不因这些情况判账号异常。
 - 不匹配推理/思考文本、工具参数、错误对象或序列化 JSON。Responses 收集器可能在没有终止事件时补出 `body.status=completed`，不能用它证明样本完整。
 
-执行状态 `ok` 和内容 `verdict` 分开。一条调用成功的记录可以内容不通过；超时/认证失败仍是调用失败、内容待定。规则通过只代表满足你设置的字符串条件，不能单独证明账号“满血”或“降智”。
+色块先判断调用成败，再按该次记录的规则快照显示：
+
+- 未启用规则：调用成功为绿色（仅代表调用成功），调用失败为红色。
+- 已启用规则：完整非空回答匹配通过为绿色；未匹配按规则设为黄色或红色；空回答、截断、缺少可信终止原因等无法可靠判断的样本为黄色。
+- 调用失败始终显示红色，详情明确区分“调用失败”和“匹配不通过”。底层内容 `verdict` 仍为待定，不以网络错误判断回答质量。
+
+执行状态 `ok` 和内容 `verdict` 保持分开，数据库历史不重写。颜色由 `ok`、当时 `rule.enabled` 和保存的 `verdict` 推导；之后修改规则不会改变旧记录颜色。规则通过只代表满足字符串条件，不证明账号能力。
 
 规则在调用开始时快照，判定在可见正文截为2000字符的展示摘要之前执行。优先从测试返回体中提取正文，绕开上游 `result.text` 的4000字符显示上限；只剩截断文本而无法确认完整时待定。匹配后的命中/缺失字符串和原因随记录保存，不随规则修改而重写。没有自动重判历史。
 
@@ -38,7 +44,7 @@
 ```bash
 node --test test/unit/fork-test-reports.test.mjs test/unit/fork-test-reports-api.test.mjs test/unit/vm-test-schedule.test.mjs test/unit/panel-acl.test.mjs test/unit/panel-tenant-guards.test.mjs
 node --test test/e2e/vm-test-schedule.e2e.test.mjs
-pnpm -C web test src/features/fork/test-reports/record-detail.test.tsx src/features/vm/vm-test-schedule.test.ts
+pnpm -C web test src/features/fork/test-reports/panel.test.tsx src/features/fork/test-reports/record-detail.test.tsx src/features/vm/vm-test-schedule.test.ts
 pnpm -C web typecheck
 ```
 

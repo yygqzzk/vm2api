@@ -79,6 +79,11 @@ test('report routes enforce tenant scope, pagination, immutable snapshots and al
     (await call('user', 'GET', `${ROOT}/summary`)).body.data.items.map((vm) => vm.vm_id),
     ['vm-mine'],
   )
+  const overview = (await call('user', 'GET', `${ROOT}/summary`)).body.data.items
+  assert.deepEqual(overview[0].history.map((entry) => entry.id), [mine.id])
+  assert.equal(overview[0].history[0].rule_enabled, false)
+  assert.equal('text' in overview[0].history[0], false)
+  assert.deepEqual((await call('user', 'GET', `${ROOT}/summary?vm_id=vm-other`)).body.data.items, [])
   assert.equal((await call('super', 'GET', ROOT)).body.data.total, 2)
   const rule = { enabled: true, contains: ['answer'], mode: 'all', when_unmatched: 'pending' }
   assert.equal((await call('user', 'GET', `${ROOT}/rules?vm_id=vm-other`)).status, 404)

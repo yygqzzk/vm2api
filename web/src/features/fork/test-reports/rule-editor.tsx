@@ -98,7 +98,7 @@ export function RuleEditor({
         <DialogHeader>
           <DialogTitle>测试判定规则 · {vm?.name || vmId}</DialogTitle>
           <DialogDescription>
-            只判断可见回答是否符合预期，不代表官方能力检测。不修改调度；修改后仅影响新的测试。
+            未启用时，调用成功为绿色、失败为红色。启用后按匹配结果判定，仅影响新的测试。
           </DialogDescription>
         </DialogHeader>
         <QueryGate
@@ -114,50 +114,57 @@ export function RuleEditor({
               onCheckedChange={setEnabled}
             />
           </div>
-          <Label htmlFor='test-rule-contains'>
-            预期字符串（每行一条，区分大小写，字面匹配）
-          </Label>
-          <Textarea
-            id='test-rule-contains'
-            value={contains}
-            onChange={(event) => setContains(event.target.value)}
-            rows={6}
-            placeholder={'预期答案\n另一个关键片段'}
-          />
-          <div className='grid grid-cols-2 gap-3'>
-            <div className='space-y-2'>
-              <Label>匹配方式</Label>
-              <Select
-                value={mode}
-                onValueChange={(value) => setMode(value as Rule['mode'])}
-              >
-                <SelectTrigger aria-label='匹配方式'>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value='all'>全部包含</SelectItem>
-                  <SelectItem value='any'>任意包含</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-            <div className='space-y-2'>
-              <Label>未满足时</Label>
-              <Select
-                value={unmatched}
-                onValueChange={(value) =>
-                  setUnmatched(value as Rule['when_unmatched'])
-                }
-              >
-                <SelectTrigger aria-label='未满足时'>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value='pending'>待定（推荐）</SelectItem>
-                  <SelectItem value='fail'>不通过</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-          </div>
+          {enabled ? (
+            <>
+              <Label htmlFor='test-rule-contains'>
+                预期字符串（每行一条，区分大小写，字面匹配）
+              </Label>
+              <Textarea
+                id='test-rule-contains'
+                value={contains}
+                onChange={(event) => setContains(event.target.value)}
+                rows={6}
+                placeholder={'预期答案\n另一个关键片段'}
+              />
+              <div className='grid grid-cols-2 gap-3'>
+                <div className='space-y-2'>
+                  <Label>匹配方式</Label>
+                  <Select
+                    value={mode}
+                    onValueChange={(value) => setMode(value as Rule['mode'])}
+                  >
+                    <SelectTrigger aria-label='匹配方式'>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value='all'>全部包含</SelectItem>
+                      <SelectItem value='any'>任意包含</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className='space-y-2'>
+                  <Label>未满足时</Label>
+                  <Select
+                    value={unmatched}
+                    onValueChange={(value) =>
+                      setUnmatched(value as Rule['when_unmatched'])
+                    }
+                  >
+                    <SelectTrigger aria-label='未满足时'>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value='pending'>待定（推荐）</SelectItem>
+                      <SelectItem value='fail'>不通过</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+              <p className='text-xs text-muted-foreground'>
+                回答为空或不完整时为黄色；调用失败为红色，不代表回答质量不合格。
+              </p>
+            </>
+          ) : null}
           {sameKind.length > 1 ? (
             <label className='flex items-start gap-2 text-sm'>
               <Checkbox
@@ -170,9 +177,6 @@ export function RuleEditor({
               </span>
             </label>
           ) : null}
-          <p className='text-xs text-muted-foreground'>
-            调用失败、没有可见回答或样本不完整时始终待定，避免把网络问题误判为回答质量问题。
-          </p>
         </QueryGate>
         <DialogFooter>
           <Button variant='outline' onClick={onClose} disabled={save.isPending}>

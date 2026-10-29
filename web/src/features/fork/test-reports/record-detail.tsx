@@ -2,22 +2,30 @@ import { useQuery } from '@tanstack/react-query'
 import { api } from '@/lib/api'
 import { fmtExpiresAt, fmtMs } from '@/lib/format'
 import { QueryGate } from '@/components/query-gate'
-import { REPORT_API, REPORT_KEY, REASONS, VERDICTS, type Report } from './types'
+import {
+  REPORT_API,
+  REPORT_KEY,
+  REASONS,
+  VERDICTS,
+  testOutcome,
+  type Report,
+} from './types'
 
 export function ReportBody({ item }: { item: Report }) {
+  const outcome = testOutcome({ ...item, rule_enabled: item.rule.enabled })
   return (
     <div className='space-y-3 rounded-md border p-3 text-sm'>
       <p className='font-medium'>
         {item.vm_name} · {item.model} · {fmtExpiresAt(item.started_at)}
       </p>
-      <p>
-        调用{item.ok ? '成功' : '失败'} · 内容{VERDICTS[item.verdict]} ·{' '}
-        {REASONS[item.evaluation.reason]} · {fmtMs(item.duration_ms)}
+      <p className='font-medium'>
+        {outcome.label} · {fmtMs(item.duration_ms)}
       </p>
       <p className='text-xs text-muted-foreground'>
-        HTTP {item.status ?? '—'} · stop: {item.stop_reason || '—'} · 输入{' '}
-        {item.input_tokens ?? '—'} / 输出 {item.output_tokens ?? '—'} / 缓存读取{' '}
-        {item.cache_read_tokens ?? '—'}
+        调用{item.ok ? '成功' : '失败'}
+        {item.rule.enabled
+          ? ` · 内容${VERDICTS[item.verdict]} · ${REASONS[item.evaluation.reason]}`
+          : ' · 本次未启用匹配规则，仅判断调用是否成功'}
       </p>
       {item.error ? (
         <p className='break-words text-destructive'>{item.error}</p>
@@ -45,7 +53,14 @@ export function ReportBody({ item }: { item: Report }) {
         </p>
       ) : null}
       <details>
-        <summary className='cursor-pointer'>本次测试参数与规则快照</summary>
+        <summary className='cursor-pointer'>
+          调用指标、测试参数与规则快照
+        </summary>
+        <p className='mt-2 text-xs text-muted-foreground'>
+          HTTP {item.status ?? '—'} · stop: {item.stop_reason || '—'} · 输入{' '}
+          {item.input_tokens ?? '—'} / 输出 {item.output_tokens ?? '—'} /
+          缓存读取 {item.cache_read_tokens ?? '—'}
+        </p>
         <p className='mt-2 text-xs text-muted-foreground'>
           来源：{item.source === 'scheduled' ? '定时' : '手动'} · token 上限{' '}
           {item.request.max_tokens ?? '—'} · effort{' '}

@@ -77,6 +77,20 @@ describe('test report detail', () => {
     expect(html).toContain('内容不通过')
     expect(html).toContain('未命中：expected answer')
   })
+  it('shows invocation success, not pending content, when the captured rule was disabled', () => {
+    const html = renderToStaticMarkup(
+      <ReportBody
+        item={{
+          ...report,
+          verdict: 'pending',
+          rule: { ...report.rule, enabled: false },
+        }}
+      />
+    )
+    expect(html).toContain('调用成功')
+    expect(html).toContain('本次未启用匹配规则')
+    expect(html).not.toContain('内容待定')
+  })
   it('does not equate incomplete output or network errors with degraded account ability', () => {
     const html = renderToStaticMarkup(
       <ReportBody

@@ -22,7 +22,8 @@ export async function handleTestReports(req, res, url, { reports, visibleVms, js
       })
     }
     if (req.method === 'GET' && path === `${ROOT}/summary`) {
-      return json(res, 200, { ok: true, data: { items: reports.overview(vms) } })
+      const vmId = url.searchParams.get('vm_id')
+      return json(res, 200, { ok: true, data: { items: reports.overview(vmId ? vms.filter((vm) => vm.id === vmId) : vms) } })
     }
     if (path === `${ROOT}/rules` && req.method === 'GET') {
       const id = url.searchParams.get('vm_id')

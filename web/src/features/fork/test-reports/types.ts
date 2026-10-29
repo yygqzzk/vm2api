@@ -57,6 +57,38 @@ export type SlotOption = {
   name?: string | null
   platform?: string | null
 }
+export type HistoryEntry = {
+  id: number
+  started_at: string
+  ok: boolean
+  verdict: Verdict
+  rule_enabled: boolean
+}
+export type SlotHistory = {
+  vm_id: string
+  vm_name: string
+  platform: string
+  latest: ReportSummary | null
+  history: HistoryEntry[]
+}
+
+// Color summarizes execution first, then the rule captured when this test began.
+export function testOutcome(
+  item: Pick<HistoryEntry, 'ok' | 'verdict' | 'rule_enabled'>
+) {
+  if (!item.ok) return { tone: 'fail' as const, label: '调用失败' }
+  if (!item.rule_enabled) return { tone: 'pass' as const, label: '调用成功' }
+  return {
+    tone: item.verdict,
+    label:
+      item.verdict === 'pass'
+        ? '匹配通过'
+        : item.verdict === 'fail'
+          ? '匹配不通过'
+          : '待定',
+  }
+}
+
 export const VERDICTS: Record<Verdict, string> = {
   pass: '通过',
   pending: '待定',
