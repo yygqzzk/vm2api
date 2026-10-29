@@ -62,7 +62,7 @@ docker build --platform linux/amd64 \
 
 构建前先提交并验收合并结果，确保镜像标签和 revision 对应完整源码。
 `VERSION` 继续表示兼容的上游版本，fork 身份以镜像标签和 OCI revision
-label 为准。本次同步的版本为 1.4.023，另含上游 main 尚未发布的后续修复。
+label 为准。当前上游基线读仓库根目录的 `VERSION`。
 
 ## 本机隔离部署
 

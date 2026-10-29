@@ -1,5 +1,7 @@
 # 文档
 
+本 fork 的仓库约定见 [fork/REPO.md](fork/REPO.md)，构建与部署见 [fork/DEPLOY.md](fork/DEPLOY.md)。
+
 - [DEPLOY.md](DEPLOY.md) — 安装与升级（含 `deploy/install.sh` 一键安装 / 更新）
 - [nginx-shell.md](nginx-shell.md) — 集群 / 槽运维终端 WebSocket 连不上时查 nginx Upgrade
 - [FORMAT.md](FORMAT.md) — 本地与 CI 同一套格式（Biome / gofmt / Prettier，LF）
