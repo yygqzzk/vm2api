@@ -48,6 +48,7 @@ import { atomicWriteJson, listVmRecordFiles } from '../vm/vm-file.mjs'
 import { CONTAINER_CLI_NODE_BIN, normalizeOfficialCcInference, resolveOfficialCcInference } from '../vm/slot-engine.mjs'
 import { getVm } from '../vm/vm-registry.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
+import { CRS_OFFICIAL_CLI_SYSTEM } from '../identity/crs-persona.mjs'
 
 export { officialCcUidGid } from '../vm/vm-runtime.mjs'
 export const DEFAULT_HELLO_PROMPT = 'hello'
@@ -799,6 +800,11 @@ export function buildOfficialCcDockerArgs({
       ...(slash
         ? [text, '--print', '--permission-mode', 'bypassPermissions', '--output-format', 'stream-json', '--verbose']
         : ['-p', text, '--permission-mode', 'bypassPermissions', '--output-format', 'json']),
+      // Direct api.anthropic.com: this CLI build drops the first-party identity
+      // block, and the gateway persona never runs. Compact Agent SDK identity
+      // is refused; the official CLI sentence has to land as system[0].
+      '--append-system-prompt',
+      CRS_OFFICIAL_CLI_SYSTEM,
     ],
     {
       user: `${uid}:${gid}`,

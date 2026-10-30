@@ -56,6 +56,7 @@ import { apiKeyBetaHeader, setupTokenBetaHeader } from './claude-code-betas.mjs'
 
 import { isApiKeyMode, isAnySetupTokenMode } from '../oauth/credential-mode.mjs'
 import { prepareClassifierBody } from './request-purpose.mjs'
+import { applyEagerToolStreaming } from './eager-tool-streaming.mjs'
 
 export const INFERENCE_UA = 'kin-inference/1.0'
 
@@ -245,25 +246,17 @@ function stampMessageTail(messages, index, ttl) {
     return
   }
 }
-/** Official Claude Code omits eager streaming and tool cache markers. A caller TTL here makes CLI fill the omitted system and message markers. */
-function stripEagerInputStreaming(tools, { preserveCacheControl = false } = {}) {
+/** Tool-cache cleanup must not remove caller or panel-controlled eager streaming. */
+function stripToolCacheControl(tools, { preserveCacheControl = false } = {}) {
   if (!Array.isArray(tools)) return tools
   let changed = false
   const next = tools.map((tool) => {
     if (!tool || typeof tool !== 'object') return tool
-    const hasOwn = Object.prototype.hasOwnProperty.call(tool, 'eager_input_streaming')
     const hasCache = !preserveCacheControl && Object.prototype.hasOwnProperty.call(tool, 'cache_control')
-    const fn = tool.function
-    const fnHas = fn && typeof fn === 'object' && Object.prototype.hasOwnProperty.call(fn, 'eager_input_streaming')
-    if (!hasOwn && !hasCache && !fnHas) return tool
+    if (!hasCache) return tool
     changed = true
     const copy = { ...tool }
-    delete copy.eager_input_streaming
-    if (!preserveCacheControl) delete copy.cache_control
-    if (fnHas) {
-      copy.function = { ...fn }
-      delete copy.function.eager_input_streaming
-    }
+    delete copy.cache_control
     return copy
   })
   return changed ? next : tools
@@ -273,7 +266,7 @@ function stripEagerInputStreaming(tools, { preserveCacheControl = false } = {}) 
 export function prepareCliPersonaInput(body, preset) {
   if (preset === 'zero') return body
   const { cache_control: _automatic, ...out } = body
-  if (Array.isArray(out.tools)) out.tools = stripEagerInputStreaming(out.tools)
+  if (Array.isArray(out.tools)) out.tools = stripToolCacheControl(out.tools)
   return out
 }
 
@@ -405,7 +398,7 @@ export function prepareCliHopBody(
     // Keep official tool-marker cleanup before counting available slots. A
     // caller's 5m tool marker must not precede a template-owned 1h system marker.
     if (Array.isArray(body.tools)) {
-      body = { ...body, tools: stripEagerInputStreaming(body.tools, { preserveCacheControl: zeroFallback }) }
+      body = { ...body, tools: stripToolCacheControl(body.tools, { preserveCacheControl: zeroFallback }) }
     }
     // Assembled official templates own their system markers, not the growing
     // conversation. Fill missing message anchors without moving caller markers.
@@ -421,7 +414,7 @@ export function prepareCliHopBody(
       }
     }
   }
-  return body
+  return applyEagerToolStreaming(body, routing)
 }
 
 export function prepareOutboundAttempt({

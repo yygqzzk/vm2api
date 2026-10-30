@@ -1,12 +1,12 @@
 {
   "repo": "dofastted/vm2api",
-  "release": "payload-2026.10.29-telemetry-slot-start",
+  "release": "payload-2026.10.29-telemetry-kernel",
   "files": [
     {
       "path": "bin/kin-kernel",
       "asset": "kin-kernel",
-      "size": 12947192,
-      "sha256": "8a61aaa3cba06567a4c3b0039d357b341975e2495ec7fc7e8b5c3425cc53ec16"
+      "size": 13228472,
+      "sha256": "f57d4e71081bbca0b5bc2ba15886a7149c3e34c256a890ec51e084a9fcd14288"
     },
     {
       "path": "bin/kin-codex-kernel",
@@ -59,8 +59,8 @@
     {
       "path": "share/wrap-cli/kin-kernel.bin",
       "asset": "kin-kernel",
-      "size": 12947192,
-      "sha256": "8a61aaa3cba06567a4c3b0039d357b341975e2495ec7fc7e8b5c3425cc53ec16"
+      "size": 13228472,
+      "sha256": "f57d4e71081bbca0b5bc2ba15886a7149c3e34c256a890ec51e084a9fcd14288"
     },
     {
       "path": "share/wrap-cli/glibc239/ld-linux-x86-64.so.2",

@@ -5,6 +5,7 @@
 import { applyIntercept } from '../core/intercept.mjs'
 import { resolveStreamIdleTimeoutMs, inboundBodyLimit, queueKeepaliveDelayMs } from '../core/config.mjs'
 import { applyEagerToolStreaming } from './eager-tool-streaming.mjs'
+import { validateToolChoice } from './model-policy.mjs'
 import {
   inboundRefusalDeviceId,
   isRefusalGuardEnabled,
@@ -308,8 +309,8 @@ export function createHandleProtocol(deps) {
       mapUpstreamError(result?.status || 503, result?.body, result?.headers || {}),
       result?.body,
     )
-    const mappedCode = mapped.body?.error?.code
     const summary = formatPoolSelectionSummary(details)
+    const mappedCode = mapped.body?.error?.code
     if (mappedCode === ErrorCode.REFUSAL_GUARD) {
       // The kernel often names an AUP refusal upstream_invalid_request. Keep
       // the refusal code so the audit feed can see it, and the upstream sentence
@@ -942,6 +943,15 @@ export function createHandleProtocol(deps) {
         return json(res, error.status, error.body)
       }
     } else ctx.body = applyMinMaxTokens(ctx.body, getRouting()?.compatibility?.min_max_tokens)
+    try {
+      validateToolChoice(ctx.body)
+    } catch (error) {
+      if (!error.body?.error) throw error
+      stats.errors++
+      logBag.error_code = error.body.error.code
+      logBag.error_message = error.body.error.message
+      return json(res, error.status, error.body)
+    }
     if (!requestContext && officialTraffic && officialCcPassthroughFromRouting(getRouting())) {
       try {
         validateCacheBreakpoints(ctx.body)

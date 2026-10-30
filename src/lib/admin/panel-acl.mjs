@@ -6,6 +6,8 @@
  *   user   — tenant: vm / proxies / keys / billing / logs / statistics (owner-scoped)
  */
 
+import { testReportsRouteAllowed } from '../fork/test-reports/routes.mjs'
+
 export const PANEL_VIEWS = [
   'overview',
   'cluster',
@@ -245,6 +247,7 @@ export function authorizePanelRoute(method, path, role) {
   if (r === 'admin') return { ok: true, role: r }
   const m = String(method || 'GET').toUpperCase()
   const p = String(path || '')
+  if (testReportsRouteAllowed(m, p, r)) return { ok: true, role: r }
 
   if (p === '/api/panel/test-schedule/default' && m === 'PUT') {
     return { ok: false, role: r, code: 'forbidden', message: '当前权限无法执行此操作' }
