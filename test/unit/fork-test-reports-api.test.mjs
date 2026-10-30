@@ -80,7 +80,10 @@ test('report routes enforce tenant scope, pagination, immutable snapshots and al
     ['vm-mine'],
   )
   const overview = (await call('user', 'GET', `${ROOT}/summary`)).body.data.items
-  assert.deepEqual(overview[0].history.map((entry) => entry.id), [mine.id])
+  assert.deepEqual(
+    overview[0].history.map((entry) => entry.id),
+    [mine.id],
+  )
   assert.equal(overview[0].history[0].rule_enabled, false)
   assert.equal('text' in overview[0].history[0], false)
   assert.deepEqual((await call('user', 'GET', `${ROOT}/summary?vm_id=vm-other`)).body.data.items, [])

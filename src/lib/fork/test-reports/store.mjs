@@ -156,10 +156,12 @@ export class TestReports {
   overview(vms) {
     if (!vms.length) return []
     const histories = new Map(vms.map((vm) => [vm.id, []]))
-    const rows = this.db.prepare(
-      `SELECT id, vm_id, record_json FROM fork_test_reports
+    const rows = this.db
+      .prepare(
+        `SELECT id, vm_id, record_json FROM fork_test_reports
        WHERE vm_id IN (${vms.map(() => '?').join(',')}) ORDER BY started_at DESC, id DESC`,
-    ).all(...vms.map((vm) => vm.id))
+      )
+      .all(...vms.map((vm) => vm.id))
     for (const row of rows) histories.get(row.vm_id).push(decode(row))
     return vms.map((vm) => {
       const records = histories.get(vm.id).slice(0, REPORT_LIMIT_PER_VM)
@@ -169,7 +171,11 @@ export class TestReports {
         platform: isCodexVm(vm) ? 'openai' : 'anthropic',
         latest: records[0] ? summary(records[0]) : null,
         history: records.reverse().map(({ id, started_at, ok, verdict, rule }) => ({
-          id, started_at, ok, verdict, rule_enabled: rule.enabled,
+          id,
+          started_at,
+          ok,
+          verdict,
+          rule_enabled: rule.enabled,
         })),
       }
     })
