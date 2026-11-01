@@ -58,6 +58,28 @@ test('geo payload keeps named zones and reports provider-level failures', () => 
   assert.equal(normalizeGeoPayload({}), null)
 })
 
+test('geo payload reads a nested timezone object (ipwho.is) and its nested ISP', () => {
+  // The deployment overrides KIN_PROXY_GEO_URL to ipwho.is, which nests the
+  // zone; reading only a string dropped it and blocked browser start.
+  const geo = normalizeGeoPayload({
+    ip: '2a12:a303:10b:18::14',
+    success: true,
+    country: 'Japan',
+    country_code: 'JP',
+    region: 'Tokyo',
+    city: 'Tokyo',
+    connection: { asn: 3258, org: 'xTom Japan Corporation', isp: 'xTom Japan Corporation' },
+    timezone: { id: 'Asia/Tokyo', abbr: 'JST', is_dst: false, offset: 32400, utc: '+09:00' },
+  })
+  assert.equal(geo.timezone, 'Asia/Tokyo')
+  assert.equal(geo.country_code, 'JP')
+  assert.equal(geo.city, 'Tokyo')
+  assert.equal(geo.isp, 'xTom Japan Corporation')
+  // Offset strings are not IANA zones and must still be rejected.
+  assert.equal(normalizeGeoPayload({ ip: '203.0.113.9', timezone: { utc: '+09:00' } }).timezone, null)
+  assert.equal(normalizeGeoPayload({ ip: '203.0.113.9', timezone: { id: 'asia/tokyo' } }).timezone, 'Asia/Tokyo')
+})
+
 test('plaintext IP parser trims whitespace', () => {
   assert.equal(parsePlaintextIp('2001:db8::1\n'), '2001:db8::1')
   assert.equal(parsePlaintextIp(''), null)
