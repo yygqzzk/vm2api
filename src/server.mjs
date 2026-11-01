@@ -85,6 +85,9 @@ import { bindPlacement, nodeImageBuildRunning } from './lib/cluster/placement.mj
 import { ClusterError } from './lib/cluster/ssh-link.mjs'
 import { nodeEgressProxyUrl, startNodeEgressSocks } from './lib/cluster/node-egress-socks.mjs'
 import { createSlotShell } from './lib/vm/slot-shell.mjs'
+import { createSlotBrowser } from './lib/fork/slot-browser/service.mjs'
+import { browserPrincipal } from './lib/fork/slot-browser/principal.mjs'
+import { createBrowserEnvironment } from './lib/fork/slot-browser/environment.mjs'
 import { vmLockBusy } from './lib/vm/vm-file.mjs'
 import { refreshSlotGuestBinDir, syncLocalSlotRestartPolicies } from './lib/vm/vm-runtime.mjs'
 
@@ -806,8 +809,9 @@ function requireAuth(req, res) {
   return true
 }
 
-function fetchWorkerModels(opts) {
-  return gatewayModelCatalog(opts)
+function fetchWorkerModels(opts = {}) {
+  const mappingKeys = Object.keys(routingConfig?.codex?.model_mappings || {})
+  return gatewayModelCatalog({ ...opts, mappingKeys })
 }
 
 const importCommit = createImportCommit({
@@ -930,6 +934,12 @@ if (proxyPool.snapshot().config.ipv6_enabled !== true) {
 }
 const clusterRoutes = createClusterRoutes({ manager: clusterManager, json, readBody, ok: panel.ok })
 const slotShell = createSlotShell({ projectRoot: cfg.paths.project, importOauth: commitImportedOauth })
+const slotBrowser = createSlotBrowser({
+  projectRoot: cfg.paths.project,
+  refreshEnvironment: createBrowserEnvironment({ projectRoot: cfg.paths.project, proxyPool }),
+  principalFor: (req) =>
+    browserPrincipal(req, { masterKey: cfg.api_key, findUser: (name) => panelUsers.getByUsername(name) }),
+})
 for (const vm of listVms(cfg.paths.project)) {
   if (isCodexVm(vm)) continue
   try {
@@ -1013,6 +1023,7 @@ const handlePanel = createPanelHandler({
   clusterRoutes,
   clusterManager,
   slotShell,
+  slotBrowser,
 })
 
 const server = http.createServer(async (req, res) => {
@@ -1183,6 +1194,7 @@ const server = http.createServer(async (req, res) => {
 server.on('upgrade', (req, socket, head) => {
   if (responsesWs.handleUpgrade(req, socket, head)) return
   if (clusterRoutes.handleUpgrade(req, socket, head)) return
+  if (slotBrowser.handleUpgrade(req, socket, head)) return
   if (!slotShell.handleUpgrade(req, socket, head)) socket.destroy()
 })
 

@@ -18,7 +18,11 @@ function reasonOf(value: unknown): string {
 }
 
 /** 绑定后网关会停调度并重载槽位；重载失败时槽位保持停调度，不能报成功。 */
-export function bindOutcome(done: string, worker: SlotResult): Outcome {
+export function bindOutcome(
+  done: string,
+  worker: SlotResult,
+  timezone?: { ok?: boolean; reason?: string }
+): Outcome {
   if (worker && worker.ok === false) {
     const reason = reasonOf(worker.error)
     return {
@@ -26,10 +30,22 @@ export function bindOutcome(done: string, worker: SlotResult): Outcome {
       text: `${done}，但槽位重载失败${reason ? `（${reason}）` : ''}，该槽已停止调度，修好后需手动恢复调度`,
     }
   }
+  if (
+    timezone?.ok === false &&
+    !['timezone_pinned', 'follow_proxy_timezone_disabled'].includes(
+      timezone.reason || ''
+    )
+  ) {
+    return {
+      level: 'warning',
+      text: `${done}，但自动时区未确认，请在代理池重新测地理后再打开槽位浏览器`,
+    }
+  }
   return { level: 'success', text: done }
 }
 
 export type ProxyEditResult = {
+  geo_error?: string | null
   workers?: { vm_id: string; ok: boolean; error?: string | null }[]
   egress?: { ok?: boolean; error?: string | null } | null
 }
@@ -46,6 +62,10 @@ export function editOutcome(data: ProxyEditResult): Outcome {
     const reason = reasonOf(data.egress.error)
     problems.push(`出口转发重启失败${reason ? `（${reason}）` : ''}`)
   }
+  if (data.geo_error)
+    problems.push(
+      '出口地理检测失败，自动时区未确认；请重新测地理后再打开槽位浏览器'
+    )
   if (!problems.length) return { level: 'success', text: '已保存' }
   return { level: 'warning', text: `已保存，但${problems.join('；')}` }
 }

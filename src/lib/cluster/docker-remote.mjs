@@ -394,13 +394,21 @@ function execPath(execId) {
   return `/exec/${execId}`
 }
 
+/** Interactive terminals keep their existing raw-TTY contract. */
+export function openExecTty(connect, id, opts = {}) {
+  return openExecStream(connect, id, { ...opts, tty: true })
+}
+
 /**
- * `docker exec -it` over the Engine API. The start call is hijacked
- * (`Upgrade: tcp`); with Tty the stream is raw, no 8-byte frame headers.
- * No `User`: the session runs as the container's configured user.
+ * Docker exec over a hijacked stream. Non-TTY output has Docker's 8-byte
+ * multiplex headers; callers must decode them rather than use a PTY for binary data.
  * @returns {Promise<{ execId: string, stream: import('node:stream').Duplex }>}
  */
-export async function openExecTty(connect, id, { cmd, env = [], workingDir, cols = 80, rows = 24 } = {}) {
+export async function openExecStream(
+  connect,
+  id,
+  { cmd, env = [], workingDir, user, tty = false, cols = 80, rows = 24 } = {},
+) {
   const created = await dockerJson(
     connect,
     {
@@ -409,10 +417,11 @@ export async function openExecTty(connect, id, { cmd, env = [], workingDir, cols
       body: {
         Cmd: cmd,
         Env: env,
-        Tty: true,
+        Tty: tty,
         AttachStdin: true,
         AttachStdout: true,
         AttachStderr: true,
+        ...(user ? { User: user } : {}),
         ...(workingDir ? { WorkingDir: workingDir } : {}),
       },
     },
@@ -420,7 +429,9 @@ export async function openExecTty(connect, id, { cmd, env = [], workingDir, cols
   )
   const start = `${execPath(created.Id)}/start`
   const socket = await connect()
-  const payload = Buffer.from(JSON.stringify({ Detach: false, Tty: true, ConsoleSize: [rows, cols] }))
+  const payload = Buffer.from(
+    JSON.stringify({ Detach: false, Tty: tty, ...(tty ? { ConsoleSize: [rows, cols] } : {}) }),
+  )
   const agent = new http.Agent({ keepAlive: false })
   agent.createConnection = () => socket
   const stream = await new Promise((resolve, reject) => {

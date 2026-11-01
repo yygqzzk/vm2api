@@ -19,7 +19,11 @@ function tmpDir(prefix = 'kin-geo-') {
 }
 
 function makePool(geoLookup) {
-  const pool = new ProxyPool({ dataDir: tmpDir(), geoLookup })
+  const pool = new ProxyPool({
+    dataDir: tmpDir(),
+    geoLookup,
+    geoV6Lookup: async () => ({ ok: false, error: 'test_ipv6_unavailable' }),
+  })
   pool.stopScheduler()
   return pool
 }

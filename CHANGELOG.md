@@ -1,11 +1,23 @@
 # Changelog
 
 ## Unreleased
-- 设置 → 配额直接显示并管理「请求体上限」（`failover.max_request_mib`，8–128 MiB）。账号池「重试与切号」不再包含这项。保存后的生效方式不变：各槽 kernel 在没有请求时重启。
 
-已部署机升级：更新 `web/dist` 后刷新控制台。不必重启 Node，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+## 1.4.032 — 2026-11-01
 
-- 官方 Claude Code 家族不再仅凭识别放行。协议页「官方 Claude Code 家族透传」（`official_cc_passthrough`）关闭时，直连、中转、子跳以及任何看起来像官方的 Messages 都走 persona 清洗；只有该开关打开才保留入站 system。cli-hop 与 HTTP 同一条门。
+- OpenAI GPT 模型页支持按上游 `priority` 档位公开 `<model>-fast` 别名；调度前还原基模型并发送 `service_tier: "priority"`。
+- Codex Image 增加 `gpt-image-2` 及 `gpt-image-2-2026-04-21` 快照，覆盖模型目录、Images 端点、Responses 图像工具、计费和槽位白名单。
+- Codex kernel 对齐 `codex-proxy-rs`：支持大图像 WebSocket 帧，并用增量字节 SSE 解码器处理拆分 UTF-8、LF/CRLF 和大流。
+- OAuth 换票与 bootstrap 全程沿用目标 VM 绑定出口。
+
+已部署机升级：更新 Node 控制面与 `web/dist` 后重启；本版包含 Codex kernel payload 更新，不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.4.031 — 2026-11-01
+
+- #841：设置 → 配额直接显示并管理「请求体上限」（`failover.max_request_mib`，8–128 MiB）。账号池「重试与切号」不再包含这项。保存后的生效方式不变：各槽 kernel 在没有请求时重启。
+- #843：官方 Claude Code 家族不再仅凭识别放行。协议页「官方 Claude Code 家族透传」（`official_cc_passthrough`）关闭时，直连、中转、子跳以及任何看起来像官方的 Messages 都走 persona 清洗；只有该开关打开才保留入站 system。cli-hop 与 HTTP 同一条门。
+- #842：上游 HTTP 400/503「Third-party apps now draw from your extra usage…」和「no third-party apps allowed」不再当无效请求、过载或额度错误。不换号、不修复重试，客户端收到 400 `refusal_guard`，该 prompt 永久写入拒答缓存，近似正文按已有阈值拦截。这是计费限制，不封 device。内容策略错误码（含只写在 `upstream_code` 的）同样永久入库并带相似度签名。
+
+已部署机升级：须更新 Node 控制面与 `web/dist` 后重启；无迁移、不必 `fetch:payload` / `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
 
 ## 1.4.030 — 2026-10-31
 

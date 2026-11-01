@@ -45,6 +45,7 @@ import { CodexCredentialPanel } from '@/features/vm/codex-credential-panel'
 import { ConvertOauthToSetupButton } from '@/features/vm/convert-oauth-button'
 import { prepareLoginTerminal } from '@/features/vm/login-terminal-start'
 import { vmQueryOptions } from '@/features/vm/queries'
+import { SlotBrowserButton } from '@/features/vm/slot-browser-panel'
 
 export type CommitResult = {
   official_cc_bootstrap?: { scheduled?: boolean; reason?: string } | null
@@ -474,6 +475,11 @@ function ClaudeCredentialPanel({
                     <Copy className='size-3.5' aria-hidden='true' />
                     复制链接
                   </Button>
+                  <SlotBrowserButton
+                    vm={vm}
+                    authUrl={loginUrl}
+                    disabled={!loginUrl}
+                  />
                   {loginUrl ? (
                     <a
                       className='inline-flex items-center gap-1 text-xs underline'
@@ -546,6 +552,7 @@ function ClaudeCredentialPanel({
               <Copy className='size-3.5' aria-hidden='true' />
               复制链接
             </Button>
+            <SlotBrowserButton vm={vm} authUrl={link.authUrl} disabled={busy} />
             <a
               className='inline-flex items-center gap-1 text-xs underline'
               href={link.authUrl}

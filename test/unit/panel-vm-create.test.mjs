@@ -199,9 +199,14 @@ test('create returns the persisted VM when runtime start fails', async () => {
         getProxyForVm() {
           return proxy
         },
-        // A new slot without a requested zone takes its exit's.
+        // Startup refreshes the actual exit even when a cached zone exists.
         proxyTimezone() {
-          return 'Europe/Berlin'
+          return 'Asia/Hong_Kong'
+        },
+        async detectGeo(id, options) {
+          assert.equal(id, proxy.id)
+          assert.equal(options.force, true)
+          return { ok: true, geo: { timezone: 'Europe/Berlin' } }
         },
       },
     )
