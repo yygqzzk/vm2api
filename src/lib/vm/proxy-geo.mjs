@@ -33,6 +33,12 @@ function text(value) {
   return s || null
 }
 
+/** Some providers nest the zone (`ipwho.is`: {id:'Asia/Tokyo', abbr, offset}). */
+function timezoneValue(value) {
+  const raw = value && typeof value === 'object' ? (value.id ?? value.name ?? value.zone) : value
+  return text(raw)
+}
+
 /** Split an `ipapi.co` style `America/New_York` or ipinfo `loc` payload into our shape. */
 export function normalizeGeoPayload(payload) {
   if (!payload || typeof payload !== 'object') return null
@@ -40,14 +46,14 @@ export function normalizeGeoPayload(payload) {
   if (String(payload.status || '').toLowerCase() === 'fail') {
     return { error: text(payload.message) || 'geo_lookup_failed' }
   }
-  const timezone = validTimezone(payload.timezone || payload.time_zone || payload.timeZone)
+  const timezone = validTimezone(timezoneValue(payload.timezone ?? payload.time_zone ?? payload.timeZone))
   const geo = {
     ip: text(payload.query || payload.ip),
     country: text(payload.country || payload.country_name),
     country_code: text(payload.countryCode || payload.country_code || payload.country)?.slice(0, 8) || null,
     region: text(payload.regionName || payload.region || payload.region_name),
     city: text(payload.city),
-    isp: text(payload.isp || payload.org || payload.asn),
+    isp: text(payload.isp || payload.org || payload.asn || payload.connection?.isp || payload.connection?.org),
     timezone: timezone || null,
   }
   if (!geo.ip && !geo.country && !geo.timezone) return null
