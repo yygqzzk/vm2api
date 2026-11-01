@@ -341,6 +341,7 @@ export class ProxyPool extends EventEmitter {
     this._probeSockets = new Map()
     // Node exits are not pool rows: px-local's geo is the control plane's, a node slot leaves elsewhere.
     this._exitGeo = new Map()
+    this._geoRequests = new Map()
     this.load()
   }
 
@@ -904,6 +905,12 @@ export class ProxyPool extends EventEmitter {
       password: has('password') ? patch.password : username ? p.password : null,
     })
     if (!next) return { ok: false, error: 'invalid_proxy' }
+    const connectionChanged = ['host', 'port', 'username', 'password'].some((key) => next[key] !== p[key])
+    if (connectionChanged) {
+      // Geography belongs to this exact endpoint and authentication, not the row ID.
+      for (const key of Object.keys(p)) if (key.startsWith('geo_')) p[key] = null
+      this._geoRequests.delete(proxyId)
+    }
     p.host = next.host
     p.port = next.port
     p.username = next.username
@@ -915,7 +922,12 @@ export class ProxyPool extends EventEmitter {
     p.label = label
     p.domain_forward = domainForward
     this.save()
-    return { ok: true, proxy: this.publicProxy(p), connection_changed: true, domain_forward_changed: domainChanged }
+    return {
+      ok: true,
+      proxy: this.publicProxy(p),
+      connection_changed: connectionChanged,
+      domain_forward_changed: domainChanged,
+    }
   }
 
   updateConfig(patch = {}) {
@@ -1212,6 +1224,9 @@ export class ProxyPool extends EventEmitter {
         geo_v6: proxyGeoV6Of(p),
       }
     }
+    const identity = this._withAuth(p).url
+    const request = Symbol('geo')
+    this._geoRequests.set(proxyId, request)
     // Control-plane local egress has no SOCKS URL: the lookup leaves over the
     // host default route. A node row looks up through that node's own route.
     let url = this._withAuth(p).url
@@ -1226,9 +1241,17 @@ export class ProxyPool extends EventEmitter {
       }
     }
     const timeoutMs = this.state.config?.geo_timeout_ms
-    let v4Result = v4Cached ? { ok: true } : await this.geoLookup(url, { timeoutMs })
+    const v4Result = v4Cached ? { ok: true } : await this.geoLookup(url, { timeoutMs })
+    const v6Result = v6Cached ? { ok: true } : await this.geoV6Lookup(url, { timeoutMs })
+    if (
+      !this.state.proxies.includes(p) ||
+      this._withAuth(p).url !== identity ||
+      this._geoRequests.get(proxyId) !== request
+    ) {
+      return { ok: false, error: 'proxy_changed' }
+    }
+    this._geoRequests.delete(proxyId)
     if (!v4Cached) this._applyGeoResult(p, v4Result)
-    let v6Result = v6Cached ? { ok: true } : await this.geoV6Lookup(url, { timeoutMs })
     if (!v6Cached) this._applyGeoV6Result(p, v6Result)
     this.save()
     const pub = this.publicProxy(p)

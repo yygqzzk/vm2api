@@ -87,6 +87,7 @@ import {
 import { runVmTestChat, resolveTestModels, syncCodexCatalog } from './vm-test-chat.mjs'
 import { VmTestScheduleError } from './vm-test-schedule.mjs'
 import { handleTestReports } from '../fork/test-reports/routes.mjs'
+import { BROWSER_PATH } from '../fork/slot-browser/service.mjs'
 import { runReportedTest } from '../fork/test-reports/store.mjs'
 import { readCatalogSync, syncClaudeCatalog, syncGptCatalog } from './catalog-monitor.mjs'
 import { setPriceOverride, listPriceOverrides, syncModelsDev } from './price-catalog.mjs'
@@ -162,7 +163,7 @@ import {
   applyUnschedulable,
   migrateScheduleRecord,
 } from '../pool/schedule-state.mjs'
-import { fillVmTimezoneFromExit, syncVmTimezoneFromProxy } from '../vm/proxy-timezone.mjs'
+import { fillVmTimezoneFromExit, syncVmTimezoneFromProxy, syncProxyTimezones } from '../vm/proxy-timezone.mjs'
 import { validTimezone } from '../core/timezone.mjs'
 import { stampVmKind, isCodexVm } from '../vm/vm-kind.mjs'
 import { parseAllowedModelsPatch } from '../pool/slot-model-gate.mjs'
@@ -1184,7 +1185,15 @@ export function createPanelHandler(ctx) {
     }
   }
 
-  return async function handlePanel(req, res, url) {
+  async function applyProxyLocation(req, proxyId, observed) {
+    if (!observed.ok) return []
+    await ctx.slotBrowser?.proxyObserved(req, proxyId, observed.geo)
+    return syncProxyTimezones(cfg.paths.project, proxyPool, proxyId, {
+      beforeApply: (vmIds) => ctx.slotBrowser?.beforeProxyMutation(req, { vmIds }),
+    })
+  }
+
+  async function handlePanel(req, res, url) {
     const p = url.pathname
     if (!p.startsWith('/admin') && !p.startsWith('/api/panel')) return false
 
@@ -1397,6 +1406,11 @@ export function createPanelHandler(ctx) {
       ) {
         return true
       }
+      if (BROWSER_PATH.test(p)) {
+        if (!ctx.slotBrowser) return json(res, 503, { ok: false, error: { message: '槽位浏览器服务不可用' } })
+        return ctx.slotBrowser.handle(req, res, url, { json, readBody })
+      }
+      await ctx.slotBrowser?.beforeMutation(req, p)
       if ((req.method === 'GET' || req.method === 'PUT') && p === '/api/panel/onboarding') {
         if (req.method === 'PUT') {
           const body = await readBody(req, 4096).catch(() => ({}))
@@ -3307,6 +3321,7 @@ export function createPanelHandler(ctx) {
             }
           }
         } catch {}
+        if (vm) await ctx.slotBrowser?.purgeProfile(vm)
         // detach this VM only — do not unbind other slots sharing the SOCKS5
         try {
           proxyPool.unbindVm(id)
@@ -3354,6 +3369,7 @@ export function createPanelHandler(ctx) {
           if (!gone.ok) {
             return json(res, 500, { ok: false, error: { message: gone.error || 'destroy failed', code: gone.code } })
           }
+          if (mode === 'traits') await ctx.slotBrowser?.purgeProfile(prev)
           let { vm } = recreateVmFiles(cfg.paths.project, prev, { mode })
           try {
             invalidateLiveCredentialCache()
@@ -3785,6 +3801,7 @@ export function createPanelHandler(ctx) {
           const gone = await destroySlot(vm)
           if (!gone.ok)
             return json(res, 500, { ok: false, error: { code: gone.code, message: gone.error || '重建新特征失败' } })
+          await ctx.slotBrowser?.purgeProfile(vm)
           const rebuilt = recreateVmFiles(cfg.paths.project, vm, { mode: 'traits' })
           const boot = await startSlotReady(rebuilt.vm, cfg.paths.project, {
             recreate: true,
@@ -4574,6 +4591,7 @@ export function createPanelHandler(ctx) {
               proxyUrl: slotProxy.proxyUrl,
               installationId: existing.device_id || existing.codex?.installation_id,
             })
+            ctx.slotBrowser?.recordAuthorization(id, generated)
             const px = existing.proxy || {}
             return json(
               res,
@@ -5617,11 +5635,13 @@ export function createPanelHandler(ctx) {
         if (bindVmId && result.items?.[0]?.id) {
           const bind = proxyPool.bind(result.items[0].id, bindVmId)
           if (bind.ok) {
+            await ctx.slotBrowser?.beforeProxyMutation(req, { vmIds: [bindVmId] })
             bindVmProxy(cfg.paths.project, bindVmId, proxyPool.getProxyForVm(bindVmId))
             bound = bind.proxy
             // Before the reload: the worker reads vm.timezone when it starts.
             timezone = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, bindVmId, {
               proxyId: result.items[0].id,
+              refresh: true,
             })
             const vm = getVm(cfg.paths.project, bindVmId)
             if (vm?.status === 'running' && process.env.KIN_CRS_MOCK !== '1') {
@@ -5639,9 +5659,13 @@ export function createPanelHandler(ctx) {
         const body = await readBody(req, 8192).catch(() => ({}))
         const result = await proxyPool.detectGeoAll({
           onlyEnabled: body?.only_enabled !== false,
-          force: body?.force === true,
+          force: body?.force !== false,
         })
-        return json(res, 200, panel.ok(result))
+        const timezones = []
+        for (const observed of result.results || []) {
+          timezones.push(...(await applyProxyLocation(req, observed.id, observed)))
+        }
+        return json(res, 200, panel.ok({ ...result, timezones }))
       }
       if (req.method === 'POST' && p === '/api/panel/proxies/probe') {
         const result = await proxyPool.probeAll({ onlyEnabled: true })
@@ -5704,6 +5728,9 @@ export function createPanelHandler(ctx) {
           const type = status === 404 ? 'not_found_error' : 'invalid_request_error'
           return json(res, status, { ok: false, error: { type, code: result.error, message: result.error } })
         }
+        if (result.connection_changed || result.domain_forward_changed) {
+          await ctx.slotBrowser?.beforeProxyMutation(req, { proxyId: id })
+        }
         // Hostname mode and SOCKS upstream both live inside kin-egress.
         // Domain-forward-only: restart the helper; slots keep the same bridge.
         // Same-id connection change: network name is unchanged so reload would
@@ -5722,6 +5749,8 @@ export function createPanelHandler(ctx) {
         // A label is display-only; reloading every bound worker for it would
         // pull live slots out of scheduling for nothing.
         if (!result.connection_changed) return json(res, 200, panel.ok({ proxy: result.proxy, workers: [], egress }))
+        const observed = await proxyPool.detectGeo(id, { force: true })
+        const timezones = await applyProxyLocation(req, id, observed)
         // The pool store is only one of three places the credentials live
         // (pool -> vms/<id>.json -> worker.json). Without this the edit looks
         // like it worked while every bound slot keeps dialing the old proxy.
@@ -5742,7 +5771,18 @@ export function createPanelHandler(ctx) {
             workers.push({ vm_id: vmId, ok: true, error: null })
           }
         }
-        return json(res, 200, panel.ok({ proxy: result.proxy, workers, egress }))
+        const updated = proxyPool.snapshot().proxies.find((proxy) => proxy.id === id)
+        return json(
+          res,
+          200,
+          panel.ok({
+            proxy: updated || result.proxy,
+            workers,
+            egress,
+            timezones,
+            geo_error: observed.ok ? null : observed.error || 'geo_lookup_failed',
+          }),
+        )
       }
       // The one endpoint allowed to return proxy credentials. Mirrors
       // POST /api/panel/api-keys/:id/reveal: POST so it never lands in browser
@@ -5810,15 +5850,7 @@ export function createPanelHandler(ctx) {
             },
           })
         }
-        // A slot already bound to this proxy adopts the freshly learned zone.
-        const timezones = []
-        for (const vmId of result.proxy?.bound_vm_ids || []) {
-          const synced = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, vmId, {
-            proxyId: id,
-            detect: false,
-          })
-          timezones.push({ vm_id: vmId, applied: synced.applied, timezone: synced.timezone, reason: synced.reason })
-        }
+        const timezones = await applyProxyLocation(req, id, result)
         return json(res, 200, panel.ok({ ...result, timezones }))
       }
       if (req.method === 'POST' && /^\/api\/panel\/proxies\/[^/]+\/enable$/.test(p)) {
@@ -5845,6 +5877,7 @@ export function createPanelHandler(ctx) {
             ok: false,
             error: { type: 'not_found_error', code: result.error, message: result.error },
           })
+        await ctx.slotBrowser?.beforeProxyMutation(req, { proxyId: id })
         return json(res, 200, panel.ok(result.proxy))
       }
       if (req.method === 'POST' && /^\/api\/panel\/proxies\/[^/]+\/bind$/.test(p)) {
@@ -5869,6 +5902,7 @@ export function createPanelHandler(ctx) {
             error: { type: 'invalid_request_error', code: result.error, message, details: result },
           })
         }
+        await ctx.slotBrowser?.beforeProxyMutation(req, { vmIds: [vmId] })
         bindVmProxy(cfg.paths.project, vmId, proxyPool.getProxyForVm(vmId))
         if (egressEnabled()) {
           await ensureProxyEgress(
@@ -5878,7 +5912,10 @@ export function createPanelHandler(ctx) {
         }
         let worker = null
         // Runs before the reload so the worker starts with the exit node's zone.
-        const timezone = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, vmId, { proxyId: id })
+        const timezone = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, vmId, {
+          proxyId: id,
+          refresh: true,
+        })
         const vm = getVm(cfg.paths.project, vmId)
         if (vm?.status === 'running' && process.env.KIN_CRS_MOCK !== '1') {
           setScheduleHold(cfg.paths.project, vmId, HOLD_MAINTENANCE, { tag: 'proxy_rebind_worker_reload' })
@@ -5907,6 +5944,7 @@ export function createPanelHandler(ctx) {
             ok: false,
             error: { type: 'not_found_error', code: result.error, message: result.error },
           })
+        await ctx.slotBrowser?.beforeProxyMutation(req, { vmIds: result.unbound_vm_ids || targets })
         for (const unboundId of result.unbound_vm_ids || targets) {
           bindVmProxy(cfg.paths.project, unboundId, null)
           markUnschedulable(cfg.paths.project, unboundId, 'proxy_required')
@@ -5926,6 +5964,7 @@ export function createPanelHandler(ctx) {
             ok: false,
             error: { type: 'not_found_error', code: result.error, message: result.error },
           })
+        await ctx.slotBrowser?.beforeProxyMutation(req, { proxyId: id })
         for (const unboundId of targets) {
           bindVmProxy(cfg.paths.project, unboundId, null)
           markUnschedulable(cfg.paths.project, unboundId, 'proxy_required')
@@ -5947,6 +5986,7 @@ export function createPanelHandler(ctx) {
         let worker = null
         const timezone = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, vmId, {
           proxyId: allocated?.id || null,
+          refresh: true,
         })
         const vm = getVm(cfg.paths.project, vmId)
         if (vm?.status === 'running' && process.env.KIN_CRS_MOCK !== '1') {
@@ -6025,6 +6065,15 @@ export function createPanelHandler(ctx) {
     }
 
     return false
+  }
+
+  return async (req, res, url) => {
+    try {
+      return await handlePanel(req, res, url)
+    } finally {
+      // A client disconnect must not unlock a still-running slot/proxy mutation.
+      ctx.slotBrowser?.afterMutation(req)
+    }
   }
 }
 

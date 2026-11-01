@@ -173,6 +173,8 @@ function userVmPathAllowed(method, path) {
     if (rest === 'oauth/credential' || rest === 'package') return false
     return (
       rest === 'test-schedule' ||
+      rest === 'browser' ||
+      rest === 'browser/callback' ||
       rest.startsWith('oauth/') ||
       rest === 'probe' ||
       rest === 'count-tokens' ||
@@ -200,6 +202,9 @@ function userVmPathAllowed(method, path) {
       rest === 'openai-quota/reset' ||
       rest === 'claude-reset/query' ||
       rest === 'claude-reset/redeem' ||
+      rest === 'browser/start' ||
+      rest === 'browser/stop' ||
+      rest === 'browser/ticket' ||
       rest.startsWith('oauth/')
     )
   }

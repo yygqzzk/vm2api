@@ -13,6 +13,7 @@
       "package.json",
       "biome.json",
       "!test/fixtures/**",
+      "!src/lib/fork/slot-browser/vendor/**",
       "!public/**"
     ]
   },

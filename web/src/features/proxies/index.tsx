@@ -235,13 +235,13 @@ export function ProxiesPage() {
   })
   const bind = useMutation({
     mutationFn: ({ id, vmId }: { id: string; vmId: string }) =>
-      api<{ worker?: { ok?: boolean; error?: unknown } | null }>(
-        `/api/panel/proxies/${encodeURIComponent(id)}/bind`,
-        {
-          method: 'POST',
-          body: JSON.stringify({ vm_id: vmId }),
-        }
-      ),
+      api<{
+        worker?: { ok?: boolean; error?: unknown } | null
+        timezone?: { ok?: boolean; reason?: string }
+      }>(`/api/panel/proxies/${encodeURIComponent(id)}/bind`, {
+        method: 'POST',
+        body: JSON.stringify({ vm_id: vmId }),
+      }),
     onSuccess: async (data, { id, vmId }) => {
       const to = list.find((p) => p.id === id)
       const from = ownerOf.get(vmId)
@@ -250,7 +250,8 @@ export function ProxiesPage() {
         from && from.id !== id
           ? `${name} 已从 ${proxyLabel(from)} 换绑到 ${to ? proxyLabel(to) : id}`
           : `${name} 已绑定`,
-        data?.worker
+        data?.worker,
+        data?.timezone
       )
       toast[out.level](out.text)
       await refresh()

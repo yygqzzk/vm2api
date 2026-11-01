@@ -8,6 +8,11 @@ import {
 } from './proxy-results'
 
 describe('proxy action outcomes', () => {
+  it('does not call a saved connection with failed geography fully verified', () => {
+    const result = editOutcome({ workers: [], geo_error: 'geo_http_429' })
+    expect(result.level).toBe('warning')
+    expect(result.text).toContain('自动时区未确认')
+  })
   it('warns when the slot reload after binding failed', () => {
     const out = bindOutcome('vm-1 已绑定', { ok: false, error: 'boot timeout' })
     expect(out.level).toBe('warning')
@@ -15,6 +20,13 @@ describe('proxy action outcomes', () => {
     expect(out.text).toContain('停止调度')
     expect(bindOutcome('vm-1 已绑定', null).level).toBe('success')
     expect(bindOutcome('vm-1 已绑定', { ok: true }).level).toBe('success')
+    expect(
+      bindOutcome('已绑定', null, { ok: false, reason: 'geo_http_429' }).level
+    ).toBe('warning')
+    expect(
+      bindOutcome('已绑定', null, { ok: false, reason: 'timezone_pinned' })
+        .level
+    ).toBe('success')
   })
 
   it('reports a failed egress restart after editing a proxy', () => {

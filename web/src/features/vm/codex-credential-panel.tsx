@@ -11,6 +11,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { dashboardQueryOptions } from '@/features/overview/queries'
 import type { CommitResult } from '@/features/vm/credential-panel'
 import { vmQueryOptions } from '@/features/vm/queries'
+import { SlotBrowserButton } from '@/features/vm/slot-browser-panel'
 
 type CodexImportMode = 'oauth' | 'access_token' | 'refresh_token' | 'json'
 
@@ -175,6 +176,13 @@ export function CodexCredentialPanel({
     onError: (error: Error) => toast.error(error.message),
   })
 
+  async function oauthCommitted(data: CommitResult) {
+    setCode('')
+    setLink(EMPTY_LINK)
+    await invalidate()
+    onCommitted?.(data, vm.id, '已完成 Codex OAuth')
+  }
+
   const exchange = useMutation({
     mutationFn: () =>
       api<CommitResult>(
@@ -189,11 +197,8 @@ export function CodexCredentialPanel({
         }
       ),
     onSuccess: async (data) => {
-      setCode('')
-      setLink(EMPTY_LINK)
-      await invalidate()
+      await oauthCommitted(data)
       toast.success('已完成 Codex OAuth')
-      onCommitted?.(data, vm.id, '已完成 Codex OAuth')
     },
     onError: (error: Error) => toast.error(error.message),
   })
@@ -239,6 +244,13 @@ export function CodexCredentialPanel({
                 <Copy className='size-3.5' aria-hidden='true' />
                 复制链接
               </Button>
+              <SlotBrowserButton
+                vm={vm}
+                authUrl={link.authUrl}
+                codexSessionId={link.sessionId}
+                disabled={busy}
+                onAuthorized={oauthCommitted}
+              />
               <a
                 className='inline-flex items-center gap-1 text-xs underline'
                 href={link.authUrl}
@@ -287,15 +299,16 @@ export function CodexCredentialPanel({
               </Button>
             </div>
             <Hint>
-              浏览器走 {proxyHint || '槽 SOCKS5'}。授权完成后把 localhost:1455
-              回调整段贴回来。
+              选择「在槽位浏览器中授权」会使用该槽出口并自动接收回调。
+              普通「打开授权页」仍使用本机浏览器，需要自行确认代理并粘贴回调
+              URL。
             </Hint>
           </div>
         ) : (
           <div className='space-y-2'>
             <Hint>
-              生成官方 Codex Desktop 授权链接。换票经槽
-              SOCKS5，打开链接仍是本机浏览器。
+              生成官方 Codex Desktop 授权链接后，可选择槽位浏览器完成登录。
+              换票沿用该槽原有流程。
             </Hint>
             <Button
               size='sm'
