@@ -142,6 +142,10 @@ jobs:
                 test/unit/proxy-geo-refresh.test.mjs \
                 test/unit/proxy-timezone-api.test.mjs
             '
+      - name: isolated panel and bundled kernel startup
+        env:
+          VM2API_TEST_CONTROL_IMAGE: local/vm2api:fork-${{ env.REVISION }}
+        run: node test/deploy/smoke_control_image.mjs
       - name: export the tested images
         run: |
           docker image inspect "local/vm2api-slot-browser:fork-$REVISION" \

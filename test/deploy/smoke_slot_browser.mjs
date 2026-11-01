@@ -285,7 +285,7 @@ async function main() {
       assert.match(status, /CapBnd:\s+0000000000000000/)
       assert.match(status, /NoNewPrivs:\s+1/)
       const info = fixture.inspect(vm)
-      assert.deepEqual(info.HostConfig.PortBindings, {})
+      assert.equal(Object.keys(info.HostConfig.PortBindings || {}).length, 0, 'no published host ports')
       assert.equal(info.HostConfig.Privileged, false)
       const sockets = await fixture.runtime.transport(fixture.sessions.get(vm.id))
       const version = await new Promise((resolve, reject) => {
