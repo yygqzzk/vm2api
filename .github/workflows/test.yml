@@ -1,5 +1,5 @@
-# PR/main gate against the production baseline: deploy/payload.json pins the
-# exact ELFs running live, so CI only checks source and the pinned bytes.
+# PR/main gate: deploy/payload.json pins the upstream payload bytes.
+# Native browser/image acceptance exports the same tested offline artifacts.
 name: ci
 
 on:
@@ -33,7 +33,8 @@ jobs:
           # refs/pull/<n>/merge keeps the base from the PR's last push and a
           # re-run reuses it; merge today's base so a re-run tests against it.
           git fetch --no-tags origin "$BASE_REF"
-          git -c user.name=ci -c user.email=ci@localhost merge --no-edit FETCH_HEAD
+          git -c user.name=ci -c user.email=ci@localhost \
+            merge --no-edit FETCH_HEAD
       - uses: actions/setup-node@v7
         with:
           node-version: '22'
@@ -54,14 +55,17 @@ jobs:
       - name: format and syntax
         run: |
           npx biome format
-          test -z "$(gofmt -l worker api-kernel)" || { gofmt -l worker api-kernel; exit 1; }
+          test -z "$(gofmt -l worker api-kernel)" || {
+            gofmt -l worker api-kernel; exit 1;
+          }
           find src scripts -name '*.mjs' -print0 | xargs -0 -n1 node --check
       - name: pinned payload
         run: |
           node scripts/fetch-payload.mjs
           node scripts/fetch-payload.mjs --check
       - name: native CLI packaging unit tests
-        run: python3 -m unittest discover -s test/deploy -p test_native_cli.py -v
+        run: >-
+          python3 -m unittest discover -s test/deploy -p test_native_cli.py -v
       - run: npm run test:unit
       - name: go vet and test
         run: |
@@ -75,6 +79,89 @@ jobs:
           pnpm test
           pnpm build
 
+  fork-images-amd64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.25.x'
+          cache-dependency-path: worker/go.sum
+      - run: npm ci
+      - name: browser offline contracts
+        run: |
+          node --test test/unit/slot-browser-*.test.mjs
+          python3 -m unittest discover -s test/deploy -p test_slot_browser.py -v
+      - name: build native browser and exit helper
+        run: |
+          docker build --label org.opencontainers.image.revision="$REVISION" \
+            --label io.vm2api.fork.feature=slot-browser \
+            -t "local/vm2api-slot-browser:fork-$REVISION" \
+            docker/fork/slot-browser
+          mkdir -p .local/slot-browser-test
+          (cd worker && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+            -o ../.local/slot-browser-test/kin-egress ./cmd/kin-egress)
+      - name: native sandbox, profiles and fail-closed network
+        env:
+          VM2API_BROWSER_IMAGE: >-
+            local/vm2api-slot-browser:fork-${{ env.REVISION }}
+          KIN_BROWSER_SMOKE_EGRESS: >-
+            ${{ github.workspace }}/.local/slot-browser-test/kin-egress
+        run: node test/deploy/smoke_slot_browser.mjs
+      - name: build complete control-plane image
+        run: |
+          docker build --platform linux/amd64 \
+            --label org.opencontainers.image.revision="$REVISION" \
+            --label io.vm2api.fork.feature=slot-browser \
+            -t "local/vm2api:fork-$REVISION" .
+      - name: control-plane image regression
+        run: |
+          docker run --rm --network none --entrypoint sh \
+            -e KIN_DATA_DIR=/tmp/kin-image-tests \
+            -v "$PWD/test:/opt/vm2api/test:ro" \
+            "local/vm2api:fork-$REVISION" -c '
+              cp -a image-bin/. bin/
+              mkdir -p share/wrap-cli share/crag
+              cp -a image-wrap-cli/. share/wrap-cli/
+              cp -a image-crag/. share/crag/
+              exec node --test test/unit/fork-codex-stream.test.mjs \
+                test/unit/oauth-auth-url.test.mjs \
+                test/unit/gpt-model-policy.test.mjs \
+                test/unit/codex-image-tool.test.mjs \
+                test/unit/slot-browser-*.test.mjs \
+                test/unit/proxy-geo-refresh.test.mjs \
+                test/unit/proxy-timezone-api.test.mjs
+            '
+      - name: export the tested images
+        run: |
+          docker image inspect "local/vm2api-slot-browser:fork-$REVISION" \
+            > browser-image.json
+          docker image inspect "local/vm2api:fork-$REVISION" \
+            > control-image.json
+          docker save "local/vm2api-slot-browser:fork-$REVISION" \
+            "local/vm2api:fork-$REVISION" | gzip > vm2api-linux-amd64.tar.gz
+          sha256sum vm2api-linux-amd64.tar.gz > vm2api-linux-amd64.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fork-images-linux-amd64
+          retention-days: 7
+          compression-level: 0
+          path: |
+            vm2api-linux-amd64.tar.gz
+            vm2api-linux-amd64.tar.gz.sha256
+            browser-image.json
+            control-image.json
+
   arm64-native-cli:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
@@ -83,9 +170,12 @@ jobs:
       - name: prepare pinned x86 kernel emulation
         run: python3 deploy/prepare-arm64.py
       - name: build native ARM control plane
-        run: docker build -f deploy/Dockerfile.arm64-control -t vm2api-native-cli-ci .
+        run: >-
+          docker build -f deploy/Dockerfile.arm64-control
+          -t vm2api-native-cli-ci .
       - name: offline large-body, concurrency and cancel regression
         run: |
           docker run --network none --cpus 2 --memory 3g --pids-limit 256 \
-            --entrypoint python3 -v "$PWD/test/deploy/smoke_native_cli.py:/smoke.py:ro" \
+            --entrypoint python3 \
+            -v "$PWD/test/deploy/smoke_native_cli.py:/smoke.py:ro" \
             vm2api-native-cli-ci /smoke.py
