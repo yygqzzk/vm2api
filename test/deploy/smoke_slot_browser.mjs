@@ -29,6 +29,9 @@ export async function browserFixture() {
   const socks = `browser-test-socks-${key}`
   const helper = `browser-test-egress-${key}`
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'browser-acceptance-'))
+  // Only synthetic fixture files live here. Native Linux enforces the runner
+  // UID's 0700 directory against a cap-drop root process in the test container.
+  fs.chmodSync(temp, 0o755)
   const binary = process.env.KIN_BROWSER_SMOKE_EGRESS
   if (!binary || !fs.existsSync(binary))
     throw new Error('Set KIN_BROWSER_SMOKE_EGRESS to a Linux kin-egress binary matching Docker architecture')
@@ -113,7 +116,6 @@ export async function browserFixture() {
     ])
     const network = JSON.parse(docker(['network', 'inspect', net]))[0]
     gateway = network.IPAM.Config[0].Gateway
-    proxyIp = gateway.replace(/\.1$/, '.2')
     const ports = portsForProxy(proxyId)
     fs.writeFileSync(
       path.join(temp, 'plan.json'),
@@ -127,6 +129,27 @@ export async function browserFixture() {
         }),
       ),
     )
+    docker([
+      'run',
+      '-d',
+      '--name',
+      socks,
+      '--network',
+      net,
+      '--cap-drop',
+      'ALL',
+      '-e',
+      'BROWSER_TEST_PROXY_IP=0.0.0.0',
+      '-v',
+      `${temp}:/fixture:ro`,
+      '--entrypoint',
+      'python3',
+      image,
+      '/fixture/proxy.py',
+    ])
+    // Older Docker versions reject a static IP on an auto-allocated subnet.
+    proxyIp = inspect(socks).NetworkSettings.Networks[net].IPAddress
+    assert.ok(proxyIp, 'fixture SOCKS server has an assigned address')
     fs.writeFileSync(
       path.join(temp, 'egress.json'),
       JSON.stringify({
@@ -137,26 +160,6 @@ export async function browserFixture() {
         dns_upstream: '8.8.8.8:53',
       }),
     )
-    docker([
-      'run',
-      '-d',
-      '--name',
-      socks,
-      '--network',
-      net,
-      '--ip',
-      proxyIp,
-      '--cap-drop',
-      'ALL',
-      '-e',
-      `BROWSER_TEST_PROXY_IP=${proxyIp}`,
-      '-v',
-      `${temp}:/fixture:ro`,
-      '--entrypoint',
-      'python3',
-      image,
-      '/fixture/proxy.py',
-    ])
     docker([
       'run',
       '-d',
