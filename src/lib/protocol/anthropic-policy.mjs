@@ -555,13 +555,15 @@ export function rewriteToolNames(body = {}, { enabled = true } = {}) {
 export function restoreToolNames(response, reverse = {}) {
   if (!response || typeof response !== 'object' || Object.keys(reverse).length === 0) return response
   const out = clone(response)
-  const restoreBlocks = (content) => {
-    if (!Array.isArray(content)) return content
-    return content.map((block) =>
-      block?.type === 'tool_use' && reverse[block.name] ? { ...block, name: reverse[block.name] } : block,
-    )
-  }
+  const restoreCall = (block) =>
+    (block?.type === 'tool_use' || block?.type === 'function_call') && Object.hasOwn(reverse, block.name)
+      ? { ...block, name: reverse[block.name] }
+      : block
+  const restoreBlocks = (content) => (Array.isArray(content) ? content.map(restoreCall) : content)
   out.content = restoreBlocks(out.content)
+  if (out.output) out.output = restoreBlocks(out.output)
+  if (out.item) out.item = restoreCall(out.item)
+  if (out.response) out.response = restoreToolNames(out.response, reverse)
   if (out.message) out.message.content = restoreBlocks(out.message.content)
   return out
 }
@@ -578,13 +580,13 @@ export function restoreToolNamesInSSELine(line, reverse = {}) {
   } catch {
     return line
   }
-  if (payload?.content_block?.type === 'tool_use' && reverse[payload.content_block.name]) {
+  if (payload?.content_block?.type === 'tool_use' && Object.hasOwn(reverse, payload.content_block.name)) {
     payload.content_block.name = reverse[payload.content_block.name]
   }
-  if (payload?.delta?.type === 'tool_use' && reverse[payload.delta.name]) {
+  if (payload?.delta?.type === 'tool_use' && Object.hasOwn(reverse, payload.delta.name)) {
     payload.delta.name = reverse[payload.delta.name]
   }
-  if (payload?.message) payload.message = restoreToolNames(payload.message, reverse)
+  payload = restoreToolNames(payload, reverse)
   return `${prefix} ${JSON.stringify(payload)}`
 }
 
@@ -622,7 +624,9 @@ export function scrubUpstreamClientBody(body, { official = false, rewriteTools =
   if (!body || typeof body !== 'object') return { body, reverse: {} }
   const out = clone(body)
   const reverse = {}
-  const used = new Set()
+  const used = new Set(
+    (Array.isArray(out.tools) ? out.tools : []).map((tool) => tool?.name).filter((name) => typeof name === 'string'),
+  )
   const assigned = new Map()
   const rename = (name) => {
     if (assigned.has(name)) return assigned.get(name)
@@ -703,7 +707,7 @@ export function composeToolNames(front = {}, hop = {}) {
   const out = { ...front }
   for (const [wire, mid] of Object.entries(hop || {})) {
     if (!wire || wire === mid) continue
-    const client = front[mid] || mid
+    const client = Object.hasOwn(front, mid) ? front[mid] : mid
     if (client !== wire) out[wire] = client
     delete out[mid]
   }

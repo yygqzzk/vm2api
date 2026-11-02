@@ -1193,6 +1193,7 @@ export function createHandleProtocol(deps) {
           protocol,
           inbound,
           convertedBody: ctx.body,
+          toolNames: inboundToolReverse,
           clientStream,
           deliveryMode,
           signal: clientAbort.signal,

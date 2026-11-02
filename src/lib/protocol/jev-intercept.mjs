@@ -1097,7 +1097,8 @@ function promptPieces(src) {
   if (typeof src.developer === 'string') raw.push(src.developer)
   const messages = Array.isArray(src.messages) ? src.messages : []
   for (const message of messages) {
-    if (String(message?.role || '').toLowerCase() !== 'system') continue
+    const role = String(message?.role || '').toLowerCase()
+    if (role !== 'system' && role !== 'developer') continue
     pushPromptContent(raw, message.content)
   }
   const input = Array.isArray(src.input) ? src.input : []

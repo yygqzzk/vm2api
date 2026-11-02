@@ -1,5 +1,6 @@
 import { OFFICIAL_CLAUDE_CLI_UA } from '../identity/vm-identity.mjs'
 import { officialMessagesBody } from '../protocol/anthropic-messages.mjs'
+import { restoreToolNamesInSSELine } from '../protocol/anthropic-policy.mjs'
 import { prepareClassifierBody } from '../protocol/request-purpose.mjs'
 import { consumeClaudeSSEData } from '../protocol/convert.mjs'
 import { isCompleteAssistantMessage, mapUpstreamError } from '../core/errors.mjs'
@@ -220,6 +221,7 @@ export async function runApiInference({
   converters,
   requestContext = null,
   passthrough = false,
+  toolNames = {},
 } = {}) {
   const canonical = officialMessagesBody(convertedBody)
   const model = canonical.model
@@ -367,6 +369,7 @@ export async function runApiInference({
       converters,
       body,
       timing,
+      toolNames,
     })
   }
 
@@ -377,6 +380,7 @@ export async function runApiInference({
   const readUpstreamLines = async (onLine) => {
     try {
       await readLines(upstream, async (line, receivedAt) => {
+        line = restoreToolNamesInSSELine(line, toolNames)
         const event = consumeClaudeSSEData(line, classifierSseState)
         timing.observe(event, receivedAt)
         streamedUsage = mergeUsage(streamedUsage, event?.message?.usage || event?.usage)
@@ -552,6 +556,7 @@ async function runOpenAIResponsesUpstream({
   converters,
   body,
   timing,
+  toolNames,
 }) {
   const chunks = []
   const anthropicSse = protocol === 'anthropic.messages' ? createAnthropicSseState() : null
@@ -594,7 +599,7 @@ async function runOpenAIResponsesUpstream({
 
   await readLines(upstream, async (line, receivedAt) => {
     if (conversionError) return
-    const raw = String(line || '')
+    const raw = String(restoreToolNamesInSSELine(line, toolNames) || '')
     const event = openAIResponsesSseEvent(raw)
     timing.observe(event, receivedAt)
     const failure = openAIResponsesFailure(event)
@@ -630,9 +635,9 @@ async function runOpenAIResponsesUpstream({
     try {
       assembled = assembleCodexBodyFromSse(chunks, {})
       outBody =
-        protocol === 'anthropic.messages'
-          ? codexBodyToAnthropicMessage(assembled, inbound?.model || body?.model)
-          : assembled
+        protocol === 'openai.responses'
+          ? assembled
+          : codexBodyToAnthropicMessage(assembled, inbound?.model || body?.model)
     } catch (error) {
       if (!isToolArgumentsError(error)) throw error
       return {

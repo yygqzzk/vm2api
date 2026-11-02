@@ -8,6 +8,7 @@ import {
   toStandardAnthropicBody,
   restoreToolNames,
   restoreToolNamesInSSELine,
+  composeToolNames,
   sanitizeAnthropicBodyForBetaTokens,
   anthropicBetaTokensContains,
   CONTEXT_MANAGEMENT_BETA,
@@ -712,6 +713,78 @@ test('valid unique tool names are not changed', () => {
     result.body.tools.map((tool) => tool.name),
     ['read_file', 'write_file'],
   )
+})
+
+test('third-party rewrites reserve unchanged names in either declaration order', () => {
+  for (const names of [
+    ['read_file', 'mcp__read_file'],
+    ['mcp__read_file', 'read_file'],
+  ]) {
+    const input = {
+      tools: names.map((name) => ({ name, input_schema: { type: 'object' } })),
+      tool_choice: { type: 'tool', name: 'read_file' },
+      messages: [
+        { role: 'assistant', content: names.map((name, i) => ({ type: 'tool_use', id: `id${i}`, name, input: {} })) },
+      ],
+    }
+    const out = scrubUpstreamClientBody(input)
+    assert.equal(new Set(out.body.tools.map((tool) => tool.name)).size, 2)
+    assert.equal(out.body.tools[names.indexOf('mcp__read_file')].name, 'mcp__read_file')
+    assert.equal(out.body.tool_choice.name, out.body.tools[names.indexOf('read_file')].name)
+    assert.deepEqual(
+      restoreToolNames({ content: out.body.messages[0].content }, out.reverse).content.map((block) => block.name),
+      names,
+    )
+    assert.deepEqual(
+      input.tools.map((tool) => tool.name),
+      names,
+    )
+  }
+})
+
+test('tool restoration covers Responses output items and terminal output without rewriting text', () => {
+  const reverse = { mcp__lookup: 'lookup' }
+  const item = { type: 'function_call', name: 'mcp__lookup', arguments: '{"name":"mcp__lookup"}' }
+  for (const event of [
+    { type: 'response.output_item.added', item },
+    {
+      type: 'response.completed',
+      response: { output: [item, { type: 'message', content: [{ type: 'output_text', text: 'mcp__lookup' }] }] },
+    },
+  ]) {
+    const restored = JSON.parse(restoreToolNamesInSSELine(`data: ${JSON.stringify(event)}`, reverse).slice(5))
+    const call = restored.item || restored.response.output[0]
+    assert.equal(call.name, 'lookup')
+    assert.equal(call.arguments, item.arguments)
+    if (restored.response) assert.equal(restored.response.output[1].content[0].text, 'mcp__lookup')
+    assert.equal((event.item || event.response.output[0]).name, 'mcp__lookup')
+  }
+})
+
+test('tool restoration ignores inherited names and only changes own mappings', () => {
+  const reverse = { mcp__foo: 'mcp_foo' }
+  for (const name of ['constructor', 'toString', '__proto__']) {
+    for (const event of [
+      { type: 'content_block_start', content_block: { type: 'tool_use', name } },
+      { type: 'content_block_delta', delta: { type: 'tool_use', name } },
+      { type: 'message_start', message: { content: [{ type: 'tool_use', name }] } },
+      { type: 'response.output_item.added', item: { type: 'function_call', name, arguments: '{}' } },
+      { type: 'response.completed', response: { output: [{ type: 'function_call', name, arguments: '{}' }] } },
+    ]) {
+      const restored = JSON.parse(restoreToolNamesInSSELine(`data: ${JSON.stringify(event)}`, reverse).slice(5))
+      assert.deepEqual(restored, event)
+    }
+    const composed = composeToolNames(reverse, { mcp__wire: name })
+    assert.equal(composed.mcp__wire, name)
+  }
+})
+
+test('front tool reservation preserves the existing non-array input boundary', () => {
+  for (const tools of [{}, 'invalid', 1, null]) {
+    const result = scrubUpstreamClientBody({ tools, messages: [] })
+    assert.deepEqual(result.body.tools, tools)
+    assert.deepEqual(result.reverse, {})
+  }
 })
 
 test('third-party Hermes body is rewritten before the upstream hop', () => {
