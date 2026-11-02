@@ -196,7 +196,7 @@ test('cross-slot history is ordered, paginated, scoped and limited to 30 per slo
   assert.throws(() => reports.list(['vm-01'], { offset: -1 }))
 })
 
-test('overview returns bounded chronological blocks with immutable rule state and no content', (t) => {
+test('overview returns newest-first bounded blocks with immutable rule state and no content', (t) => {
   const { reports, add } = fixture(t)
   for (let i = 0; i < 35; i++) add('vm-01', `private answer ${i}`)
   reports.saveRule(['vm-01'], rule())
@@ -207,13 +207,23 @@ test('overview returns bounded chronological blocks with immutable rule state an
   assert.equal(overview.length, 2)
   const { history, latest } = overview[0]
   assert.equal(history.length, 30)
-  assert.equal(history[0].id, 7)
-  assert.equal(history.at(-1).id, latest.id)
-  assert.equal(history[0].rule_enabled, false)
-  assert.equal(history.at(-1).rule_enabled, true)
+  assert.equal(history[0].id, latest.id)
+  assert.equal(history.at(-1).id, 7)
+  assert.equal(history[0].rule_enabled, true)
+  assert.equal(history.at(-1).rule_enabled, false)
   assert.equal(latest.rule_enabled, true)
-  assert.ok(history.every((item, i) => !i || history[i - 1].started_at <= item.started_at))
-  assert.deepEqual(Object.keys(history[0]).sort(), ['id', 'ok', 'rule_enabled', 'started_at', 'verdict'])
+  assert.ok(history.every((item, i) => !i || history[i - 1].started_at >= item.started_at))
+  assert.deepEqual(Object.keys(history[0]).sort(), [
+    'id',
+    'ok',
+    'participating',
+    'rule_enabled',
+    'source',
+    'started_at',
+    'verdict',
+  ])
+  assert.equal(history[0].source, 'manual')
+  assert.equal(history[0].participating, false)
   assert.deepEqual(overview[1].history, [])
   assert.equal(overview[1].latest, null)
   assert.deepEqual(reports.overview([]), [])

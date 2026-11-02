@@ -1206,6 +1206,7 @@ export class PoolScheduler extends EventEmitter {
             vm.schedule_off = live.schedule_off
             vm.unschedulable = live.unschedulable
             vm.schedule_hold = live.schedule_hold
+            vm.test_schedule_hold = live.test_schedule_hold
             vm.claude = live.claude || vm.claude
             vm.temp_unschedulable_until = live.temp_unschedulable_until
             vm.temp_unschedulable_reason = live.temp_unschedulable_reason

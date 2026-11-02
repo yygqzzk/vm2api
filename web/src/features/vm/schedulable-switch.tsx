@@ -11,6 +11,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import { REPORT_KEY } from '@/features/fork/test-reports/types'
 import { dashboardQueryOptions } from '@/features/overview/queries'
 import { vmQueryOptions, vmsListQueryOptions } from '@/features/vm/queries'
 
@@ -62,14 +63,24 @@ export function SchedulableSwitch({
   const checked = optimistic ?? schedulable
   const mutation = useMutation({
     mutationFn: (next: boolean) =>
-      api(`/api/panel/vms/${encodeURIComponent(vmId)}/schedulable`, {
-        method: 'POST',
-        body: JSON.stringify({ schedulable: next }),
-      }),
+      api<{ schedulable: boolean }>(
+        `/api/panel/vms/${encodeURIComponent(vmId)}/schedulable`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ schedulable: next }),
+        }
+      ),
     onMutate: (next) => setOptimistic(next),
-    onSuccess: async (_data, next) => {
-      toast.success(next ? '已开启调度' : '已关闭调度')
+    onSuccess: async (data, next) => {
+      toast.success(
+        next
+          ? data.schedulable
+            ? '已开启调度'
+            : '已允许调度，当前仍有其他限制'
+          : '已关闭调度'
+      )
       await Promise.all([
+        qc.invalidateQueries({ queryKey: REPORT_KEY }),
         qc.invalidateQueries({ queryKey: vmsListQueryOptions().queryKey }),
         qc.invalidateQueries({ queryKey: dashboardQueryOptions().queryKey }),
         qc.invalidateQueries({ queryKey: vmQueryOptions(vmId).queryKey }),

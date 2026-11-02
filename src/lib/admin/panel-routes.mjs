@@ -3114,6 +3114,20 @@ export function createPanelHandler(ctx) {
         return await handleTestReports(req, res, url, {
           reports: ctx.testReports,
           visibleVms: () => keyScopeVms(req),
+          summaryVms: async () => {
+            const ident = panelIdentity(req)
+            const result = await panel.buildVmList({
+              cfg,
+              accountQuota,
+              routingConfig: ctx.routingConfig,
+              poolScheduler: ctx.poolScheduler,
+              proxyPool,
+              role: ident.role,
+              ownerUserId: ident.role === 'user' ? req.panelUserId : null,
+              clusterNodes: clusterNodesOf(ctx),
+            })
+            return result.data.items
+          },
           json,
           readBody,
         })
@@ -3225,6 +3239,9 @@ export function createPanelHandler(ctx) {
           return json(res, 400, { ok: false, error: { message: 'schedulable required' } })
         }
         const currentVm = getVm(cfg.paths.project, id)
+        if (userMissesVmId(req, cfg.paths.project, id)) {
+          return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+        }
         const credentialFailure =
           /oauth_revoked|oauth_invalid_grant|invalid_grant|refresh_token_missing|token has been revoked/i.test(
             `${currentVm?.claude?.refresh_error || ''} ${currentVm?.schedule_disabled_reason || ''}`,
@@ -3237,6 +3254,7 @@ export function createPanelHandler(ctx) {
         }
         const reason = body.schedulable ? null : body.reason || 'disabled'
         const summary = setScheduleOff(cfg.paths.project, id, !body.schedulable, { reason, preserveStatus: true })
+        ctx.testReports?.auto.sync(id)
         return json(
           res,
           200,

@@ -468,7 +468,11 @@ healthMonitor = createHealthProbeMonitor({
       extraHeaders: { [HEALTH_REAL_HEADER]: '1' },
     }),
 })
-const testReports = new TestReports({ db: getDb(), projectRoot: cfg.paths.project })
+const testReports = new TestReports({
+  db: getDb(),
+  projectRoot: cfg.paths.project,
+  schedule: (id) => vmTestSchedule.get(id),
+})
 const vmTestSchedule = new VmTestScheduleRunner({
   testReports,
   projectRoot: cfg.paths.project,
@@ -1307,6 +1311,7 @@ if (process.env.KIN_CRS_MOCK !== '1') {
   syncLocalSlotRestartPolicies(listVms(cfg.paths.project))
 }
 await bootApiKernel(cfg)
+testReports.auto.reconcile()
 server.keepAliveTimeout = 120_000
 server.headersTimeout = 125_000
 server.timeout = 0

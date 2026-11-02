@@ -183,6 +183,9 @@ export function buildRecreatedVmRecord(prev, generated, { mode = 'traits' } = {}
   // Keep mode carries the operator switch and any 不可调度 over; a fresh slot has no ticket.
   if (keep && prev?.claude?.has_access) Object.assign(next, pickScheduleFields(prev))
   else applyUnschedulable(next, 'no_credential')
+  // Rebuilding the runtime is not permission to release a test-owned park.
+  if (prev.test_schedule_hold) next.test_schedule_hold = structuredClone(prev.test_schedule_hold)
+  if (prev.schedule_operator_revision != null) next.schedule_operator_revision = prev.schedule_operator_revision
   deriveScheduleFields(next)
   stampVmKind(next, prev)
   if (keep && account.codex) next.codex = account.codex
