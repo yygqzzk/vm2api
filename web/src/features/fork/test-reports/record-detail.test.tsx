@@ -91,6 +91,48 @@ describe('test report detail', () => {
     expect(html).toContain('本次未启用匹配规则')
     expect(html).not.toContain('内容待定')
   })
+  it('shows automation evidence separately and never claims an unsuccessful action was applied', () => {
+    const html = renderToStaticMarkup(
+      <ReportBody
+        item={{
+          ...report,
+          automation: {
+            participating: true,
+            reason: 'counted',
+            outcome: 'pending',
+            pause_streak: 3,
+            resume_streak: 0,
+            policy_revision: 'policy-one',
+            action: 'pause',
+            threshold: 3,
+            action_status: 'failed',
+            action_error: '写入失败',
+          },
+        }}
+      />
+    )
+    expect(html).toContain('调度影响')
+    expect(html).toContain('达到连续 3 次')
+    expect(html).toContain('执行失败')
+    expect(html).toContain('写入失败')
+    expect(html).toContain('policy-one')
+    const ignored = renderToStaticMarkup(
+      <ReportBody
+        item={{
+          ...report,
+          automation: {
+            participating: false,
+            reason: 'manual_test',
+            action: null,
+          },
+        }}
+      />
+    )
+    expect(ignored).toContain('手动测试不参与自动调度')
+    expect(renderToStaticMarkup(<ReportBody item={report} />)).not.toContain(
+      '调度影响'
+    )
+  })
   it('does not equate incomplete output or network errors with degraded account ability', () => {
     const html = renderToStaticMarkup(
       <ReportBody

@@ -1,6 +1,74 @@
 export const REPORT_KEY = ['panel', 'fork-test-reports'] as const
 export const REPORT_API = '/api/panel/fork/test-reports'
 export type Verdict = 'pass' | 'pending' | 'fail'
+export type PauseOutcome = 'pending' | 'fail' | 'error'
+export type AutoPolicy = {
+  enabled: boolean
+  pause_on: PauseOutcome[]
+  pause_after: number
+  resume_enabled: boolean
+  resume_after: number
+  revision: string | null
+}
+export type AutoAction = {
+  kind: string
+  at: string
+  report_id?: number
+  threshold?: number
+  outcome?: string
+  status: 'pending' | 'applied' | 'failed'
+}
+export type AutoSchedule = {
+  policy: AutoPolicy
+  pause_streak: number
+  resume_streak: number
+  paused: boolean
+  pending_action: 'hold' | 'release' | 'manual' | null
+  hold: { at: string; threshold: number; outcome: string } | null
+  blocked_reason: string | null
+  last_action: AutoAction | null
+  action_error: string | null
+}
+export type TestScheduleSummary = {
+  enabled: boolean
+  next_run_at: string | null
+  parse_error?: boolean
+}
+export type AutoDecision = {
+  participating: boolean
+  reason: string
+  outcome?: string
+  pause_streak?: number
+  resume_streak?: number
+  policy_revision?: string
+  action: 'pause' | 'resume' | null
+  action_status?: 'pending' | 'applied' | 'failed'
+  action_error?: string | null
+  threshold?: number | null
+}
+export const PAUSE_OUTCOMES: Record<PauseOutcome, string> = {
+  pending: '待定',
+  fail: '内容不通过',
+  error: '调用失败',
+}
+export const AUTO_ACTIONS: Record<string, string> = {
+  pause: '触发测试停调',
+  resume: '解除测试停调',
+  release: '人工解除测试停调',
+  manual_off: '人工关闭调度',
+  manual_on: '人工开启调度，重新观察',
+  disable_manual: '停用策略并转人工关闭',
+  owner_changed: '归属变更，策略已停用',
+}
+export const AUTO_REASONS: Record<string, string> = {
+  manual_test: '手动测试不参与自动调度',
+  disabled: '自动策略未启用',
+  stale_test: '测试开始后配置或槽位状态已变化，不参与新策略',
+  action_pending: '上一次调度动作尚未完成',
+  manual_off: '人工关闭优先，不参与自动开关计数',
+  not_ready: '定时测试或判定规则尚未就绪',
+  duplicate: '重复结果，不重复计数',
+}
 export type Rule = {
   enabled: boolean
   contains: string[]
@@ -29,6 +97,7 @@ export type ReportSummary = {
   input_tokens: number | null
   output_tokens: number | null
   cache_read_tokens: number | null
+  automation?: AutoDecision
 }
 export type Report = Omit<ReportSummary, 'text_preview' | 'reason'> & {
   text: string | null
@@ -56,6 +125,7 @@ export type SlotOption = {
   id: string
   name?: string | null
   platform?: string | null
+  auto_paused?: boolean
 }
 export type HistoryEntry = {
   id: number
@@ -63,6 +133,8 @@ export type HistoryEntry = {
   ok: boolean
   verdict: Verdict
   rule_enabled: boolean
+  source?: 'manual' | 'scheduled'
+  participating?: boolean
 }
 export type SlotHistory = {
   vm_id: string
@@ -70,6 +142,18 @@ export type SlotHistory = {
   platform: string
   latest: ReportSummary | null
   history: HistoryEntry[]
+  scheduling: {
+    schedule_state: 'on' | 'off' | 'unschedulable' | 'restricted'
+    restriction_reason: string | null
+    restriction_text: string | null
+    restriction_until: number | null
+    unschedulable_text: string | null
+    schedule_off: boolean
+    schedulable: boolean
+    status: string | null
+  }
+  automatic: AutoSchedule
+  test_schedule: TestScheduleSummary
 }
 
 // Color summarizes execution first, then the rule captured when this test began.

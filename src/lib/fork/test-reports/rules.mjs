@@ -64,6 +64,13 @@ export function answerSample(result) {
   return { text, complete }
 }
 
+// The same execution-first semantics as the result center's green/yellow/red blocks.
+export function reportOutcome(record) {
+  if (!record.ok) return 'error'
+  if (!record.rule.enabled) return 'pass'
+  return record.verdict
+}
+
 export function evaluateRule(rule, sample, executionOk) {
   let reason
   if (!executionOk) reason = 'execution_error'

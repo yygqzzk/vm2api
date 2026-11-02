@@ -154,6 +154,8 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
     schedule_off: vm.schedule_off === true,
     unschedulable: vm.unschedulable || null,
     schedule_hold: vm.schedule_hold || null,
+    test_schedule_hold: vm.test_schedule_hold || null,
+    schedule_operator_revision: vm.schedule_operator_revision || 0,
     temp_unschedulable_until: vm.claude?.temp_unschedulable_until || vm.temp_unschedulable_until || null,
     temp_unschedulable_reason: vm.claude?.temp_unschedulable_reason || vm.temp_unschedulable_reason || null,
     owner_user_id: normalizeOwnerId(vm.owner_user_id),

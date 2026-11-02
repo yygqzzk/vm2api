@@ -7,7 +7,7 @@
  *                  operator action brings it back
  *   restricted     受限: clears by itself (quota, cooldown, circuit, hold, seats)
  *
- * vm.json keeps three owned fields. `schedulable` / `schedule_disabled_reason` /
+ * vm.json keeps independently owned schedule fields. `schedulable` / `schedule_disabled_reason` /
  * `schedule_manual` are derived on every write so older readers keep working.
  */
 
@@ -66,6 +66,7 @@ const RESTRICTED_SLOT = [
   { match: /^kernel_faulted$/, text: '内核故障' },
   { match: /^worker_unhealthy$/, text: '槽服务异常' },
   { match: /^maintenance$/, text: '维护中' },
+  { match: /^test_auto_pause$/, text: '测试自动停调' },
   { match: /^rest_period$/, text: '休息时段' },
   { match: /^(cooldown|account_cooldown|restricted)$/, text: '冷却中' },
 ]
@@ -154,10 +155,11 @@ export function deriveScheduleFields(vm, { preserveStatus = true } = {}) {
   const off = vm.schedule_off === true
   const bad = vm.unschedulable?.reason || null
   const hold = vm.schedule_hold?.reason || null
-  const schedulable = !off && !bad && !hold
+  const testHold = vm.test_schedule_hold ? 'test_auto_pause' : null
+  const schedulable = !off && !bad && !hold && !testHold
   vm.schedulable = schedulable
   vm.schedule_manual = off
-  vm.schedule_disabled_reason = off ? vm.schedule_off_reason || 'disabled' : bad || hold || null
+  vm.schedule_disabled_reason = off ? vm.schedule_off_reason || 'disabled' : bad || hold || testHold || null
   const status = String(vm.status || '').toLowerCase()
   if (schedulable && status === 'paused') vm.status = 'running'
   if (!preserveStatus && !schedulable && status === 'running') vm.status = 'paused'
@@ -166,6 +168,9 @@ export function deriveScheduleFields(vm, { preserveStatus = true } = {}) {
 
 /** 调度关 / 调度开 by the operator. Turning on also clears 不可调度 (decision 6). */
 export function applyScheduleOff(vm, off, { reason = null, now = Date.now(), preserveStatus = true } = {}) {
+  // An operator action supersedes test automation, including an in-flight test decision.
+  delete vm.test_schedule_hold
+  vm.schedule_operator_revision = (vm.schedule_operator_revision || 0) + 1
   if (off) {
     vm.schedule_off = true
     if (reason && reason !== 'disabled') vm.schedule_off_reason = String(reason).slice(0, 64)
@@ -227,7 +232,7 @@ const LEGACY_START_FAILED = /runtime start failed|start|boot|container|docker|ke
  */
 export function migrateScheduleRecord(vm) {
   if (!vm || typeof vm !== 'object') return false
-  if (vm.schedule_off === true || vm.unschedulable || vm.schedule_hold) return false
+  if (vm.schedule_off === true || vm.unschedulable || vm.schedule_hold || vm.test_schedule_hold) return false
   if (vm.schedulable !== false) return false
   const reason = String(vm.schedule_disabled_reason || '').trim()
   if (vm.schedule_manual === true || reason === 'disabled' || reason === 'stopped' || !reason) {
@@ -274,12 +279,20 @@ export function pickScheduleFields(vm = {}) {
     schedule_disabled_detail: vm.schedule_disabled_detail,
     schedule_updated_at: vm.schedule_updated_at,
   }
-  for (const key of ['schedule_off', 'schedule_off_reason', 'unschedulable', 'schedule_hold']) {
+  const keys = [
+    'schedule_off',
+    'schedule_off_reason',
+    'unschedulable',
+    'schedule_hold',
+    'test_schedule_hold',
+    'schedule_operator_revision',
+  ]
+  for (const key of keys) {
     if (vm[key] != null) copy[key] = structuredClone(vm[key])
   }
   migrateScheduleRecord(copy)
   const out = {}
-  for (const key of ['schedule_off', 'schedule_off_reason', 'unschedulable', 'schedule_hold']) {
+  for (const key of keys) {
     if (copy[key] != null) out[key] = copy[key]
   }
   return out
@@ -335,7 +348,7 @@ export function resolveSlotState({
   }
   if (vm.unschedulable?.reason) return unschedulable(vm.unschedulable.reason)
   // A record not yet migrated: its legacy reason decides.
-  if (vm.schedulable === false && !vm.schedule_hold) {
+  if (vm.schedulable === false && !vm.schedule_hold && !vm.test_schedule_hold) {
     const legacy = stateOfReason(vm.schedule_disabled_reason)
     if (legacy?.state === 'unschedulable') return unschedulable(vm.schedule_disabled_reason)
     if (!legacy || legacy.state !== 'restricted') return { ...base, schedule_state: 'off' }
@@ -355,6 +368,7 @@ export function resolveSlotState({
     restriction_soft: soft,
   })
   if (vm.schedule_hold?.reason) return restricted(vm.schedule_hold.reason, null)
+  if (vm.test_schedule_hold) return restricted('test_auto_pause', null)
   const until = Number(restrictionUntil) || Number(availability?.until) || 0
   const live = until > now
   if (!live && availability?.key === 'rest') {

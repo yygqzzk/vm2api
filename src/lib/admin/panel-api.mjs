@@ -2120,6 +2120,7 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     schedule_disabled_reason: v.schedule_disabled_reason || null,
     schedule_off: v.schedule_off === true,
     schedule_hold: v.schedule_hold || null,
+    test_schedule_hold: v.test_schedule_hold || null,
     created_at: v.created_at || null,
   }
 }

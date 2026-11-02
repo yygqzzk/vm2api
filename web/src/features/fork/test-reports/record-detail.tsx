@@ -7,6 +7,8 @@ import {
   REPORT_KEY,
   REASONS,
   VERDICTS,
+  AUTO_ACTIONS,
+  AUTO_REASONS,
   testOutcome,
   type Report,
 } from './types'
@@ -51,6 +53,47 @@ export function ReportBody({ item }: { item: Report }) {
         <p className='break-words'>
           未命中：{item.evaluation.missing.join('、')}
         </p>
+      ) : null}
+      {item.automation ? (
+        <div className='space-y-1 rounded-lg border border-dashed bg-muted/30 p-3 text-xs'>
+          <p className='font-medium'>调度影响</p>
+          {item.automation.participating ? (
+            <>
+              <p>
+                本次纳入定时测试策略 · 停调连续计数{' '}
+                {item.automation.pause_streak ?? 0} · 恢复连续计数{' '}
+                {item.automation.resume_streak ?? 0}
+              </p>
+              <p>
+                {item.automation.action
+                  ? `${AUTO_ACTIONS[item.automation.action]}：达到连续 ${item.automation.threshold} 次`
+                  : '尚未达到切换条件，保持现有调度状态'}
+              </p>
+              {item.automation.action ? (
+                <p>
+                  执行状态：
+                  {item.automation.action_status === 'applied'
+                    ? '已完成'
+                    : item.automation.action_status === 'failed'
+                      ? '执行失败'
+                      : '等待执行 / 以当前槽位状态为准'}
+                </p>
+              ) : null}
+              {item.automation.action_error ? (
+                <p className='text-destructive'>
+                  {item.automation.action_error}
+                </p>
+              ) : null}
+              <p className='break-all text-muted-foreground'>
+                策略版本：{item.automation.policy_revision}
+              </p>
+            </>
+          ) : (
+            <p className='text-muted-foreground'>
+              {AUTO_REASONS[item.automation.reason] || '本次未参与自动调度'}
+            </p>
+          )}
+        </div>
       ) : null}
       <details>
         <summary className='cursor-pointer'>

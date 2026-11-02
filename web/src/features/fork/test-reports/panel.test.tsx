@@ -30,13 +30,25 @@ describe('test history colors', () => {
       ).toBe('fail')
     }
   })
-  it('renders one accessible button per record, preserves order and does not invent empty blocks', () => {
+  it('renders newest-first accessible blocks without inventing empty records', () => {
     const html = renderToStaticMarkup(
       <HistoryBlocks
         items={[
-          entry,
-          { ...entry, id: 2, rule_enabled: true },
-          { ...entry, id: 3, ok: false },
+          {
+            ...entry,
+            id: 3,
+            started_at: '2026-10-29T02:00:00Z',
+            source: 'manual',
+          },
+          {
+            ...entry,
+            id: 2,
+            started_at: '2026-10-29T01:00:00Z',
+            rule_enabled: true,
+            source: 'scheduled',
+            participating: true,
+          },
+          { ...entry, id: 1, ok: false },
         ]}
         onSelect={() => {}}
       />
@@ -48,7 +60,9 @@ describe('test history colors', () => {
     expect(html.indexOf('调用成功')).toBeLessThan(html.indexOf('待定'))
     expect(html.indexOf('待定')).toBeLessThan(html.indexOf('调用失败'))
     expect(html).toContain('aria-label=')
-    expect(html).toContain('从旧到新')
+    expect(html).toContain('左新右旧')
+    expect(html).toContain('手动 · 不参与自动调度')
+    expect(html).toContain('定时 · 参与策略计数')
     const empty = renderToStaticMarkup(
       <HistoryBlocks items={[]} onSelect={() => {}} />
     )
