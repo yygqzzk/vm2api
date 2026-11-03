@@ -41,6 +41,7 @@ import { resetModelPolicy, saveModelPolicy } from '../../src/lib/protocol/model-
 import { slotRuntimeOwner } from '../../src/lib/oauth/oauth-credentials.mjs'
 import { closeDatabase, openDatabase } from '../../src/lib/db/database.mjs'
 import { socksUidFor } from '../../src/lib/vm/vm-runtime.mjs'
+import { gatewayRetryDecision } from '../../src/lib/fork/gateway-retry.mjs'
 
 const unix = process.platform !== 'win32'
 const unixTest = unix ? test : test.skip
@@ -258,6 +259,55 @@ unixTest('dispatchStreamInference uses rust socket when ready', async () => {
     else process.env.KIN_KERNEL_BIN = prev
   }
 })
+
+for (const mode of ['call', 'stream']) {
+  unixTest(`${mode}: transport failure followed by refresh and rejection retains unknown execution`, async () => {
+    const previous = process.env.KIN_KERNEL_BIN
+    process.env.KIN_KERNEL_BIN = '/bin/true'
+    let hits = 0
+    let ensures = 0
+    const fx = await kernelFixture((req, res) => {
+      hits++
+      if (hits === 1) {
+        req.socket.destroy()
+        return
+      }
+      res.writeHead(hits === 2 ? 401 : 503, { 'content-type': 'application/json' })
+      res.end(
+        JSON.stringify({
+          error:
+            hits === 2
+              ? { type: 'worker_error', code: 'needs_refresh', message: 'credential needs refresh' }
+              : { type: 'server_error', code: 'server_error', message: 'rejected after refresh' },
+        }),
+      )
+    })
+    try {
+      const dispatch = mode === 'call' ? dispatchCallInference : dispatchStreamInference
+      const result = await dispatch({
+        exec: fx.exec,
+        body: { model: 'claude-test', messages: [{ role: 'user', content: 'hello' }] },
+        routing: { inference: { engine: 'rust' } },
+        ensureRust: async () => ({ ok: true }),
+        ensureCredential: async () => {
+          ensures++
+          return { ok: true }
+        },
+        onEvent: () => assert.fail('a rejected hop must not emit content'),
+      })
+      assert.equal(hits, 3)
+      assert.equal(ensures, 1)
+      assert.equal(result.credential_retried, true)
+      assert.equal(result.rust_transport_retried, true)
+      assert.equal(result.status, 503)
+      assert.equal(gatewayRetryDecision(result), 'outcome-unknown')
+    } finally {
+      await fx.close()
+      if (previous == null) delete process.env.KIN_KERNEL_BIN
+      else process.env.KIN_KERNEL_BIN = previous
+    }
+  })
+}
 
 unixTest('needs_refresh retries once via Go ensure', async () => {
   const prev = process.env.KIN_KERNEL_BIN

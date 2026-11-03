@@ -98,6 +98,20 @@ test('Codex retains uncertainty from earlier slots even if the final slot explic
   assert.equal(fx.res._kinGatewayRetry, 'outcome-unknown')
 })
 
+test('account-bound turn-state forbids outer retry on both admission and kernel rejection', async (t) => {
+  for (const admission of [false, true]) {
+    const fx = fixture(t, {
+      headers: { 'x-codex-turn-state': 'opaque-account-owned-state' },
+      hop: async () => ({ ok: false, status: 503, body: { error: { code: 'server_error' } } }),
+    })
+    fx.args.routing = { failover: { max_total_attempts: 1, max_same_account_retries: 0 } }
+    if (admission) fs.rmSync(path.join(fx.args.projectRoot, 'vms'), { recursive: true })
+    await handleCodexProtocol(fx.args)
+    assert.equal(fx.res.statusCode, 503)
+    assert.equal(fx.res._kinGatewayRetry, 'never')
+  }
+})
+
 for (const [name, result, decision] of [
   ['confirmed rejection', { ok: false, status: 503, body: { error: { code: 'server_error' } } }, 'next-channel'],
   [

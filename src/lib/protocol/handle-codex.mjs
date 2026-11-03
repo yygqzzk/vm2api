@@ -684,7 +684,7 @@ export async function handleCodexProtocol({
         }
         // Real upstream failures already happened: report the last one, not the pool.
         if (last) break
-        return rejectCodexAdmission({ res, json, stats, logBag, picked, model: converted.body?.model })
+        return rejectCodexAdmission({ req, res, json, stats, logBag, picked, model: converted.body?.model })
       }
       const vm = getVm(projectRoot, admitted.vmId)
       const lease = admitted.lease
@@ -1004,17 +1004,19 @@ export async function handleCodexProtocol({
   res._kinGatewayRetry = gatewayRetryDecision(
     { ...last, gatewayOutcomeUnknown },
     {
-      stateBound: !!inboundSession.previous_response_id || !!pinnedVmId(req),
+      stateBound:
+        !!inboundSession.previous_response_id || !!pinnedVmId(req) || !!headerString(req.headers, 'x-codex-turn-state'),
     },
   )
   return json(res, last?.status || 502, last?.body || { error: { type: 'api_error', code: 'codex_upstream' } })
 }
 
 /** No seat was admitted and nothing ran: say which gate stopped the request. */
-function rejectCodexAdmission({ res, json, stats, logBag, picked, model }) {
+function rejectCodexAdmission({ req, res, json, stats, logBag, picked, model }) {
   stats.errors++
   logBag.error_code = picked.error || 'no_codex_vm'
-  res._kinGatewayRetry = poolAdmissionRetry(logBag.error_code)
+  res._kinGatewayRetry =
+    headerString(req.headers, 'x-codex-turn-state') || pinnedVmId(req) ? 'never' : poolAdmissionRetry(logBag.error_code)
   if (picked.error === 'platform_mismatch') {
     return json(res, 400, {
       error: {
@@ -1266,7 +1268,7 @@ export async function handleCodexSearch({
           return
         }
         if (last) break
-        return rejectCodexAdmission({ res, json, stats, logBag, picked: admitted.picked, model: outbound.model })
+        return rejectCodexAdmission({ req, res, json, stats, logBag, picked: admitted.picked, model: outbound.model })
       }
       try {
         const vm = getVm(projectRoot, admitted.vmId)
@@ -1418,7 +1420,7 @@ export async function handleCodexImages({
           return
         }
         if (last) break
-        return rejectCodexAdmission({ res, json, stats, logBag, picked: admitted.picked, model })
+        return rejectCodexAdmission({ req, res, json, stats, logBag, picked: admitted.picked, model })
       }
       try {
         const vm = getVm(projectRoot, admitted.vmId)
