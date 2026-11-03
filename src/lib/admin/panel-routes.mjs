@@ -376,6 +376,8 @@ function usageLogFilters(req, u) {
     vm_id: get('vm_id'),
     account_id: get('account_id'),
     session_id: get('session_id'),
+    request_id: get('request_id')?.trim(),
+    correlation_id: get('correlation_id')?.trim(),
     model: get('model'),
     endpoint: get('endpoint'),
     protocol: get('protocol'),
@@ -1983,6 +1985,8 @@ export function createPanelHandler(ctx) {
           since: u.searchParams.get('since') || null,
           until: u.searchParams.get('until') || null,
           q: u.searchParams.get('q') || null,
+          request_id: u.searchParams.get('request_id')?.trim() || null,
+          correlation_id: u.searchParams.get('correlation_id')?.trim() || null,
           owner_user_id: panelIdentity(req).role === 'user' ? req.panelUserId : u.searchParams.get('user_id') || null,
         }
         const { items, total } = requestLog.queryNormal(filters)

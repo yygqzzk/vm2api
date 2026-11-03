@@ -32,6 +32,7 @@ import {
   actualCacheRate,
   cacheCostSplit,
   cacheWriteSplit,
+  copyText,
   effectiveMultiplier,
   hasFastMode,
   isSuccessStatus,
@@ -350,9 +351,42 @@ export function SummaryTab({
                 <span className='shrink-0 text-xs text-muted-foreground'>
                   Request ID
                 </span>
-                <span className='min-w-0 truncate font-mono text-xs'>
+                <button
+                  type='button'
+                  title='点击复制执行请求 ID'
+                  className='min-w-0 text-left font-mono text-xs break-all hover:underline'
+                  onClick={() => row.requestId && void copyText(row.requestId)}
+                >
                   {row.requestId}
+                </button>
+              </div>
+            ) : null}
+            {row.correlationId ? (
+              <div className='flex flex-wrap items-center gap-2 p-4'>
+                <span className='shrink-0 text-xs text-muted-foreground'>
+                  关联请求 ID（new-api）
                 </span>
+                <Link
+                  to='/logs'
+                  search={{ correlationId: row.correlationId }}
+                  className='min-w-0 font-mono text-xs break-all hover:underline'
+                >
+                  {row.correlationId}
+                </Link>
+                <button
+                  type='button'
+                  className='text-xs underline'
+                  onClick={() =>
+                    row.correlationId && void copyText(row.correlationId)
+                  }
+                >
+                  复制
+                </button>
+                {row.retryIndex != null ? (
+                  <span className='text-xs text-muted-foreground'>
+                    外层第 {row.retryIndex + 1} 次尝试
+                  </span>
+                ) : null}
               </div>
             ) : null}
             {row.reasoningEffort ? (

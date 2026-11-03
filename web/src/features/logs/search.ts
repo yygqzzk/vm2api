@@ -11,6 +11,8 @@ export type LogsSearch = {
   /** 供应商 = 槽位。 */
   vmId?: string
   sessionId?: string
+  requestId?: string
+  correlationId?: string
   /** 毫秒时间戳，含。 */
   startTime?: number
   /** 毫秒时间戳，不含（界面上的结束秒 + 1000）。 */
@@ -37,6 +39,8 @@ export type LogsFilterState = {
   keyId?: string
   vmId?: string
   sessionId?: string
+  requestId?: string
+  correlationId?: string
   startTime?: number
   endTime?: number
   statusCode?: number
@@ -85,6 +89,8 @@ export function validateLogsSearch(
     keyId: str(search.keyId),
     vmId: str(search.vmId),
     sessionId: str(search.sessionId),
+    requestId: str(search.requestId),
+    correlationId: str(search.correlationId),
     startTime: search.startTime == null ? undefined : int(search.startTime),
     endTime: search.endTime == null ? undefined : int(search.endTime),
     statusCode,
@@ -106,6 +112,8 @@ export function searchToFilters(search: LogsSearch): LogsFilterState {
     keyId: search.keyId,
     vmId: search.vmId,
     sessionId: search.sessionId,
+    requestId: search.requestId,
+    correlationId: search.correlationId,
     startTime: search.startTime,
     endTime: search.endTime,
     statusCode:
@@ -128,6 +136,9 @@ export function filtersToSearch(filters: LogsFilterState): LogsSearch {
   if (filters.keyId) out.keyId = filters.keyId
   if (filters.vmId) out.vmId = filters.vmId
   if (filters.sessionId?.trim()) out.sessionId = filters.sessionId.trim()
+  if (filters.requestId?.trim()) out.requestId = filters.requestId.trim()
+  if (filters.correlationId?.trim())
+    out.correlationId = filters.correlationId.trim()
   if (filters.startTime != null) out.startTime = filters.startTime
   if (filters.endTime != null) out.endTime = filters.endTime
   if (filters.excludeStatus200) out.statusCode = '!200'
@@ -155,6 +166,9 @@ export function filtersToApi(
   if (filters.keyId) out.keyId = filters.keyId
   if (filters.vmId) out.vmId = filters.vmId
   if (filters.sessionId) out.sessionId = filters.sessionId
+  if (filters.requestId?.trim()) out.requestId = filters.requestId.trim()
+  if (filters.correlationId?.trim())
+    out.correlationId = filters.correlationId.trim()
   if (filters.model) out.model = filters.model
   if (filters.endpoint) out.endpoint = filters.endpoint
   if (filters.protocol) out.protocol = filters.protocol
@@ -164,7 +178,8 @@ export function filtersToApi(
   if (filters.minRetry != null && filters.minRetry > 0)
     out.minAttemptCount = filters.minRetry + 1
   if (filters.errorClass) out.errorClass = filters.errorClass
-  else if (muted.length) out.excludeErrorClass = muted.join(',')
+  else if (!out.requestId && !out.correlationId && muted.length)
+    out.excludeErrorClass = muted.join(',')
   if (filters.debugOnly) out.debugOnly = true
   if (filters.startTime != null)
     out.startTime = new Date(filters.startTime).toISOString()
@@ -186,6 +201,8 @@ export function usageLogFiltersQuery(
   set('vm_id', filters.vmId)
   set('account_id', filters.accountId)
   set('session_id', filters.sessionId)
+  set('request_id', filters.requestId)
+  set('correlation_id', filters.correlationId)
   set('model', filters.model)
   set('endpoint', filters.endpoint)
   set('protocol', filters.protocol)
@@ -211,6 +228,8 @@ export function activeFilterCount(filters: LogsFilterState): number {
   if (filters.keyId) count++
   if (filters.vmId) count++
   if (filters.sessionId) count++
+  if (filters.requestId) count++
+  if (filters.correlationId) count++
   if (filters.statusCode != null || filters.excludeStatus200) count++
   if (filters.model) count++
   if (filters.mismatch) count++

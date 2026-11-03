@@ -124,6 +124,25 @@ function LogRow({
       <div className='min-w-[56px] flex-[0.6] truncate pr-1.5 pl-3 font-mono text-xs'>
         <RelativeTime date={row.createdAt} fallback='-' />
       </div>
+      {hidden('requestId') ? null : (
+        <div className='min-w-[110px] flex-[1] px-1.5 font-mono text-xs'>
+          {row.requestId ? (
+            <button
+              type='button'
+              className='block w-full truncate text-left hover:underline'
+              title={`执行 ${row.requestId}${row.correlationId ? `\n关联 ${row.correlationId}` : ''}${row.retryIndex != null ? `\n外层尝试 ${row.retryIndex + 1}` : ''}\n点击复制执行 ID`}
+              onClick={(event) => {
+                event.stopPropagation()
+                if (row.requestId) void copyText(row.requestId)
+              }}
+            >
+              {row.requestId}
+            </button>
+          ) : (
+            '—'
+          )}
+        </div>
+      )}
       {hidden('user') ? null : (
         <div
           className='min-w-[50px] flex-[0.8] truncate px-1.5 text-sm'
@@ -467,6 +486,9 @@ export function VirtualizedLogsTable({
               <HeadCell className='min-w-[56px] flex-[0.6] pr-1.5 pl-3'>
                 时间
               </HeadCell>
+              {isHidden('requestId') ? null : (
+                <HeadCell className='min-w-[110px] flex-[1]'>请求 ID</HeadCell>
+              )}
               {isHidden('user') ? null : (
                 <HeadCell className='min-w-[50px] flex-[0.8]'>用户</HeadCell>
               )}

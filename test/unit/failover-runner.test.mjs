@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { gatewayRetryDecision } from '../../src/lib/fork/gateway-retry.mjs'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -73,6 +74,22 @@ function success(text = 'ok') {
     },
   }
 }
+
+test('a later rejection cannot erase an earlier uncertain pool execution', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const runner = new FailoverRunner({ scheduler, config: { max_same_account_retries: 0 } })
+  const result = await runner.run({
+    requestId: 'mixed-outcome',
+    model: 'claude-sonnet-test',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    callAttempt: ({ candidate: selected }) =>
+      selected.accountId === 'account-1'
+        ? { ok: false, status: 0, transportError: true }
+        : { ok: false, status: 503, body: { error: { code: 'server_error', message: 'rejected' } } },
+  })
+  assert.equal(result.gatewayOutcomeUnknown, true)
+  assert.equal(gatewayRetryDecision(result), 'outcome-unknown')
+})
 
 test('unsupported classifier runtime stops without counting execution or cooling accounts', async () => {
   const scheduler = new Scheduler([candidate(1), candidate(2)])

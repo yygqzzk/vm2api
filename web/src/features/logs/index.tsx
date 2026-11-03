@@ -46,6 +46,7 @@ import {
   USAGE_LOGS_QUERY_KEY,
   logStatsQueryOptions,
 } from './queries'
+import { RequestIdSearch } from './request-id-search'
 import {
   activeFilterCount,
   filtersToApi,
@@ -220,7 +221,11 @@ export function LogsPage() {
     errorClass
       ? `错误类 ${ERROR_CLASS_META[errorClass]?.label || errorClass}`
       : null,
-    !errorClass && muted.length ? `不含 ${muted.length} 个已屏蔽类` : null,
+    !errorClass && !filters.requestId && !filters.correlationId && muted.length
+      ? `不含 ${muted.length} 个已屏蔽类`
+      : null,
+    filters.requestId ? `执行 ID ${filters.requestId}` : null,
+    filters.correlationId ? `关联 ID ${filters.correlationId}` : null,
     filters.model ? `模型 ${filters.model}` : null,
     filters.sessionId ? `会话 ${filters.sessionId}` : null,
     filters.endpoint ? `端点 ${filters.endpoint}` : null,
@@ -256,6 +261,7 @@ export function LogsPage() {
           }
         />
         {filterCount > 0 ? <UsageLogsStatsPanel filters={apiFilters} /> : null}
+        <RequestIdSearch filters={filters} onApply={applyFilters} />
         <Collapsible open={isFilterOpen} onOpenChange={setIsFilterOpen}>
           <div className='flex items-center justify-between gap-3'>
             <CollapsibleTrigger asChild>

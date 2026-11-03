@@ -83,6 +83,39 @@ function fixture(t, { body = {}, headers = {}, protocol = 'openai.responses', ho
   return { args, res, chunks }
 }
 
+test('Codex retains uncertainty from earlier slots even if the final slot explicitly rejects', async (t) => {
+  let calls = 0
+  const fx = fixture(t, {
+    hop: async () =>
+      ++calls === 1
+        ? { ok: false, status: 504, body: { error: { code: 'server_error', message: 'upstream timeout' } } }
+        : { ok: false, status: 503, body: { error: { code: 'server_error' } } },
+  })
+  fx.args.routing = { failover: { max_total_attempts: 2, max_same_account_retries: 0 } }
+  await handleCodexProtocol(fx.args)
+  assert.equal(calls, 2)
+  assert.equal(fx.res.statusCode, 503)
+  assert.equal(fx.res._kinGatewayRetry, 'outcome-unknown')
+})
+
+for (const [name, result, decision] of [
+  ['confirmed rejection', { ok: false, status: 503, body: { error: { code: 'server_error' } } }, 'next-channel'],
+  [
+    'uncertain transport',
+    { ok: false, status: 502, transportError: true, body: { error: { code: 'upstream_transport_error' } } },
+    'outcome-unknown',
+  ],
+  ['invalid request', { ok: false, status: 400, body: { error: { code: 'invalid_request' } } }, 'never'],
+]) {
+  test(`Codex exposes the outer retry decision after its internal budget: ${name}`, async (t) => {
+    const fx = fixture(t, { hop: async () => structuredClone(result) })
+    fx.args.routing = { failover: { max_total_attempts: 1, max_same_account_retries: 0 } }
+    await handleCodexProtocol(fx.args)
+    assert.equal(fx.res.statusCode, result.status)
+    assert.equal(fx.res._kinGatewayRetry, decision)
+  })
+}
+
 for (const [name, body, headers, streamed] of [
   ['omitted stream', {}, {}, false],
   ['explicit false', { stream: false }, {}, false],

@@ -24,6 +24,9 @@ export function buildAnthropicSseError(error = {}) {
     message: String(error.message || 'An error occurred while processing the request'),
   }
   if (error.code) body.code = String(error.code)
+  if (['next-channel', 'never', 'outcome-unknown'].includes(error.gateway_retry)) {
+    body.gateway_retry = error.gateway_retry
+  }
   return sse('error', { type: 'error', error: body })
 }
 

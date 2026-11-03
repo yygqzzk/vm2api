@@ -86,6 +86,10 @@ export type UsageLogRow = {
   /** `usage_logs.id`（`log_<12hex>`），游标 tiebreaker。 */
   id: string
   requestId: string | null
+  /** new-api 的稳定请求 ID；历史行未采集。 */
+  correlationId?: string | null
+  /** new-api 外层尝试序号（从 0 开始），不是号池内部尝试次数。 */
+  retryIndex?: number | null
   /** ISO-8601，请求完成时刻。 */
   createdAt: string
   userId: string | null
@@ -219,6 +223,10 @@ export type UsageLogFilters = {
   accountId?: string
   /** (`session_id`) 精确匹配出站或客户端会话 id 任一。 */
   sessionId?: string
+  /** (`request_id`) 精确匹配一次号池执行。 */
+  requestId?: string
+  /** (`correlation_id`) 精确匹配 new-api 请求下的全部执行。 */
+  correlationId?: string
   /** (`model`) 匹配 model 或 requested_model。 */
   model?: string
   /** (`endpoint`) 精确匹配 path。 */

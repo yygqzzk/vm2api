@@ -65,6 +65,8 @@ function sumCostBuckets(rows) {
 const SUMMARY_COLUMNS = [
   'id',
   'request_id',
+  'correlation_id',
+  'retry_index',
   'created_at',
   'log_mode',
   'method',
@@ -439,6 +441,8 @@ export class UsageLogsRepo {
     since = null,
     until = null,
     q = null,
+    request_id = null,
+    correlation_id = null,
     error_class = null,
     exclude_error_class = null,
     maxLimit = 500,
@@ -491,6 +495,14 @@ export class UsageLogsRepo {
     if (until) {
       where.push('created_at <= ?')
       params.push(new Date(until).toISOString())
+    }
+    if (request_id) {
+      where.push('request_id = ?')
+      params.push(request_id)
+    }
+    if (correlation_id) {
+      where.push('correlation_id = ?')
+      params.push(correlation_id)
     }
     if (q) {
       where.push('(path LIKE ? OR error_code LIKE ? OR error_message LIKE ? OR request_id LIKE ?)')

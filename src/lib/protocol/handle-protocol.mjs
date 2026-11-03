@@ -2,6 +2,7 @@
  * /v1 protocol handler. URLs, auth, and response envelopes stay with the
  * server wiring; this factory owns convert → pool → Go/Rust hop → client.
  */
+import { gatewayRetryDecision } from '../fork/gateway-retry.mjs'
 import { applyIntercept } from '../core/intercept.mjs'
 import { resolveStreamIdleTimeoutMs, inboundBodyLimit, queueKeepaliveDelayMs } from '../core/config.mjs'
 import { applyEagerToolStreaming } from './eager-tool-streaming.mjs'
@@ -339,10 +340,12 @@ export function createHandleProtocol(deps) {
     if (Number(result?.retryAfterSec) > 0) {
       mapped.retryAfterSec = Math.max(1, Math.ceil(Number(result.retryAfterSec)))
     }
+    mapped.gatewayRetry = gatewayRetryDecision(result)
     return mapped
   }
 
   function sendMapped(res, mapped) {
+    res._kinGatewayRetry = mapped.gatewayRetry || 'never'
     if (mapped.retryAfterSec) res.setHeader?.('retry-after', String(mapped.retryAfterSec))
     return json(res, mapped.status, mapped.body)
   }
@@ -1871,7 +1874,7 @@ export function createHandleProtocol(deps) {
           // Headers already went out (queue ping or an in-attempt ping), so the
           // status can no longer be 429/529/503. Close with the Anthropic event.
           const mapped = mapProtocolClientError(result, logBag, logBag.error_code)
-          res.write(buildAnthropicSseError(mapped.body?.error || {}))
+          res.write(buildAnthropicSseError({ ...mapped.body?.error, gateway_retry: mapped.gatewayRetry }))
         }
       }
       rememberRefusal({ inbound, body: ctx.body, headers: req.headers, result, logBag, requestId: logCtx.request_id })

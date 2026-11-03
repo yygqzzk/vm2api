@@ -2,6 +2,7 @@
  * Codex hop from handle-protocol. Claude convert/pool/CRS never runs here.
  */
 import path from 'node:path'
+import { gatewayRetryDecision, poolAdmissionRetry } from '../fork/gateway-retry.mjs'
 import { resolveStreamIdleTimeoutMs } from '../core/config.mjs'
 import { isClientStream, fromClaudeToOpenAIChat, fromClaudeToOpenAICompletions } from './convert.mjs'
 import { getVm, listVms, persistCodexUsage, syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
@@ -667,6 +668,7 @@ export async function handleCodexProtocol({
   logBag.via = 'codex-kernel'
   logBag.attempt_count = 0
   let last = null
+  let gatewayOutcomeUnknown = false
   let hops = 0
   let attempts = 0
   let switches = 0
@@ -868,6 +870,7 @@ export async function handleCodexProtocol({
             },
           })
         let result = await runHop()
+        gatewayOutcomeUnknown ||= gatewayRetryDecision(result) === 'outcome-unknown'
         // A transient seat-local failure gets the same account up to N retries
         // before the request spends a switch. 401/403/429 are never retried here:
         // they are credential/account state and must move to another seat.
@@ -889,6 +892,7 @@ export async function handleCodexProtocol({
           await new Promise((resolve) => setTimeout(resolve, sameRetryDelayMs))
           hopEmitted = false
           result = await runHop()
+          gatewayOutcomeUnknown ||= gatewayRetryDecision(result) === 'outcome-unknown'
         }
         // The log and total duration share ingress time; pool scoring keeps hop TTFT.
         logBag.first_token_ms = Number.isFinite(result?.firstTokenAt)
@@ -997,6 +1001,12 @@ export async function handleCodexProtocol({
   stats.errors++
   logBag.error_code = last?.body?.error?.code || 'codex_upstream'
   logBag.upstream_status = last?.status || 0
+  res._kinGatewayRetry = gatewayRetryDecision(
+    { ...last, gatewayOutcomeUnknown },
+    {
+      stateBound: !!inboundSession.previous_response_id || !!pinnedVmId(req),
+    },
+  )
   return json(res, last?.status || 502, last?.body || { error: { type: 'api_error', code: 'codex_upstream' } })
 }
 
@@ -1004,6 +1014,7 @@ export async function handleCodexProtocol({
 function rejectCodexAdmission({ res, json, stats, logBag, picked, model }) {
   stats.errors++
   logBag.error_code = picked.error || 'no_codex_vm'
+  res._kinGatewayRetry = poolAdmissionRetry(logBag.error_code)
   if (picked.error === 'platform_mismatch') {
     return json(res, 400, {
       error: {

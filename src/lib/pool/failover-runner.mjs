@@ -1,3 +1,4 @@
+import { gatewayRetryDecision } from '../fork/gateway-retry.mjs'
 import {
   classifyUpstreamResult,
   isFableModel,
@@ -642,7 +643,9 @@ export class FailoverRunner {
     let currentDeviceVmId = null
     let pinnedSlot = null
     let lastSelected = null
+    let gatewayOutcomeUnknown = false
     const attribution = () => ({
+      gatewayOutcomeUnknown,
       accountId: lastSelected?.accountId,
       vmId: lastSelected?.vmId,
       attemptCount: budget.hops,
@@ -951,6 +954,7 @@ export class FailoverRunner {
         }
 
         lastResult = result
+        gatewayOutcomeUnknown ||= gatewayRetryDecision(result) === 'outcome-unknown'
         lastPolicy = policy
         this.noteUnitHealth(selected, policy, result)
         if (attemptMeta?.sessionId) {
@@ -1139,6 +1143,7 @@ export class FailoverRunner {
           this.scheduler?.accountQuota,
         )
         lastResult = result
+        gatewayOutcomeUnknown ||= gatewayRetryDecision(result) === 'outcome-unknown'
         lastPolicy = policy
         this.noteUnitHealth(selected, policy, result)
         notifyProxyFailure(this.onProxyFailure, selected, policy)

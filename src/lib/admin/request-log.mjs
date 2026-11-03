@@ -24,6 +24,7 @@ import { classifyRequestError, resolveMutedErrorClasses } from './error-class.mj
 import { costColumnsFromUsage, normalizeUsage } from './pricing.mjs'
 import { disjointOpenaiUsage } from '../protocol/openai-usage.mjs'
 import { REASONING_EFFORTS, sessionIdForLog } from '../protocol/log-fields.mjs'
+import { requestCorrelation } from '../fork/request-correlation.mjs'
 
 /** Persist the token a client actually sent — only for failed ingress auth. */
 export function presentedApiKeyForLog(token) {
@@ -448,6 +449,7 @@ export class RequestLogStore {
     const mode = resolveLogMode(this.mode, req)
     return {
       request_id: requestId,
+      ...requestCorrelation(req),
       mode,
       t0: Date.now(),
       protocol,
@@ -540,6 +542,8 @@ export class RequestLogStore {
     const summary = {
       id: 'log_' + crypto.randomBytes(6).toString('hex'),
       request_id: ctx.request_id,
+      correlation_id: ctx.correlation_id ?? null,
+      retry_index: ctx.retry_index ?? null,
       ts: new Date().toISOString(),
       log_mode: ctx.mode,
       method: ctx.method,
@@ -660,7 +664,7 @@ export class RequestLogStore {
   }
 
   _mutedExclude(opts = {}) {
-    if (opts.error_class || opts.include_muted) return null
+    if (opts.error_class || opts.include_muted || opts.request_id || opts.correlation_id) return null
     if (opts.exclude_error_class != null && String(opts.exclude_error_class).trim() !== '') {
       return opts.exclude_error_class
     }
@@ -831,6 +835,8 @@ export class RequestLogStore {
 const EXPORT_COLUMNS = [
   'ts',
   'request_id',
+  'correlation_id',
+  'retry_index',
   'method',
   'path',
   'protocol',
