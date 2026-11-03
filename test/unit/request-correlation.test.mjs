@@ -6,7 +6,10 @@ import path from 'node:path'
 import { RequestLogStore, logsToCsv, logsToJsonl } from '../../src/lib/admin/request-log.mjs'
 import { requestCorrelation } from '../../src/lib/fork/request-correlation.mjs'
 import { UsageLogsView } from '../../src/lib/db/repos/usage-logs-view.mjs'
-import { applyMigrations, createDatabase } from '../../src/lib/db/database.mjs'
+import { applyMigrations, createDatabase, openDatabase, closeDatabase } from '../../src/lib/db/database.mjs'
+import { usageRead } from '../../src/lib/db/sqlite-pool.mjs'
+import { flushWrites, pendingWrites } from '../../src/lib/db/write-behind.mjs'
+import { RequestAttemptsRepo } from '../../src/lib/db/repos/request-attempts-repo.mjs'
 import { fileURLToPath } from 'node:url'
 
 test('normal and debug logs keep outer identity separate from unique pool execution ids', (t) => {
@@ -80,6 +83,61 @@ test('migration preserves existing execution ids and leaves historical correlati
     /UNIQUE/,
   )
   assert.equal(new UsageLogsView(db).listBatch({ request_id: 'caller-r1' }).logs.length, 1)
+})
+
+test('pooled writes preserve correlation, attempts and tenant scope through worker reads and close', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-correlated-pool-'))
+  const dbPath = path.join(root, 'logs.db')
+  const db = openDatabase({ dbPath, pooled: true })
+  t.after(() => {
+    closeDatabase()
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  const store = new RequestLogStore({ db, dataDir: root, mode: 'debug' })
+  const attempts = new RequestAttemptsRepo(db)
+  for (const [execution, userId, retryIndex] of [
+    ['pooled-root', 'alice', 0],
+    ['pooled-root-r1', 'bob', 1],
+  ]) {
+    const ctx = store.start({
+      headers: {
+        'x-request-id': execution,
+        'x-oneapi-request-id': 'pooled-root',
+        'x-oneapi-retry-index': String(retryIndex),
+      },
+    })
+    attempts.begin({ requestId: execution, attemptNo: 1, model: 'test' })
+    attempts.complete(execution, 1, { upstreamStatus: 401, terminalState: 'rejected' })
+    store.finish(ctx, { status: 401, error_code: 'invalid_api_key', user_id: userId, attempt_count: 1 })
+  }
+  assert.ok(pendingWrites() > 0)
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM usage_logs').get().n, 0)
+  flushWrites()
+  const filters = { correlation_id: 'pooled-root', owner_user_id: 'alice' }
+  const listed = await usageRead({ kind: 'view', method: 'listBatch', args: [filters], mutedErrorClasses: ['auth'] })
+  assert.equal(listed.logs.length, 1)
+  assert.equal(listed.logs[0].requestId, 'pooled-root')
+  assert.equal(listed.logs[0].retryIndex, 0)
+  assert.equal(listed.logs[0].providerChain[0].upstreamStatus, 401)
+  const summary = await usageRead({ kind: 'view', method: 'summary', args: [filters] })
+  const exported = await usageRead({ kind: 'view', method: 'exportRows', args: [filters] })
+  assert.equal(summary.totalRequests, 1)
+  assert.equal(exported.items[0].correlation_id, 'pooled-root')
+  assert.equal(exported.total, 1)
+  assert.equal(store.getDebug('pooled-root', { owner_user_id: 'alice' }).retry_index, 0)
+  const last = store.start({ headers: { 'x-request-id': 'on-close', 'x-oneapi-request-id': 'pooled-root' } })
+  store.finish(last, { status: 200, user_id: 'alice' })
+  closeDatabase()
+  assert.equal(pendingWrites(), 0)
+  const reopened = createDatabase({ dbPath })
+  try {
+    assert.equal(
+      new UsageLogsView(reopened).listBatch({ request_id: 'on-close', owner_user_id: 'alice' }).logs.length,
+      1,
+    )
+  } finally {
+    reopened.close()
+  }
 })
 
 test('correlation metadata is bounded and never inferred by stripping an execution suffix', () => {
