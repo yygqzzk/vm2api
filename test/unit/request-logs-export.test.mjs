@@ -45,11 +45,18 @@ function seed(rows) {
 
 seed([
   { session_id: 's1', status: 200 },
-  { session_id: 's1', status: 500, error_code: 'upstream_error' },
+  { session_id: 's1', status: 500, error_code: 'upstream_error', correlation_id: 'outer', retry_index: 0 },
   { session_id: 's1', status: 500, error_code: 'upstream_error', path: '/v1/chat/completions' },
   { session_id: 's2', status: 500, error_code: 'upstream_error' },
   { session_id: 's1', status: 200, attempt_count: 3, log_mode: 'debug' },
-  { session_id: 's1', status: 401, error_code: 'invalid_api_key', vm_id: null },
+  {
+    session_id: 's1',
+    status: 401,
+    error_code: 'invalid_api_key',
+    vm_id: null,
+    correlation_id: 'outer',
+    retry_index: 1,
+  },
   { session_id: 's9', user_id: 'u2', api_key_id: 'k2', status: 500, error_code: 'upstream_error' },
 ])
 
@@ -91,6 +98,16 @@ async function exportLogs(query, { role = 'admin', userId = null, headers = {} }
 }
 
 const ids = (rows) => rows.map((r) => r.request_id)
+
+test('request and correlation filters reach the HTTP export without default muting', async () => {
+  const { rows, headers } = await exportLogs('correlation_id=outer')
+  assert.deepEqual(ids(rows), ['req-6', 'req-2'])
+  assert.equal(headers['x-kin-export-total'], '2')
+  assert.equal(rows[0].correlation_id, 'outer')
+  assert.equal(rows[0].retry_index, 1)
+  assert.deepEqual(ids((await exportLogs('request_id=req-6')).rows), ['req-6'])
+  assert.deepEqual(ids((await exportLogs('correlation_id=outer&status_code=500')).rows), ['req-2'])
+})
 
 test('export honours the list filters the page sends (session, status code, endpoint)', async () => {
   const query = 'session_id=s1&status_code=500&endpoint=%2Fv1%2Fmessages'

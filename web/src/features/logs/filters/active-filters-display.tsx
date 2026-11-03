@@ -54,6 +54,18 @@ export function ActiveFiltersDisplay({
           ? `${filters.sessionId.slice(0, 12)}...`
           : filters.sessionId,
     })
+  if (filters.requestId)
+    chips.push({
+      key: 'requestId',
+      label: '执行请求 ID',
+      value: filters.requestId,
+    })
+  if (filters.correlationId)
+    chips.push({
+      key: 'correlationId',
+      label: '关联请求 ID',
+      value: filters.correlationId,
+    })
   if (filters.startTime != null && filters.endTime != null) {
     const start = format(new Date(filters.startTime), 'MM/dd')
     const end = format(

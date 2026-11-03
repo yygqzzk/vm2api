@@ -267,12 +267,14 @@ async function runHop({ mode, opts }) {
   const send = mode === 'stream' ? streamRustKernel : callRustKernel
   beginWrapHop(opts.exec)
   let result
+  let transportRetried = false
   try {
     result = await send(opts)
     noteWrapHop(opts.exec)
     if (opts.signal?.aborted || isClientCancelledResult(result)) {
       result = clientCancelledResult(result)
     } else if (result.transportError === true && result.committed !== true) {
+      transportRetried = true
       result = await send(opts)
       result = { ...result, rust_transport_retried: true }
       noteWrapHop(opts.exec)
@@ -289,6 +291,7 @@ async function runHop({ mode, opts }) {
         noteWrapHop(opts.exec)
       }
     }
+    if (transportRetried) result = { ...result, rust_transport_retried: true }
     return {
       ...result,
       engine,

@@ -175,6 +175,8 @@ export function toUsageLogRow(row, names, chain = []) {
   return {
     id: row.id,
     requestId: row.request_id ?? null,
+    correlationId: row.correlation_id ?? null,
+    retryIndex: nullableNum(row.retry_index),
     createdAt: row.created_at,
     userId: row.user_id ?? null,
     userName: row.user_id ? (names.users.get(row.user_id) ?? null) : null,
@@ -297,7 +299,7 @@ function splitClasses(raw) {
  * settings default; otherwise the settings default applies.
  */
 function mutedClasses(filters, defaults) {
-  if (filters.error_class || filters.include_muted) return []
+  if (filters.error_class || filters.include_muted || filters.request_id || filters.correlation_id) return []
   const explicit = splitClasses(filters.exclude_error_class)
   return explicit.length ? explicit : defaults.slice()
 }
@@ -320,6 +322,8 @@ function buildFilter(filters, defaultMuted) {
     params.push(String(val))
   }
   eq('user_id', filters.user_id)
+  eq('request_id', filters.request_id)
+  eq('correlation_id', filters.correlation_id)
   eq('api_key_id', filters.key_id)
   eq('vm_id', filters.vm_id)
   if (filters.session_id) {

@@ -46,6 +46,14 @@ test('an unstarted stream reports that, and an error event names overloaded_erro
   assert.equal(payload.error.details, undefined)
 })
 
+test('terminal queue errors carry only a validated outer retry hint after keepalives', () => {
+  for (const hint of ['next-channel', 'never', 'outcome-unknown', 'invalid']) {
+    const event = buildAnthropicSseError({ type: 'overloaded_error', code: 'pool_overloaded', gateway_retry: hint })
+    const payload = JSON.parse(event.split('\n')[1].slice(5).trim())
+    assert.equal(payload.error.gateway_retry, hint === 'invalid' ? undefined : hint)
+  }
+})
+
 test('a worker timeout is not closed as max_tokens', () => {
   assert.equal(isRecoverableTruncation({ ok: false }), true)
   assert.equal(

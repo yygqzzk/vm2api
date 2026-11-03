@@ -1,3 +1,4 @@
+import { gatewayRetryDecision } from '../fork/gateway-retry.mjs'
 import {
   classifyUpstreamResult,
   isFableModel,
@@ -642,7 +643,9 @@ export class FailoverRunner {
     let currentDeviceVmId = null
     let pinnedSlot = null
     let lastSelected = null
+    let gatewayOutcomeUnknown = false
     const attribution = () => ({
+      gatewayOutcomeUnknown,
       accountId: lastSelected?.accountId,
       vmId: lastSelected?.vmId,
       attemptCount: budget.hops,
@@ -659,11 +662,13 @@ export class FailoverRunner {
         for (const key of bindKeys) {
           if (pinMoved(key)) continue
           const prev = this.stickyRouter.resolve?.(key)
+          // A granted seat follows the scheduler's device home even when the
+          // previous account is still eligible. Capacity spills keep its pin.
           const ownMove =
-            !!outboundSessionAccountId &&
-            prev?.accountId === outboundSessionAccountId &&
+            !!prev?.accountId &&
             prev.accountId !== account.accountId &&
-            opts?.borrowed !== true
+            opts?.borrowed !== true &&
+            (prev.accountId === outboundSessionAccountId || (!!lastSelected?.seatKey && !spilled.has(prev.accountId)))
           if (prev?.accountId && prev.accountId !== account.accountId && !ownMove) continue
           let guard = opts
           if (prev) guard = { ...opts, ifGeneration: prev.generation || 0 }
@@ -951,6 +956,7 @@ export class FailoverRunner {
         }
 
         lastResult = result
+        gatewayOutcomeUnknown ||= gatewayRetryDecision(result) === 'outcome-unknown'
         lastPolicy = policy
         this.noteUnitHealth(selected, policy, result)
         if (attemptMeta?.sessionId) {
@@ -1139,6 +1145,7 @@ export class FailoverRunner {
           this.scheduler?.accountQuota,
         )
         lastResult = result
+        gatewayOutcomeUnknown ||= gatewayRetryDecision(result) === 'outcome-unknown'
         lastPolicy = policy
         this.noteUnitHealth(selected, policy, result)
         notifyProxyFailure(this.onProxyFailure, selected, policy)

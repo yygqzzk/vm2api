@@ -4,6 +4,7 @@
  */
 import { ErrorCode, ErrorType, makeError } from '../core/errors.mjs'
 import { CORS_ALLOW_HEADERS, corsHeadersForRequest } from './cors.mjs'
+import { GATEWAY_RETRY_HEADER } from '../fork/gateway-retry.mjs'
 
 export { CORS_ALLOW_HEADERS } from './cors.mjs'
 
@@ -131,7 +132,10 @@ export function createRespond(cfg, options = {}) {
       'content-type': 'application/json; charset=utf-8',
       'x-kin-rewrite': cfg.rewrite.enabled ? 'on' : 'off',
     })
-    if (res._kinRequestId) headers['x-request-id'] = res._kinRequestId
+    if (res._kinRequestId) {
+      headers['x-request-id'] = res._kinRequestId
+      if (status >= 400) headers[GATEWAY_RETRY_HEADER] = res._kinGatewayRetry || 'never'
+    }
     if (body?.error?.details?.retryable === false) headers['x-should-retry'] = 'false'
     res.writeHead(status, headers)
     res.end(data)

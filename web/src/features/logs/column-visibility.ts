@@ -1,5 +1,6 @@
 /** 可隐藏列，顺序 = 下拉菜单顺序（hub `DEFAULT_VISIBLE_COLUMNS`）。时间/模型/状态恒显示。 */
 export const LOGS_TABLE_COLUMNS = [
+  { id: 'requestId', label: '请求 ID' },
   { id: 'user', label: '用户' },
   { id: 'key', label: '密钥' },
   { id: 'sessionId', label: '出站 Session' },

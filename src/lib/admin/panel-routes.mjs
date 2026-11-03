@@ -22,6 +22,7 @@ import {
   buildScopeInventory,
   listPolicyModels as listDecisionModels,
   publicJevConfig,
+  publicJevKeys,
   readJevConfig,
 } from '../protocol/jev-intercept.mjs'
 import { JevUsageRepo } from '../db/repos/jev-usage-repo.mjs'
@@ -192,6 +193,7 @@ import { withVmLock, atomicWriteJson, isValidVmId, invalidateVmSlotReadCache } f
 import { snapshotDatabaseMetrics } from '../db/database-metrics.mjs'
 import { getUsageCache } from '../oauth/usage-cache.mjs'
 import { getDb, getDbPath } from '../db/database.mjs'
+import { usagePoolEnabled, usageRead } from '../db/sqlite-pool.mjs'
 import {
   readLocalVersion,
   loadChangelog,
@@ -376,6 +378,8 @@ function usageLogFilters(req, u) {
     vm_id: get('vm_id'),
     account_id: get('account_id'),
     session_id: get('session_id'),
+    request_id: get('request_id')?.trim(),
+    correlation_id: get('correlation_id')?.trim(),
     model: get('model'),
     endpoint: get('endpoint'),
     protocol: get('protocol'),
@@ -977,6 +981,15 @@ export function createPanelHandler(ctx) {
     return { ...config, account_scope: jevScopeInventory(config.account_platform_plans) }
   }
 
+  function deactivateVmSlot(id) {
+    if (getActiveVmId(cfg.paths.project) === id) {
+      clearActiveVmFromDb()
+      clearActiveVm(cfg.paths.project)
+      reloadActiveVm(cfg)
+    }
+    return { ok: true, active_vm: getActiveVmId(cfg.paths.project) }
+  }
+
   function activateVmSlot(id) {
     setActiveVm(cfg.paths.project, id)
     reloadActiveVm(cfg)
@@ -1193,6 +1206,21 @@ export function createPanelHandler(ctx) {
     })
   }
 
+  async function readUsage(kind, method, args) {
+    if (!usagePoolEnabled()) return null
+    try {
+      return await usageRead({
+        kind,
+        method,
+        args,
+        mutedErrorClasses: requestLog?.mutedErrorClasses || [],
+      })
+    } catch (err) {
+      console.warn(`[sqlite-pool] ${kind}.${method}: ${err?.message || err}`)
+      return null
+    }
+  }
+
   async function handlePanel(req, res, url) {
     const p = url.pathname
     if (!p.startsWith('/admin') && !p.startsWith('/api/panel')) return false
@@ -1277,6 +1305,12 @@ export function createPanelHandler(ctx) {
       const id = p.split('/')[3]
       if (!getVm(cfg.paths.project, id)) return json(res, 404, { error: { message: 'vm not found' } })
       return json(res, 200, activateVmSlot(id))
+    }
+    if (req.method === 'POST' && /^\/admin\/vms\/[^/]+\/deactivate$/.test(p)) {
+      if (!requireAuth(req, res)) return
+      const id = p.split('/')[3]
+      if (!getVm(cfg.paths.project, id)) return json(res, 404, { error: { message: 'vm not found' } })
+      return json(res, 200, deactivateVmSlot(id))
     }
     if (req.method === 'POST' && /^\/admin\/vms\/[^/]+\/probe$/.test(p)) {
       if (!requireAuth(req, res)) return
@@ -1983,6 +2017,8 @@ export function createPanelHandler(ctx) {
           since: u.searchParams.get('since') || null,
           until: u.searchParams.get('until') || null,
           q: u.searchParams.get('q') || null,
+          request_id: u.searchParams.get('request_id')?.trim() || null,
+          correlation_id: u.searchParams.get('correlation_id')?.trim() || null,
           owner_user_id: panelIdentity(req).role === 'user' ? req.panelUserId : u.searchParams.get('user_id') || null,
         }
         const { items, total } = requestLog.queryNormal(filters)
@@ -2013,9 +2049,10 @@ export function createPanelHandler(ctx) {
           status_code: listed.status_code || (/^\d+$/.test(legacyStatus || '') ? legacyStatus : null),
           errors_only: legacyStatus === 'error',
         }
-        const { items, total, capped } = new UsageLogsView(getDb(), {
-          mutedErrorClasses: requestLog?.mutedErrorClasses,
-        }).exportRows(filters)
+        const exported =
+          (await readUsage('view', 'exportRows', [filters])) ||
+          new UsageLogsView(getDb(), { mutedErrorClasses: requestLog?.mutedErrorClasses }).exportRows(filters)
+        const { items, total, capped } = exported
         const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '')
         const body = format === 'csv' ? logsToCsv(items) : logsToJsonl(items)
         const filename = `vm2api-logs-${stamp}.${format}`
@@ -2042,14 +2079,36 @@ export function createPanelHandler(ctx) {
         const until = u.searchParams.get('until') || null
         const tenant = panelIdentity(req).role === 'user'
         const owner_user_id = tenant ? req.panelUserId : u.searchParams.get('user_id') || null
+        let totals
+        let buckets
+        let window
+        if (usagePoolEnabled()) {
+          try {
+            const jobs = [
+              usageRead({ kind: 'repo', method: 'aggregate', args: [{ since, until, bucket, owner_user_id }] }),
+              usageRead({ kind: 'repo', method: 'windowStats', args: [{ since, until, owner_user_id }] }),
+            ]
+            if (!tenant) jobs.unshift(usageRead({ kind: 'repo', method: 'totals' }))
+            const out = await Promise.all(jobs)
+            if (tenant) [buckets, window] = out
+            else [totals, buckets, window] = out
+          } catch (err) {
+            console.warn(`[sqlite-pool] repo.stats: ${err?.message || err}`)
+          }
+        }
+        if (buckets === undefined) {
+          totals = tenant ? null : requestLog.totals()
+          buckets = requestLog.aggregate({ since, until, bucket, owner_user_id })
+          window = requestLog.windowStats({ since, until, owner_user_id })
+        }
         return json(res, 200, {
           ok: true,
           bucket,
           since,
           until,
-          totals: tenant ? null : requestLog.totals(),
-          buckets: requestLog.aggregate({ since, until, bucket, owner_user_id }),
-          window: requestLog.windowStats({ since, until, owner_user_id }),
+          totals: totals ?? null,
+          buckets,
+          window,
           muted_error_classes: requestLog.snapshot().muted_error_classes,
           config: tenant ? null : requestLog.snapshot(),
         })
@@ -2084,34 +2143,36 @@ export function createPanelHandler(ctx) {
       // Lives beside /request-logs (offset + snake_case, still used by error
       // collection and export); this surface never COUNTs the table.
       const usageLogsView = () => new UsageLogsView(getDb(), { mutedErrorClasses: requestLog?.mutedErrorClasses })
+      const readView = async (method, ...args) =>
+        (await readUsage('view', method, args)) ?? usageLogsView()[method](...args)
       const tenantId = () => (panelIdentity(req).role === 'user' ? req.panelUserId : null)
       if (req.method === 'GET' && p === '/api/panel/usage-logs') {
         const u = new URL(req.url, 'http://x')
-        return json(res, 200, panel.ok(usageLogsView().listBatch(usageLogFilters(req, u))))
+        return json(res, 200, panel.ok(await readView('listBatch', usageLogFilters(req, u))))
       }
       if (req.method === 'GET' && p === '/api/panel/usage-logs/summary') {
         const u = new URL(req.url, 'http://x')
-        return json(res, 200, panel.ok(usageLogsView().summary(usageLogFilters(req, u))))
+        return json(res, 200, panel.ok(await readView('summary', usageLogFilters(req, u))))
       }
       if (req.method === 'GET' && p === '/api/panel/usage-logs/filter-options') {
-        return json(res, 200, panel.ok(usageLogsView().filterOptions({ owner_user_id: tenantId() })))
+        return json(res, 200, panel.ok(await readView('filterOptions', { owner_user_id: tenantId() })))
       }
       if (req.method === 'GET' && p === '/api/panel/usage-logs/session-suggestions') {
         const u = new URL(req.url, 'http://x')
         const q = u.searchParams.get('q') || ''
         const limit = u.searchParams.get('limit')
-        return json(res, 200, panel.ok(usageLogsView().sessionSuggestions({ q, limit, owner_user_id: tenantId() })))
+        return json(res, 200, panel.ok(await readView('sessionSuggestions', { q, limit, owner_user_id: tenantId() })))
       }
       if (req.method === 'GET' && p === '/api/panel/usage-logs/active-sessions') {
         const u = new URL(req.url, 'http://x')
         const minutes = u.searchParams.get('minutes')
         const limit = u.searchParams.get('limit')
-        return json(res, 200, panel.ok(usageLogsView().activeSessions({ minutes, limit, owner_user_id: tenantId() })))
+        return json(res, 200, panel.ok(await readView('activeSessions', { minutes, limit, owner_user_id: tenantId() })))
       }
       if (req.method === 'GET' && p === '/api/panel/usage-logs/overview') {
         const u = new URL(req.url, 'http://x')
         const tz = u.searchParams.get('tz') || 'UTC'
-        return json(res, 200, panel.ok(usageLogsView().overview({ tz, owner_user_id: tenantId() })))
+        return json(res, 200, panel.ok(await readView('overview', { tz, owner_user_id: tenantId() })))
       }
 
       // ---- Statistics page ----
@@ -3300,6 +3361,21 @@ export function createPanelHandler(ctx) {
           return json(res, e.status, { ok: false, error: e.body.error })
         }
         return json(res, 200, panel.ok(activateVmSlot(id)))
+      }
+
+      // POST /api/panel/vms/:id/deactivate
+      if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/deactivate$/.test(p)) {
+        const id = p.split('/')[4]
+        if (!getVm(cfg.paths.project, id)) {
+          const e = makeError({
+            type: ErrorType.NOT_FOUND,
+            code: ErrorCode.VM_NOT_FOUND,
+            message: 'vm not found',
+            status: 404,
+          })
+          return json(res, e.status, { ok: false, error: e.body.error })
+        }
+        return json(res, 200, panel.ok(deactivateVmSlot(id)))
       }
 
       // POST /api/panel/vms/:id/update-claude-code — Claude CLI runtime was removed
@@ -5490,10 +5566,12 @@ export function createPanelHandler(ctx) {
         try {
           const repo = new JevUsageRepo()
           const page = repo.list(Object.fromEntries(url.searchParams))
+          const settings = new SettingsRepo()
+          const keys = repo.configuredKeys(publicJevKeys(readJevConfig((key, fallback) => settings.get(key, fallback))))
           return json(
             res,
             200,
-            panel.ok({ ...repo.overview(), ...page, storage_errors_since_start: jevUsageStorageErrors() }),
+            panel.ok({ ...repo.overview(), ...page, keys, storage_errors_since_start: jevUsageStorageErrors() }),
           )
         } catch (error) {
           if (error instanceof TypeError)

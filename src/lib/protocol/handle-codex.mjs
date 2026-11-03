@@ -2,6 +2,7 @@
  * Codex hop from handle-protocol. Claude convert/pool/CRS never runs here.
  */
 import path from 'node:path'
+import { gatewayRetryDecision, poolAdmissionRetry } from '../fork/gateway-retry.mjs'
 import { resolveStreamIdleTimeoutMs } from '../core/config.mjs'
 import { isClientStream, fromClaudeToOpenAIChat, fromClaudeToOpenAICompletions } from './convert.mjs'
 import { getVm, listVms, persistCodexUsage, syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
@@ -667,6 +668,7 @@ export async function handleCodexProtocol({
   logBag.via = 'codex-kernel'
   logBag.attempt_count = 0
   let last = null
+  let gatewayOutcomeUnknown = false
   let hops = 0
   let attempts = 0
   let switches = 0
@@ -682,7 +684,7 @@ export async function handleCodexProtocol({
         }
         // Real upstream failures already happened: report the last one, not the pool.
         if (last) break
-        return rejectCodexAdmission({ res, json, stats, logBag, picked, model: converted.body?.model })
+        return rejectCodexAdmission({ req, res, json, stats, logBag, picked, model: converted.body?.model })
       }
       const vm = getVm(projectRoot, admitted.vmId)
       const lease = admitted.lease
@@ -868,6 +870,7 @@ export async function handleCodexProtocol({
             },
           })
         let result = await runHop()
+        gatewayOutcomeUnknown ||= gatewayRetryDecision(result) === 'outcome-unknown'
         // A transient seat-local failure gets the same account up to N retries
         // before the request spends a switch. 401/403/429 are never retried here:
         // they are credential/account state and must move to another seat.
@@ -889,6 +892,7 @@ export async function handleCodexProtocol({
           await new Promise((resolve) => setTimeout(resolve, sameRetryDelayMs))
           hopEmitted = false
           result = await runHop()
+          gatewayOutcomeUnknown ||= gatewayRetryDecision(result) === 'outcome-unknown'
         }
         // The log and total duration share ingress time; pool scoring keeps hop TTFT.
         logBag.first_token_ms = Number.isFinite(result?.firstTokenAt)
@@ -997,13 +1001,22 @@ export async function handleCodexProtocol({
   stats.errors++
   logBag.error_code = last?.body?.error?.code || 'codex_upstream'
   logBag.upstream_status = last?.status || 0
+  res._kinGatewayRetry = gatewayRetryDecision(
+    { ...last, gatewayOutcomeUnknown },
+    {
+      stateBound:
+        !!inboundSession.previous_response_id || !!pinnedVmId(req) || !!headerString(req.headers, 'x-codex-turn-state'),
+    },
+  )
   return json(res, last?.status || 502, last?.body || { error: { type: 'api_error', code: 'codex_upstream' } })
 }
 
 /** No seat was admitted and nothing ran: say which gate stopped the request. */
-function rejectCodexAdmission({ res, json, stats, logBag, picked, model }) {
+function rejectCodexAdmission({ req, res, json, stats, logBag, picked, model }) {
   stats.errors++
   logBag.error_code = picked.error || 'no_codex_vm'
+  res._kinGatewayRetry =
+    headerString(req.headers, 'x-codex-turn-state') || pinnedVmId(req) ? 'never' : poolAdmissionRetry(logBag.error_code)
   if (picked.error === 'platform_mismatch') {
     return json(res, 400, {
       error: {
@@ -1058,7 +1071,7 @@ function rejectCodexAdmission({ res, json, stats, logBag, picked, model }) {
     // Queue-full has no retryAt. Every Codex pool_overloaded 429 still advertises >= 1s.
     const waitMs = Number(picked.retryAt) - Date.now()
     const retryAfterSec = Math.max(1, waitMs > 0 ? Math.ceil(waitMs / 1000) : 0)
-    res.setHeader?.('retry-after', String(retryAfterSec))
+    if (!res.headersSent) res.setHeader?.('retry-after', String(retryAfterSec))
     return json(res, 429, {
       error: {
         type: 'rate_limit_error',
@@ -1071,7 +1084,7 @@ function rejectCodexAdmission({ res, json, stats, logBag, picked, model }) {
   if (picked.error === 'pool_resting') {
     // Every slot is off-shift: 503 like the Claude pool, timed to the first window open.
     const waitMs = Number(picked.retryAt) - Date.now()
-    res.setHeader?.('retry-after', String(Math.max(1, Math.ceil(waitMs / 1000) || 1)))
+    if (!res.headersSent) res.setHeader?.('retry-after', String(Math.max(1, Math.ceil(waitMs / 1000) || 1)))
     return json(res, 503, {
       error: {
         type: 'api_error',
@@ -1255,7 +1268,7 @@ export async function handleCodexSearch({
           return
         }
         if (last) break
-        return rejectCodexAdmission({ res, json, stats, logBag, picked: admitted.picked, model: outbound.model })
+        return rejectCodexAdmission({ req, res, json, stats, logBag, picked: admitted.picked, model: outbound.model })
       }
       try {
         const vm = getVm(projectRoot, admitted.vmId)
@@ -1407,7 +1420,7 @@ export async function handleCodexImages({
           return
         }
         if (last) break
-        return rejectCodexAdmission({ res, json, stats, logBag, picked: admitted.picked, model })
+        return rejectCodexAdmission({ req, res, json, stats, logBag, picked: admitted.picked, model })
       }
       try {
         const vm = getVm(projectRoot, admitted.vmId)
