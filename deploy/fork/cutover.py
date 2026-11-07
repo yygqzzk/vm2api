@@ -119,11 +119,20 @@ class Cutover:
             image = json.loads(output(["docker", "image", "inspect", self.image]))[0]
         except subprocess.CalledProcessError:
             subprocess.run(["docker", "pull", self.image], check=True)
-            image = json.loads(output(["docker", "image", "inspect", self.image]))[0]
+            image = self._inspect_after_pull()
         require(image["Config"]["Labels"].get("org.opencontainers.image.revision") == self.revision,
                 "Image revision label does not match --revision")
         require(image["Os"] == "linux" and image["Architecture"] == "amd64", "Image is not linux/amd64")
         return image
+
+    def _inspect_after_pull(self):
+        """containerd image store publishes the tag shortly after pull returns."""
+        for _ in range(15):
+            try:
+                return json.loads(output(["docker", "image", "inspect", self.image]))[0]
+            except subprocess.CalledProcessError:
+                time.sleep(1)
+        raise RuntimeError("Pulled image is not visible to the Docker daemon")
 
     def install(self):
         install_cutover(self.root, self.repo)
@@ -132,6 +141,7 @@ class Cutover:
         image = self.ensure_image()
         before = self.snapshot()
         folder = Path(tempfile.mkdtemp(prefix="cutover-preflight-"))
+        self.write_candidate(folder)
         save(folder / "compose-environment.json", self.validate_compose(folder))
         result = {"ok": True, "image": self.image, "revision": self.revision,
                   "digest": image.get("Descriptor", {}).get("digest"), "platform": "linux/amd64",
