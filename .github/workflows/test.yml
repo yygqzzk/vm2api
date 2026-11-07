@@ -141,6 +141,7 @@ jobs:
                 test/unit/gpt-model-policy.test.mjs \
                 test/unit/codex-image-tool.test.mjs \
                 test/unit/database.test.mjs \
+                test/unit/database-metrics.test.mjs \
                 test/unit/fork-migration-upgrade.test.mjs \
                 test/unit/request-correlation.test.mjs \
                 test/unit/gateway-retry.test.mjs \
