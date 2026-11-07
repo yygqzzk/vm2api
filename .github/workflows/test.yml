@@ -183,7 +183,9 @@ jobs:
   # Publish the exact images that passed the amd64 job; production pulls
   # by digest.
   ghcr-push:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && github.ref == 'refs/heads/main'
     needs: fork-images-amd64
     runs-on: ubuntu-24.04
     timeout-minutes: 20
