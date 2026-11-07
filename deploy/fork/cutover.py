@@ -6,9 +6,13 @@ Runs on the production host as root. The image reference must be immutable
 Only the control-plane container is replaced; slot containers, credentials,
 fingerprints, routing and the business database are preserved.
 
-  python3 deploy/fork/cutover.py backup --image REF --revision SHA
-  python3 deploy/fork/cutover.py deploy  --image REF --revision SHA
-  python3 deploy/fork/cutover.py verify  --image REF --revision SHA
+  python3 deploy/fork/cutover.py preflight --release <SHA>   # pull + compose check, no changes
+  python3 deploy/fork/cutover.py backup    --release <SHA>
+  python3 deploy/fork/cutover.py deploy    --release <SHA>
+  python3 deploy/fork/cutover.py verify    --release <SHA>
+
+--release resolves <repo>:fork-<SHA> and pulls it when missing; --image/--revision
+accept any explicit reference instead.
 """
 
 import argparse
@@ -21,6 +25,7 @@ import shutil
 import sqlite3
 import subprocess
 import tarfile
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -79,6 +84,7 @@ def save(file, value):
 class Cutover:
     def __init__(self, args):
         self.root = Path(args.root)
+        self.repo = args.repo
         self.image = args.image
         self.revision = args.revision
         self.keep = args.keep_backups
@@ -106,6 +112,31 @@ class Cutover:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = json.load(response)
         return payload.get("data", payload)
+
+    def ensure_image(self):
+        """Pull the exact reference when it is not on the host; return its inspect record."""
+        try:
+            image = json.loads(output(["docker", "image", "inspect", self.image]))[0]
+        except subprocess.CalledProcessError:
+            subprocess.run(["docker", "pull", self.image], check=True)
+            image = json.loads(output(["docker", "image", "inspect", self.image]))[0]
+        require(image["Config"]["Labels"].get("org.opencontainers.image.revision") == self.revision,
+                "Image revision label does not match --revision")
+        require(image["Os"] == "linux" and image["Architecture"] == "amd64", "Image is not linux/amd64")
+        return image
+
+    def install(self):
+        install_cutover(self.root, self.repo)
+
+    def preflight(self):
+        image = self.ensure_image()
+        before = self.snapshot()
+        folder = Path(tempfile.mkdtemp(prefix="cutover-preflight-"))
+        save(folder / "compose-environment.json", self.validate_compose(folder))
+        result = {"ok": True, "image": self.image, "revision": self.revision,
+                  "digest": image.get("Descriptor", {}).get("digest"), "platform": "linux/amd64",
+                  "compose_merges_cleanly": True, **self.fleet_summary(before)}
+        print(json.dumps(result))
 
     def snapshot(self):
         listing = self.api("/api/panel/vms")
@@ -346,8 +377,8 @@ for (const id of IDS) {
                 **self.fleet_summary(after)}
 
     def rollback_script(self, folder):
-        script = folder / "rollback.sh"
         prefix = self.compose_prefix()
+        script = folder / "rollback.sh"
         script.write_text("#!/bin/sh\nset -eu\n# Restores the previous program only; the business database is kept.\ncd " + shlex.quote(str(self.root)) + "\n"
                           + shlex.join(prefix + ["up", "-d", "--no-deps", "--pull", "never", "vm2api"]) + "\n")
         script.chmod(0o700)
@@ -358,7 +389,7 @@ for (const id of IDS) {
         before = json.loads((folder / "before.json").read_text())
         require(json.loads((folder / "manifest.json").read_text())["database_quick_check"] == "ok", "Backup not validated")
         require(inspect_container("vm2api")["Id"] == before["control"]["Id"], "Baseline changed since backup")
-        image = json.loads(output(["docker", "image", "inspect", self.image]))[0]
+        image = self.ensure_image()
         require(image["Config"]["Labels"].get("org.opencontainers.image.revision") == self.revision, "Candidate revision mismatch")
         candidate = self.candidate_file(folder) if self.candidate_file(folder).exists() else self.write_candidate(folder)
         self.validate_compose(folder)
@@ -422,6 +453,24 @@ def protected_vm_files(vmroot):
         yield item
 
 
+def install_cutover(root, repo):
+    """Copy this script to a stable host path and write a no-flag wrapper."""
+    target = root / "deploy" / "fork" / "cutover.py"
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    shutil.copy2(Path(__file__).resolve(), target)
+    target.chmod(0o700)
+    wrapper = Path(os.environ.get("VM2API_CUTOVER_BIN", "/usr/local/bin/vm2api-cutover"))
+    wrapper.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        f"exec python3 {shlex.quote(str(target))} "
+        '--repo "${VM2API_IMAGE_REPO:-' + repo + '}" "$@"\n'
+    )
+    wrapper.chmod(0o755)
+    print(json.dumps({"installed": str(target), "wrapper": str(wrapper), "default_repo": repo,
+                      "next": "vm2api-cutover preflight --release <SHA>"}))
+
+
 def db_state(db):
     protected = {}
     for table, columns in PROTECTED_COLUMNS.items():
@@ -444,17 +493,30 @@ def browser_volumes():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("action", choices=["backup", "deploy", "verify"])
-    parser.add_argument("--image", required=True, help="Immutable image reference (digest preferred)")
-    parser.add_argument("--revision", required=True, help="Expected OCI revision label (full commit SHA)")
+    parser.add_argument("action", choices=["backup", "deploy", "verify", "preflight", "install"])
+    parser.add_argument("--release", help="Commit SHA; resolves ghcr.io/yygqzzk/vm2api:fork-<SHA>")
+    parser.add_argument("--repo", default=os.environ.get("VM2API_IMAGE_REPO", "ghcr.io/yygqzzk/vm2api"))
+    parser.add_argument("--image", help="Image reference (default with --release: <repo>:fork-<SHA>)")
+    parser.add_argument("--revision", help="Expected OCI revision label (default with --release: release SHA)")
     parser.add_argument("--root", default="/opt/vm2api")
     parser.add_argument("--container", default="vm2api")
     parser.add_argument("--backup-dir", default=None, help="deploy/verify: existing backup folder (default: newest cutover-*)")
     parser.add_argument("--keep-backups", type=int, default=3, help="Cutover backup sets to keep after a successful deploy")
     parser.add_argument("--drain-timeout", type=int, default=900, help="Seconds to hold scheduling while in-flight requests drain")
     args = parser.parse_args()
+    require(args.action == "install" or bool(args.release or (args.image and args.revision)), "Pass --release SHA, or both --image and --revision")
+    if args.action == "install":
+        os.umask(0o077)
+        install_cutover(Path(args.root), args.repo)
+        return
+    if args.release:
+        args.revision = args.revision or args.release
+        args.image = args.image or f"{args.repo}:fork-{args.release}"
     os.umask(0o077)
     cutover = Cutover(args)
+    if args.action == "preflight":
+        cutover.preflight()
+        return
     if args.action == "backup":
         cutover.backup()
         return

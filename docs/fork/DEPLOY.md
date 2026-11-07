@@ -133,15 +133,21 @@ docker run --rm --platform linux/amd64 --entrypoint node \
 - **排空**：面板维护 hold 接口暂停调度并等在途请求自然结束（1.4.046 起也可依赖
   优雅停机排空；长流场景建议显式 hold）。
 
-服务器上：
+服务器上首次安装（一次性）：
 
 ```bash
-cd /opt/vm2api
-python3 deploy/fork/cutover.py backup --image "ghcr.io/yygqzzk/vm2api@sha256:<digest>" --revision "<完整SHA>"
-docker pull "ghcr.io/yygqzzk/vm2api@sha256:<digest>"
-python3 deploy/fork/cutover.py deploy --image "ghcr.io/yygqzzk/vm2api@sha256:<digest>" --revision "<完整SHA>"
+cd /opt/vm2api && python3 deploy/fork/cutover.py install
 ```
 
+之后每次升级只需一条命令（自动拉取 `ghcr.io/yygqzzk/vm2api:fork-<SHA>`、
+备份、排空、替换、验收；失败自动回退）：
+
+```bash
+vm2api-cutover preflight --release <完整SHA>   # 只读：拉取 + Compose 合并校验
+vm2api-cutover deploy    --release <完整SHA>   # 备份 -> 排空 -> 替换 -> 验收
+```
+
+也可用 `--image <repo>@sha256:... --revision <SHA>` 指定 digest。
 回滚脚本写在每次备份目录的 `rollback.sh`（恢复原 Compose 链，不动数据库）。
 线上 GHCR 拉取凭证用只读 PAT 配置一次：`docker login ghcr.io`。
 
