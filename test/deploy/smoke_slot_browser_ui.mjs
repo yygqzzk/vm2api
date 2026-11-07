@@ -73,7 +73,7 @@ try {
   server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://local')
     req.panelUser = 'acceptance'
-    req.panelRole = 'user'
+    req.panelRole = 'admin'
     req.panelUserId = 'acceptance-user'
     try {
       if (url.pathname === '/favicon.ico') {
@@ -81,7 +81,7 @@ try {
         return res.end()
       }
       if (url.pathname === '/api/panel/me')
-        return json(res, 200, { ok: true, data: { user: 'acceptance', role: 'user' } })
+        return json(res, 200, { ok: true, data: { user: 'acceptance', role: 'admin' } })
       if (BROWSER_PATH.test(url.pathname)) return await service.handle(req, res, url, { json, readBody })
       if (url.pathname.endsWith('/oauth/exchange-code')) {
         const body = await readBody(req)

@@ -46,6 +46,7 @@ jobs:
           cache-dependency-path: |
             worker/go.sum
             api-kernel/go.sum
+            redact/go.sum
       - uses: pnpm/action-setup@v6
         with:
           version: 10
@@ -55,8 +56,8 @@ jobs:
       - name: format and syntax
         run: |
           npx biome format
-          test -z "$(gofmt -l worker api-kernel)" || {
-            gofmt -l worker api-kernel; exit 1;
+          test -z "$(gofmt -l worker api-kernel redact)" || {
+            gofmt -l worker api-kernel redact; exit 1;
           }
           find src scripts -name '*.mjs' -print0 | xargs -0 -n1 node --check
       - name: pinned payload
@@ -71,6 +72,7 @@ jobs:
         run: |
           (cd worker && go vet ./... && go test ./...)
           (cd api-kernel && go vet ./... && go test ./...)
+          (cd redact && go vet ./... && go test ./...)
       - name: web
         working-directory: web
         run: |
@@ -138,6 +140,13 @@ jobs:
                 test/unit/oauth-auth-url.test.mjs \
                 test/unit/gpt-model-policy.test.mjs \
                 test/unit/codex-image-tool.test.mjs \
+                test/unit/database.test.mjs \
+                test/unit/fork-migration-upgrade.test.mjs \
+                test/unit/request-correlation.test.mjs \
+                test/unit/gateway-retry.test.mjs \
+                test/unit/api-tool-roundtrip.test.mjs \
+                test/unit/redaction-*.test.mjs \
+                test/unit/graceful-shutdown.test.mjs \
                 test/unit/slot-browser-*.test.mjs \
                 test/unit/proxy-geo-refresh.test.mjs \
                 test/unit/proxy-timezone-api.test.mjs

@@ -29,7 +29,7 @@ docker build -t local/vm2api-slot-browser:1 docker/fork/slot-browser
 - 关闭面板画面不立即删除浏览器，最多保留 5 分钟用于重连；「停止浏览器」正常关闭 Chromium 并保存持久状态。退出 Chrome 最后一个窗口也会结束桌面。
 - 控制面/SSH 失联导致心跳超过 45 秒时，容器内独立 lease 结束桌面。关闭时优先发正常窗口关闭请求，保留 X server 到 Chromium 退出，避免 Cookie 写入丢失。崩溃/断电仍不保证最后几秒数据落盘。
 
-一个槽同一时间只有一个画面控制者。admin 与该槽属主 user 可使用；super 不可查看画面或操作。权限、会话撤销和属主变化会重新检查。ticket 30 秒内有效、单次使用、绑定槽/浏览器会话/Origin。VNC 和控制协议只监听容器 Unix socket，借 Docker exec 二进制流转发，不发布 5900、6080 或 CDP 端口。
+一个槽同一时间只有一个画面控制者。仅 admin 可使用；user 与 super 不可查看画面或操作，与上游 1.4.051 的租户凭据只读限制一致。权限、会话撤销和属主变化会重新检查。ticket 30 秒内有效、单次使用、绑定槽/浏览器会话/Origin。VNC 和控制协议只监听容器 Unix socket，借 Docker exec 二进制流转发，不发布 5900、6080 或 CDP 端口。
 
 公开控制面必须使用 HTTPS/WSS；反向代理需转发 WebSocket Upgrade，参见 `docs/nginx-shell.md`。跨源控制面使用现有 `PUBLIC_BASE_URL` / `PANEL_CORS_ORIGINS`。禁止代理 access log 记录 `/browser/socket` 的 query 参数，避免记录短期 ticket；应用不记录输入、授权码、密码或画面。
 

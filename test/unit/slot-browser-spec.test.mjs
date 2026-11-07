@@ -88,7 +88,7 @@ test('stable environment follows slot rather than operator browser, and bindings
   assert.equal(navigationUrl('https://example.com/path'), 'https://example.com/path')
 })
 
-test('browser routes are credential operations, not super read-only views', () => {
+test('browser routes are admin credential operations, not tenant or super views', () => {
   for (const [method, suffix] of [
     ['GET', ''],
     ['GET', '/callback'],
@@ -97,7 +97,7 @@ test('browser routes are credential operations, not super read-only views', () =
     ['POST', '/ticket'],
   ]) {
     const path = `/api/panel/vms/vm-a/browser${suffix}`
-    assert.equal(authorizePanelRoute(method, path, 'user').ok, true)
+    assert.equal(authorizePanelRoute(method, path, 'user').ok, false)
     assert.equal(authorizePanelRoute(method, path, 'super').ok, false)
     assert.equal(authorizePanelRoute(method, path, 'admin').ok, true)
   }

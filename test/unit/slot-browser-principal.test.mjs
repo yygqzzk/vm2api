@@ -15,7 +15,7 @@ after(() => {
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-test('browser principal rechecks logout, role, enabled flag, owner and user identity', () => {
+test('browser principal rechecks logout, role, enabled flag and user identity', () => {
   let user = { id: 'user-a', role: 'admin', enabled: true }
   const token = createPanelSession('operator', { role: 'admin' })
   const principal = browserPrincipal(
@@ -26,7 +26,7 @@ test('browser principal rechecks logout, role, enabled flag, owner and user iden
   assert.equal(principal.valid({ owner_user_id: 'user-b' }), true)
   user.role = 'user'
   assert.equal(principal.valid({ owner_user_id: 'user-b' }), false)
-  assert.equal(principal.valid({ owner_user_id: 'user-a' }), true)
+  assert.equal(principal.valid({ owner_user_id: 'user-a' }), false)
   user.role = 'super'
   assert.equal(principal.valid({ owner_user_id: 'user-a' }), false)
   user.role = 'admin'
