@@ -67,6 +67,10 @@ jobs:
       - name: native CLI packaging unit tests
         run: >-
           python3 -m unittest discover -s test/deploy -p test_native_cli.py -v
+      - name: fork cutover backup selection
+        run: >-
+          python3 -m unittest discover -s test/deploy
+          -p test_cutover_backup.py -v
       - run: npm run test:unit
       - name: go vet and test
         run: |
@@ -175,6 +179,46 @@ jobs:
             vm2api-linux-amd64.tar.gz.sha256
             browser-image.json
             control-image.json
+
+  # Publish the exact images that passed the amd64 job; production pulls
+  # by digest.
+  ghcr-push:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: fork-images-amd64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    env:
+      REVISION: ${{ github.sha }}
+      REGISTRY: ghcr.io
+      NAMESPACE: yygqzzk
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: fork-images-linux-amd64
+      - name: verify and load the tested archive
+        run: |
+          sha256sum -c vm2api-linux-amd64.tar.gz.sha256
+          gzip -t vm2api-linux-amd64.tar.gz
+          gzip -dc vm2api-linux-amd64.tar.gz | docker load
+      - name: push tested images to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login "$REGISTRY" \
+            -u "${{ github.actor }}" --password-stdin
+          control="$REGISTRY/$NAMESPACE/vm2api:fork-$REVISION"
+          browser="$REGISTRY/$NAMESPACE/vm2api-slot-browser:fork-$REVISION"
+          docker tag "local/vm2api:fork-$REVISION" "$control"
+          docker tag "local/vm2api-slot-browser:fork-$REVISION" "$browser"
+          docker push "$control"
+          docker push "$browser"
+          {
+            echo "control_digest=$(docker inspect --format \
+              '{{index .RepoDigests 0}}' "$control")"
+            echo "browser_digest=$(docker inspect --format \
+              '{{index .RepoDigests 0}}' "$browser")"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   arm64-native-cli:
     runs-on: ubuntu-24.04-arm

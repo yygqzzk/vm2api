@@ -118,6 +118,33 @@ docker run --rm --platform linux/amd64 --entrypoint node \
 首包后不能重试，以及 JSON/转换路径不受影响。
 这不是官方模型的真实测速，不消耗生产账号额度。
 
+## 标准化切换（cutover.py）
+
+`deploy/fork/cutover.py` 固化本轮验证过的切换流程：一致性备份 → 暂停调度排空 →
+仅替换控制面 → 逐项验收，失败自动回退程序（不覆盖业务数据库）。
+
+- **镜像交付**：`main` 合并后 CI 的 `ghcr-push` job 推送与 amd64 验收相同的镜像到
+  `ghcr.io/yygqzzk/vm2api:fork-<完整SHA>`（另带 slot-browser 镜像）。线上配置只读拉取凭证后按 digest 拉取，
+  不再手动下载/scp/load 离线包；离线包仍在 CI 工件里保留 7 天作兜底。
+- **瘦身备份**：只收 DB（gzip）+ `.env` + Compose 链 + config + 槽位不可再生文件
+  （凭证/指纹/settings/machine-id/kvm 身份），排除 `cli-home/.kin` 下可再生的
+  cli-node/cc-node/kin-kernel/glibc 二进制与运行时 socket。每套约 0.8G 而非 2.5G。
+- **保留策略**：成功切换后自动只保留最近 `--keep-backups`（默认 3）套 cutover 备份。
+- **排空**：面板维护 hold 接口暂停调度并等在途请求自然结束（1.4.046 起也可依赖
+  优雅停机排空；长流场景建议显式 hold）。
+
+服务器上：
+
+```bash
+cd /opt/vm2api
+python3 deploy/fork/cutover.py backup --image "ghcr.io/yygqzzk/vm2api@sha256:<digest>" --revision "<完整SHA>"
+docker pull "ghcr.io/yygqzzk/vm2api@sha256:<digest>"
+python3 deploy/fork/cutover.py deploy --image "ghcr.io/yygqzzk/vm2api@sha256:<digest>" --revision "<完整SHA>"
+```
+
+回滚脚本写在每次备份目录的 `rollback.sh`（恢复原 Compose 链，不动数据库）。
+线上 GHCR 拉取凭证用只读 PAT 配置一次：`docker login ghcr.io`。
+
 ## 准备部署到现有服务器（手动执行，非本机验证的一部分）
 
 线上现有布局不能换成仓库默认挂载：
