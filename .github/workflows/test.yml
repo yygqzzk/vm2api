@@ -206,8 +206,10 @@ jobs:
           gzip -t vm2api-linux-amd64.tar.gz
           gzip -dc vm2api-linux-amd64.tar.gz | docker load
       - name: push tested images to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login "$REGISTRY" \
+          echo "$GHCR_TOKEN" | docker login "$REGISTRY" \
             -u "${{ github.actor }}" --password-stdin
           control="$REGISTRY/$NAMESPACE/vm2api:fork-$REVISION"
           browser="$REGISTRY/$NAMESPACE/vm2api-slot-browser:fork-$REVISION"
