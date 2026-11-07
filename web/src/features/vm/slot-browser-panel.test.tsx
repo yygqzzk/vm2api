@@ -24,7 +24,7 @@ describe('slot browser entry', () => {
   })
   it('is available only to credential operators on supported runtimes', () => {
     expect(markup('admin')).toContain('打开槽位浏览器')
-    expect(markup('user')).toContain('打开槽位浏览器')
+    expect(markup('user')).not.toContain('打开槽位浏览器')
     expect(markup('super')).not.toContain('打开槽位浏览器')
     expect(markup('admin', 'kvm')).not.toContain('打开槽位浏览器')
     expect(markup('admin', 'native')).not.toContain('打开槽位浏览器')

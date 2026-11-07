@@ -55,7 +55,10 @@ test('snapshot reports the live SQLite/WAL state without exposing its path', () 
     assert.ok(snapshot.database.page_size_bytes > 0)
     assert.ok(snapshot.database.page_count > 0)
     assert.ok(snapshot.database.migration_count > 0)
-    assert.match(snapshot.database.latest_migration, /^\d+$/)
+    assert.ok(
+      db.prepare('SELECT 1 FROM schema_migrations WHERE version = ?').get(snapshot.database.latest_migration),
+      'latest migration preserves its recorded identity, including fork namespaces',
+    )
     assert.equal(snapshot.usage_cache.requests, 0)
     assert.equal(JSON.stringify(snapshot).includes(tmp), false)
     assert.equal(JSON.stringify(snapshot).includes('private-name.db'), false)

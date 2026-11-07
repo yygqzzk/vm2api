@@ -71,7 +71,7 @@ async function fixture(t, { refreshEnvironment } = {}) {
   })
   const server = http.createServer(async (req, res) => {
     req.panelUser = req.headers['x-actor'] || 'operator'
-    req.panelRole = req.headers['x-role'] || 'user'
+    req.panelRole = req.headers['x-role'] || 'admin'
     req.panelUserId = req.headers['x-owner'] || 'u-1'
     await service.handle(req, res, new URL(req.url, 'http://test'), {
       json(response, status, body) {
@@ -139,14 +139,18 @@ async function fixture(t, { refreshEnvironment } = {}) {
 
 test('ownership, credential role, origin, two-browser limit and operator exclusivity', async (t) => {
   const f = await fixture(t)
-  assert.equal((await f.call('vm-a', '/start', {}, { 'x-owner': 'u-2' })).status, 404)
+  for (const owner of ['u-1', 'u-2']) {
+    assert.equal((await f.call('vm-a', '/start', {}, { 'x-role': 'user', 'x-owner': owner })).status, 403)
+  }
+  assert.equal((await f.call('vm-missing', '/start')).status, 404)
   assert.equal((await f.call('vm-a', '/start', {}, { 'x-role': 'super' })).status, 403)
   assert.equal((await f.call('vm-a', '/start', {}, { origin: 'https://evil.example' })).status, 403)
   assert.equal((await f.call('vm-a', '/start')).status, 200)
   assert.equal((await f.call('vm-a', '/start', {}, { 'x-actor': 'second' })).status, 409)
   assert.equal((await f.call('vm-b', '/start')).status, 200)
   assert.equal((await f.call('vm-c', '/start')).status, 429)
-  assert.equal((await f.call('vm-a', '/stop', {}, { 'x-actor': 'second' })).status, 409)
+  assert.equal((await f.call('vm-a', '/ticket', {}, { 'x-actor': 'second' })).status, 409)
+  assert.equal((await f.call('vm-a', '/stop', {}, { 'x-actor': 'second' })).status, 200)
   assert.equal((await f.call('vm-a', '/stop')).status, 200)
   assert.equal((await f.call('vm-c', '/start')).status, 200)
   assert.equal(f.stopped[0][1].deleteProfile, false)
@@ -389,7 +393,7 @@ test('failed live geolocation warns without inventing a change; a new start stil
 
 test('only an administrator with explicit slot confirmation can reset browser login data', async (t) => {
   const f = await fixture(t)
-  assert.equal((await f.call('vm-a', '/reset-profile', { confirm_vm_id: 'vm-a' })).status, 403)
+  assert.equal((await f.call('vm-a', '/reset-profile', { confirm_vm_id: 'vm-a' }, { 'x-role': 'user' })).status, 403)
   assert.equal((await f.call('vm-a', '/reset-profile', { confirm_vm_id: 'vm-b' }, { 'x-role': 'admin' })).status, 400)
   assert.equal(f.stopped.length, 0)
   assert.equal((await f.call('vm-a', '/reset-profile', { confirm_vm_id: 'vm-a' }, { 'x-role': 'admin' })).status, 200)

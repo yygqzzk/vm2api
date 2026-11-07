@@ -156,10 +156,10 @@ for (const upstream of ['anthropic', 'openai']) {
         try {
           await handler.handleProtocol(req, response, protocol, pathname)
           assert.notEqual(wireName, undefined, JSON.stringify(response.body))
-          assert.equal(wireName, `mcp__${callerTool}`)
+          assert.equal(wireName, upstream === 'openai' ? callerTool : `mcp__${callerTool}`)
           const output = stream ? response.chunks.join('') : JSON.stringify(response.body)
           assert.ok(output.includes(callerTool), output)
-          assert.equal(output.includes(wireName), false, output)
+          assert.equal(output.includes(`mcp__${callerTool}`), false, output)
           if (!stream) assert.equal(response.status, 200)
         } finally {
           await new Promise((resolve) => kernel.close(resolve))
