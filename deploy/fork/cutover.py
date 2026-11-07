@@ -408,16 +408,19 @@ for (const id of IDS) {
         require(image["Config"]["Labels"].get("org.opencontainers.image.revision") == self.revision, "Candidate revision mismatch")
         candidate = self.candidate_file(folder) if self.candidate_file(folder).exists() else self.write_candidate(folder)
         self.validate_compose(folder)
-        self.hold_and_drain()
-        immediate = self.snapshot()
-        summary = self.fleet_summary(immediate)
-        require(summary["inflight"] == 0 and summary["queue_depth"] == 0, "New request arrived before replacement")
-        save(folder / "immediate-before.json", immediate)
         prefix = self.compose_prefix() + ["-f", str(candidate)]
         old_image = before["control"]["Image"]
         old_revision = before["control"]["Config"]["Labels"].get("org.opencontainers.image.revision")
         started = time.time()
+        swapped = False
+        resumed = False
+        self.hold_and_drain()
         try:
+            require(self.wait_idle(), "Requests did not go idle after the hold; nothing was replaced")
+            immediate = self.snapshot()
+            require(self.fleet_summary(immediate)["inflight"] == 0, "New request arrived before replacement")
+            save(folder / "immediate-before.json", immediate)
+            swapped = True
             with (folder / "compose-up.log").open("x") as log:
                 result = subprocess.run(prefix + ["up", "-d", "--no-deps", "--pull", "never", "vm2api"],
                                         cwd=self.root, env=self.compose_env(), stdout=log, stderr=log, timeout=180)
@@ -425,24 +428,53 @@ for (const id of IDS) {
             self.wait_health()
             self.warm_kernels(folder, before)
             save(folder / "maintenance-resumed.json", self.resume())
+            resumed = True
             result = self.verify(folder, before, self.image, self.revision)
             result.update({"deployed": True, "rollback_executed": False, "backup_dir": str(folder),
                            "seconds_to_verified": round(time.time() - started, 2)})
             save(folder / "deployment.json", result)
             print(json.dumps(result))
         except Exception as error:
+            if not swapped:
+                # Nothing was replaced: release the hold and stop. No rollback needed.
+                self._release_hold(folder)
+                raise
             with (folder / "rollback.log").open("a") as log:
                 reverted = subprocess.run([str(self.rollback_script(folder))], cwd=self.root, stdout=log, stderr=log, timeout=180)
             require(reverted.returncode == 0, "Rollback command failed; see restricted log")
             self.wait_health()
             self.warm_kernels(folder, before)
-            save(folder / "maintenance-resumed.json", self.resume())
+            self._release_hold(folder)
             result = self.verify(folder, before, old_image, old_revision)
             result.update({"deployed": False, "rollback_executed": True, "backup_dir": str(folder),
                            "failure_type": type(error).__name__, "failure": str(error)})
             save(folder / "rolled-back.json", result)
             print(json.dumps(result))
             raise SystemExit(1) from error
+        finally:
+            if not resumed:
+                # Never leave production unschedulable, whatever path we took.
+                self._release_hold(folder)
+
+    def _release_hold(self, folder):
+        try:
+            save(folder / "maintenance-resumed.json", self.resume())
+        except Exception as error:
+            print(json.dumps({"warning": "maintenance hold may still be active", "error": str(error)}))
+
+    def wait_idle(self, timeout=None):
+        """Poll the lightweight fleet listing until nothing is in flight."""
+        deadline = time.monotonic() + (timeout or self.drain_timeout)
+        while time.monotonic() < deadline:
+            listing = self.api("/api/panel/vms")
+            rows = listing if isinstance(listing, list) else listing["items"]
+            inflight = sum(row.get("inflight") or 0 for row in rows)
+            queue = {} if isinstance(listing, list) else listing.get("pool_queue") or {}
+            queued = queue.get("global_queue_depth") or 0
+            if inflight == 0 and queued == 0:
+                return True
+            time.sleep(1)
+        return False
 
     def prune_backups(self):
         dirs = sorted(self.root.glob("backups/cutover-*"), key=lambda p: p.name)
