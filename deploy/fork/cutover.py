@@ -397,8 +397,13 @@ for (const id of IDS) {
     def deploy(self, backup_dir):
         folder = Path(backup_dir)
         before = json.loads((folder / "before.json").read_text())
+        if inspect_container("vm2api")["Id"] != before["control"]["Id"]:
+            # Stale baseline (e.g. an older cutover set): take a fresh one instead
+            # of aborting, so a single deploy command stays sufficient.
+            print(json.dumps({"stale_backup": str(folder), "action": "fresh_backup"}))
+            folder = self.backup()
+            before = json.loads((folder / "before.json").read_text())
         require(json.loads((folder / "manifest.json").read_text())["database_quick_check"] == "ok", "Backup not validated")
-        require(inspect_container("vm2api")["Id"] == before["control"]["Id"], "Baseline changed since backup")
         image = self.ensure_image()
         require(image["Config"]["Labels"].get("org.opencontainers.image.revision") == self.revision, "Candidate revision mismatch")
         candidate = self.candidate_file(folder) if self.candidate_file(folder).exists() else self.write_candidate(folder)
