@@ -23,9 +23,9 @@
 
 | workflow | 文件 | 本 fork |
 | --- | --- | --- |
-| `ci` | `.github/workflows/test.yml` | 开。推 `main`、任意 PR、手动。这是门禁。 |
+| `ci` | `.github/workflows/test.yml` | 开。推 `main`、任意 PR、手动。这是门禁；`main` 合并后其中的 `ghcr-push` job 把通过 amd64 验收的镜像推到 `ghcr.io/yygqzzk`（commit tag）。 |
 | `pr-rerun` | `.github/workflows/pr-rerun.yml` | 开。`main` 的 `ci` 从失败恢复后，重跑因此失败的 PR。 |
-| `release` | `.github/workflows/release.yml` | 关。镜像按 [DEPLOY.md](DEPLOY.md) 手工构建。 |
+| `release` | `.github/workflows/release.yml` | 关。fork 发布身份由 CI 的 GHCR 推送或 [DEPLOY.md](DEPLOY.md) 的离线包承担。 |
 | `guest-images` | `.github/workflows/guest-images.yml` | 关。 |
 | `oneshot-*-226` | `.github/workflows/oneshot-*.yml` | 关。目标是作者仓库。 |
 
@@ -38,6 +38,6 @@
 
 ## 同步上游
 
-fetch 作者远程，把作者 `main` 合并进 fork `main`。保留上面的策略模块和三个接入点，保留作者 tag。合完按 [DEPLOY.md](DEPLOY.md) 跑受影响的回归。
+fetch 作者远程，把作者 `main` 合并进 fork `main`。保留上面的策略模块和三个接入点，保留作者 tag。合完按 [DEPLOY.md](DEPLOY.md) 跑受影响的回归。生产切换用 `deploy/fork/cutover.py`，流程见 DEPLOY.md「标准化切换」。
 
 完成条件：合并结果包含当时的作者 `main`，接入点还在，相关检查有本次结果。
