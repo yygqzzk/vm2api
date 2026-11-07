@@ -68,7 +68,8 @@ jobs:
         run: >-
           python3 -m unittest discover -s test/deploy -p test_native_cli.py -v
       - name: fork cutover backup selection
-        run: python3 -m unittest discover -s test/deploy \
+        run: >-
+          python3 -m unittest discover -s test/deploy
           -p test_cutover_backup.py -v
       - run: npm run test:unit
       - name: go vet and test

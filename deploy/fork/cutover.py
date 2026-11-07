@@ -263,14 +263,15 @@ class Cutover:
 
     def wait_health(self):
         deadline = time.monotonic() + 120
+        last_error = None
         while time.monotonic() < deadline:
             try:
                 if self.api("/health", timeout=5).get("status") == "ok":
                     return
-            except Exception:
-                pass  # polling: the container may still be starting
+            except Exception as error:  # container may still be starting; retry until deadline
+                last_error = error
             time.sleep(1)
-        raise RuntimeError("Control health readiness timed out")
+        raise RuntimeError(f"Control health readiness timed out (last: {last_error})")
 
     def hold_and_drain(self):
         reason = HOLD_REASON_PREFIX + self.revision[:12]
