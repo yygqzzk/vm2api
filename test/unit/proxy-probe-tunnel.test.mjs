@@ -40,11 +40,23 @@ function makePool(t) {
   return pool
 }
 
+function readConnectTarget(buf) {
+  if (buf.length < 5) return null
+  assert.ok(buf[3] === 0x01 || buf[3] === 0x03, 'expected an IPv4 or hostname CONNECT')
+  const end = buf[3] === 0x03 ? 5 + buf[4] : 8
+  if (buf.length < end + 2) return null
+  return {
+    host: buf[3] === 0x03 ? buf.subarray(5, end).toString() : [...buf.subarray(4, end)].join('.'),
+    port: buf.readUInt16BE(end),
+    length: end + 2,
+  }
+}
+
 /**
  * Minimal SOCKS5 server: `greeting` decides the method reply, `connect` the
  * CONNECT verdict. Records every CONNECT target it was asked for.
  */
-async function fakeSocks(t, { greeting = [5, 0], connect = () => CONNECT_OK, tunnel = true } = {}) {
+async function fakeSocks(t, { greeting = [5, 0], auth = [1, 0], connect = () => CONNECT_OK, tunnel = true } = {}) {
   const seen = []
   const server = net.createServer((socket) => {
     let phase = 'greeting'
@@ -69,16 +81,16 @@ async function fakeSocks(t, { greeting = [5, 0], connect = () => CONNECT_OK, tun
           const passwordLength = buf[2 + userLength]
           const need = 3 + userLength + passwordLength
           if (buf.length < need) return
-          socket.write(Buffer.from([1, 0]))
+          socket.write(Buffer.from(auth))
           buf = buf.subarray(need)
           phase = 'request'
           continue
         }
         if (phase === 'request') {
-          if (buf.length < 10) return
-          const host = [...buf.subarray(4, 8)].join('.')
-          const port = (buf[8] << 8) | buf[9]
-          buf = buf.subarray(10)
+          const target = readConnectTarget(buf)
+          if (!target) return
+          const { host, port } = target
+          buf = buf.subarray(target.length)
           seen.push(`${host}:${port}`)
           const reply = connect(host, port)
           socket.write(reply)
@@ -120,7 +132,7 @@ async function fakeSocks(t, { greeting = [5, 0], connect = () => CONNECT_OK, tun
  * enough for a forwarder: the client only becomes healthy after this bridge
  * carries the TLS handshake through to the local TLS server.
  */
-async function fakeTlsSocks(t) {
+async function fakeTlsSocks(t, { domainOnly = false } = {}) {
   const seen = []
   const tlsServer = tls.createServer(
     {
@@ -150,12 +162,12 @@ async function fakeTlsSocks(t) {
           continue
         }
         if (phase === 'request') {
-          if (buf.length < 10) return
-          const host = [...buf.subarray(4, 8)].join('.')
-          const port = (buf[8] << 8) | buf[9]
-          buf = buf.subarray(10)
+          const target = readConnectTarget(buf)
+          if (!target) return
+          const { host, port } = target
+          buf = buf.subarray(target.length)
           seen.push(`${host}:${port}`)
-          if (port !== 443) {
+          if (port !== 443 || (domainOnly && net.isIP(host))) {
             socket.write(CONNECT_REFUSED)
             socket.end()
             return
@@ -275,6 +287,75 @@ test('0xff is an auth mismatch, not health', async (t) => {
   assert.equal(probe.ok, false)
   assert.match(String(probe.error), /proxy_auth_unsupported/)
   assert.equal(pool.state.proxies[0].status, 'fail')
+  assert.deepEqual(socks.seen, [])
+})
+
+test('domain-forward IPv6-only exits use hostname TLS probes and recover from a false dead state', async (t) => {
+  const pool = makePool(t)
+  const socks = await fakeTlsSocks(t, { domainOnly: true })
+  const {
+    items: [proxy],
+  } = pool.importLines(`socks5h://127.0.0.1:${socks.port}`)
+  pool.update(proxy.id, { domain_forward: true })
+  Object.assign(pool.state.proxies[0], {
+    enabled: false,
+    status: 'dead',
+    last_error: 'connection_closed',
+    consecutive_failures: 3,
+  })
+
+  const { probe, proxy: recovered } = await pool.probeById(proxy.id)
+
+  assert.equal(probe.ok, true)
+  assert.deepEqual(socks.seen, ['one.one.one.one:443'])
+  assert.equal(recovered.enabled, true)
+  assert.equal(recovered.status, 'ok')
+  assert.equal(recovered.consecutive_failures, 0)
+  assert.equal(recovered.last_error, null)
+})
+
+test('domain-forward exits use a hostname DNS fallback after TLS fails', async (t) => {
+  const pool = makePool(t)
+  const socks = await fakeSocks(t, { connect: (host) => (net.isIP(host) ? CONNECT_REFUSED : CONNECT_OK) })
+  const {
+    items: [proxy],
+  } = pool.importLines(`socks5h://127.0.0.1:${socks.port}`)
+  pool.update(proxy.id, { domain_forward: true })
+
+  const { probe } = await pool.probeById(proxy.id)
+
+  assert.equal(probe.ok, true)
+  assert.deepEqual(socks.seen, ['one.one.one.one:443', 'dns.google:53'])
+})
+
+test('domain-forward CONNECT without application data is not health', async (t) => {
+  const pool = makePool(t)
+  pool.updateConfig({ probe_timeout_ms: 1000 })
+  const socks = await fakeSocks(t, { tunnel: false })
+  const {
+    items: [proxy],
+  } = pool.importLines(`socks5h://127.0.0.1:${socks.port}`)
+  pool.update(proxy.id, { domain_forward: true })
+
+  const { probe } = await pool.probeById(proxy.id)
+
+  assert.equal(probe.ok, false)
+  assert.match(String(probe.error), /egress_(tls|dns)_timeout/)
+  assert.deepEqual(socks.seen, ['one.one.one.one:443', 'dns.google:53'])
+})
+
+test('domain-forward auth failures do not try alternate destinations', async (t) => {
+  const pool = makePool(t)
+  const socks = await fakeSocks(t, { greeting: [5, 2], auth: [1, 1] })
+  const {
+    items: [proxy],
+  } = pool.importLines(`socks5h://kin:wrong@127.0.0.1:${socks.port}`)
+  pool.update(proxy.id, { domain_forward: true })
+
+  const { probe } = await pool.probeById(proxy.id)
+
+  assert.equal(probe.ok, false)
+  assert.match(String(probe.error), /proxy_auth_failed/)
   assert.deepEqual(socks.seen, [])
 })
 
