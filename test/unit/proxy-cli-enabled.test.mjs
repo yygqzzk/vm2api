@@ -72,6 +72,23 @@ test('bindVmProxy turns proxy_cli_enabled on, unbind turns it off', () => {
   }
 })
 
+test('bindVmProxy keeps hostname forwarding across reloads without changing slot identity', () => {
+  const root = tmpRoot()
+  try {
+    const identity = { hostname: 'workstation-1', device_id: 'fixed-device', timezone: 'America/Los_Angeles' }
+    writeVm(root, boundSlot({ fingerprint: identity, locale: 'en_US.UTF-8' }))
+    for (const domain_forward of [true, false]) {
+      bindVmProxy(root, 'vm-01', { ...SOCKS, domain_forward })
+      const saved = getVm(root, 'vm-01')
+      assert.equal(saved.proxy.domain_forward, domain_forward)
+      assert.deepEqual(saved.fingerprint, identity)
+      assert.equal(saved.locale, 'en_US.UTF-8')
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('rebind of the same exit heals a stale false flag', () => {
   const root = tmpRoot()
   try {
