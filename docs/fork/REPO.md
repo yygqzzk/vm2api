@@ -1,6 +1,6 @@
 # Fork 仓库
 
-本文件是 `yygqzzk/vm2api` 的仓库地图。构建和上线步骤在 [DEPLOY.md](DEPLOY.md)。一次验收的记录在 [VALIDATION.md](VALIDATION.md)，对不上本次提交的记录不算本次通过。
+本文件是 `yygqzzk/vm2api` 的仓库地图。构建和上线步骤在 [DEPLOY.md](DEPLOY.md)。一次验收的记录在 [VALIDATION.md](VALIDATION.md)，对不上本次提交的记录不算本次通过。代理配置契约、生产基线与恢复检查见 [PROXIES.md](PROXIES.md)。
 
 ## 身份
 

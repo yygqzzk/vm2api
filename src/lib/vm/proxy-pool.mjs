@@ -60,11 +60,18 @@ const DEFAULT_CONFIG = {
  * the node behind it is only as alive as an application reply through it.
  * Require a real TLS handshake first, then retry with framed DNS over TCP for
  * exits that block TLS or 1.1.1.1. SOCKS CONNECT alone is not enough because
- * sing-box's mixed inbound uses a lazy upstream connection.
+ * sing-box's mixed inbound uses a lazy upstream connection. Hostname mode uses
+ * dual-stack names so IPv6-only exits are not forced to dial IPv4 literals.
  */
 const FORWARDER_CONNECT_TARGETS = Object.freeze([
-  Object.freeze({ host: '1.1.1.1', port: 443, kind: 'tls', servername: 'one.one.one.one' }),
-  Object.freeze({ host: '8.8.8.8', port: 53, kind: 'dns' }),
+  Object.freeze({
+    host: '1.1.1.1',
+    hostname: 'one.one.one.one',
+    port: 443,
+    kind: 'tls',
+    servername: 'one.one.one.one',
+  }),
+  Object.freeze({ host: '8.8.8.8', hostname: 'dns.google', port: 53, kind: 'dns' }),
 ])
 
 function forwarderDnsQuery() {
@@ -1229,8 +1236,10 @@ export class ProxyPool extends EventEmitter {
         phase = 'connect'
         const port = Buffer.alloc(2)
         port.writeUInt16BE(target.port)
-        const ip = Buffer.from(target.host.split('.').map((n) => Number(n) & 0xff))
-        socket.write(Buffer.concat([Buffer.from([0x05, 0x01, 0x00, 0x01]), ip, port]))
+        const address = proxy.domain_forward
+          ? Buffer.concat([Buffer.from([0x03, target.hostname.length]), Buffer.from(target.hostname)])
+          : Buffer.from([0x01, ...target.host.split('.').map(Number)])
+        socket.write(Buffer.concat([Buffer.from([0x05, 0x01, 0x00]), address, port]))
       }
       const startDnsProbe = () => {
         phase = 'dns'
