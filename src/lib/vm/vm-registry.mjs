@@ -725,6 +725,7 @@ export function bindVmProxy(projectRoot, id, proxyInfo) {
         url: proxyInfo.url || null,
         username: proxyInfo.username || null,
         password: proxyInfo.password == null ? null : proxyInfo.password,
+        domain_forward: proxyInfo.domain_forward === true,
       }
     : null
   // Eligibility (`slotHasBoundProxy`) and CLI egress both require this flag.

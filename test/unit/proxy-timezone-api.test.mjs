@@ -118,6 +118,27 @@ test('renaming a proxy leaves browser sessions and geography alone', async (t) =
   assert.equal(f.pool.proxyTimezone(f.id), 'Asia/Hong_Kong')
 })
 
+test('hostname forwarding edits persist to bound slots for their next runtime reload', async (t) => {
+  const previous = process.env.KIN_CRS_MOCK
+  process.env.KIN_CRS_MOCK = '1'
+  t.after(() => {
+    if (previous === undefined) delete process.env.KIN_CRS_MOCK
+    else process.env.KIN_CRS_MOCK = previous
+  })
+  const f = fixture(t)
+  for (const domain_forward of [true, false]) {
+    const result = await f.call('PUT', f.id, { domain_forward })
+    assert.equal(result.status, 200)
+    assert.deepEqual(result.body.data.workers, [])
+    for (const id of ['vm-a', 'vm-b', 'vm-manual']) {
+      assert.equal(getVm(f.root, id).proxy.domain_forward, domain_forward)
+      assert.equal(getVm(f.root, id).timezone, 'Asia/Hong_Kong')
+      assert.equal(getVm(f.root, id).locale, 'en_US.UTF-8')
+    }
+    assert.notEqual(getVm(f.root, 'vm-other').proxy.id, f.id)
+  }
+})
+
 test('failed geography after a proxy edit is reported, with old slot timezone unchanged', async (t) => {
   const f = fixture(t)
   f.setGeo({ ok: false, error: 'geo_http_429' })

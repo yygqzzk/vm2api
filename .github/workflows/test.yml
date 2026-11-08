@@ -156,6 +156,7 @@ jobs:
                 test/unit/proxy-geo-refresh.test.mjs \
                 test/unit/proxy-probe-tunnel.test.mjs \
                 test/unit/proxy-ipv6.test.mjs \
+                test/unit/proxy-cli-enabled.test.mjs \
                 test/unit/proxy-timezone-api.test.mjs
             '
       - name: isolated panel and bundled kernel startup

@@ -6069,6 +6069,11 @@ export function createPanelHandler(ctx) {
         if (result.connection_changed || result.domain_forward_changed) {
           await ctx.slotBrowser?.beforeProxyMutation(req, { proxyId: id })
         }
+        if (result.domain_forward_changed && !result.connection_changed) {
+          for (const vmId of result.proxy.bound_vm_ids || []) {
+            bindVmProxy(cfg.paths.project, vmId, proxyPool.getProxyByIdWithAuth(id))
+          }
+        }
         // Hostname mode and SOCKS upstream both live inside kin-egress.
         // Domain-forward-only: restart the helper; slots keep the same bridge.
         // Same-id connection change: network name is unchanged so reload would
