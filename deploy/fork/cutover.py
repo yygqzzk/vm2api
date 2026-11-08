@@ -179,7 +179,8 @@ class Cutover:
         paths.extend(f for f in self.protected_vm_files())
         with sqlite3.connect("file:" + str(self.mounts["/opt/vm2api/data"] / "kin.db") + "?mode=ro", uri=True) as db:
             database = db_state(db)
-        return {"control": self.control, "slots": slots, "files": {str(f): file_hash(f) for f in paths}, "database": database}
+        control = inspect_container(self.control["Name"].lstrip("/"))
+        return {"control": control, "slots": slots, "files": {str(f): file_hash(f) for f in paths}, "database": database}
 
     def protected_vm_files(self):
         yield from protected_vm_files(self.vmroot)
@@ -351,14 +352,15 @@ for (const id of IDS) {
     def verify(self, folder, before, target_image, revision):
         after = self.snapshot()
         save(folder / ("after-" + revision[:12] + ".json"), after)
-        require(after["control"]["Image"] == target_image, "Wrong running image")
+        image = json.loads(output(["docker", "image", "inspect", target_image]))[0]
+        require(after["control"]["Image"] == image["Id"], "Wrong running image")
         require(after["control"]["Config"]["Labels"].get("org.opencontainers.image.revision") == revision, "Wrong running revision")
 
         def mount_signature(control):
             return sorted((m["Type"], m["Source"], m["Destination"], m["RW"]) for m in control["Mounts"])
 
         require(mount_signature(after["control"]) == mount_signature(before["control"]), "Control mounts changed")
-        expected_env = dict(item.split("=", 1) for item in json.loads(output(["docker", "image", "inspect", target_image]))[0]["Config"]["Env"] if "=" in item)
+        expected_env = dict(item.split("=", 1) for item in image["Config"]["Env"] if "=" in item)
         expected_env.update(json.loads((folder / "compose-environment.json").read_text()))
         actual_env = dict(item.split("=", 1) for item in after["control"]["Config"]["Env"] if "=" in item)
         require(actual_env == expected_env, "Effective container environment differs from Compose and image")
@@ -380,7 +382,7 @@ for (const id of IDS) {
                 additions[table] = added
         with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/cc", timeout=15) as response:
             require(response.status == 200 and b"<!doctype html>" in response.read().lower(), "Web console probe failed")
-        return {"passed": True, "revision": revision, "image_id": target_image,
+        return {"passed": True, "revision": revision, "image_id": image["Id"],
                 "mounts_and_compose_environment_preserved": True, "protected_configuration_preserved": True,
                 "account_identity_and_fingerprints_preserved": True, "slot_containers_unchanged": True,
                 "protected_rows_unchanged": True, "business_additions_during_window": additions,
@@ -407,7 +409,7 @@ for (const id of IDS) {
         image = self.ensure_image()
         require(image["Config"]["Labels"].get("org.opencontainers.image.revision") == self.revision, "Candidate revision mismatch")
         candidate = self.candidate_file(folder) if self.candidate_file(folder).exists() else self.write_candidate(folder)
-        self.validate_compose(folder)
+        save(folder / "compose-environment.json", self.validate_compose(folder))
         prefix = self.compose_prefix() + ["-f", str(candidate)]
         old_image = before["control"]["Image"]
         old_revision = before["control"]["Config"]["Labels"].get("org.opencontainers.image.revision")
