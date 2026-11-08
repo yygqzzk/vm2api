@@ -1,7 +1,10 @@
+import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "deploy" / "fork"))
 import cutover  # noqa: E402
@@ -37,6 +40,101 @@ class ProtectedVmFiles(unittest.TestCase):
                 target.write_text("x")
             selected = {p.relative_to(vmroot).as_posix() for p in cutover.protected_vm_files(vmroot)}
             self.assertEqual(selected, set(keep), f"unexpected selection: {sorted(selected)}")
+
+
+class CutoverVerification(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.before = {
+            "control": {"Id": "old-control", "Name": "/vm2api", "Image": "sha256:old",
+                        "Mounts": [], "Config": {"Labels": {"org.opencontainers.image.revision": "old-revision"},
+                                                 "Env": ["BASE=1", "EXTRA=production"]}},
+            "slots": {}, "files": {}, "database": {"protected": {}},
+        }
+        self.live = {
+            **self.before["control"], "Id": "new-control", "Image": "sha256:new",
+            "Config": {"Labels": {"org.opencontainers.image.revision": "new-revision"},
+                       "Env": ["BASE=1", "EXTRA=production"]},
+        }
+        self.image = {"Id": "sha256:new", "Config": {"Env": ["BASE=1"]}}
+        self.cutover = cutover.Cutover.__new__(cutover.Cutover)
+        self.cutover.root = self.root
+        self.cutover.control = self.before["control"]
+        self.cutover.port = "8787"
+        self.cutover.image = "registry.example/vm2api@sha256:manifest"
+        self.cutover.revision = "new-revision"
+        cutover.save(self.root / "before.json", self.before)
+        cutover.save(self.root / "database.json", self.before["database"])
+        cutover.save(self.root / "manifest.json", {"database_quick_check": "ok"})
+        cutover.save(self.root / "compose-environment.json", {"EXTRA": "production"})
+
+    def test_snapshot_refreshes_control_without_replacing_the_rollback_baseline(self):
+        self.cutover.api = Mock(return_value=[])
+        self.cutover.compose_files = []
+        self.cutover.vmroot = self.root / "vms"
+        self.cutover.mounts = {"/opt/vm2api/src/config": self.root / "config", "/opt/vm2api/data": self.root}
+        (self.root / ".env").write_text("EXTRA=production\n")
+        (self.root / "kin.db").touch()
+        rolled_back = {**self.before["control"], "Id": "rollback-control"}
+        with patch.object(cutover, "inspect_container", side_effect=[self.live, rolled_back]) as inspect, \
+             patch.object(cutover, "db_state", return_value=self.before["database"]):
+            self.assertEqual(self.cutover.snapshot()["control"], self.live)
+            self.assertEqual(self.cutover.snapshot()["control"], rolled_back)
+        self.assertEqual(inspect.call_args_list, [unittest.mock.call("vm2api"), unittest.mock.call("vm2api")])
+        self.assertIs(self.cutover.control, self.before["control"])
+
+    def verify(self, live, reference="registry.example/vm2api@sha256:manifest"):
+        self.cutover.snapshot = Mock(return_value={**self.before, "control": live})
+        with patch.object(cutover, "output", return_value=json.dumps([self.image])), \
+             patch.object(cutover.urllib.request, "urlopen") as urlopen:
+            response = urlopen.return_value.__enter__.return_value
+            response.status = 200
+            response.read.return_value = b"<!doctype html><html></html>"
+            return self.cutover.verify(self.root, self.before, reference, "new-revision")
+
+    def test_verify_resolves_digest_tag_and_id_to_the_expected_image(self):
+        for reference in ("registry.example/vm2api@sha256:manifest", "local/vm2api:fork-revision", "sha256:new"):
+            with self.subTest(reference=reference):
+                result = self.verify(self.live, reference)
+                self.assertTrue(result["passed"])
+                self.assertEqual(result["image_id"], "sha256:new")
+
+    def test_verify_still_rejects_wrong_images_revisions_mounts_and_environment(self):
+        cases = [
+            ({**self.live, "Image": "sha256:other"}, "Wrong running image"),
+            ({**self.live, "Config": {**self.live["Config"], "Labels": {"org.opencontainers.image.revision": "wrong"}}}, "Wrong running revision"),
+            ({**self.live, "Mounts": [{"Type": "bind", "Source": "/other", "Destination": "/data", "RW": True}]}, "Control mounts changed"),
+            ({**self.live, "Config": {**self.live["Config"], "Env": ["BASE=1"]}}, "Effective container environment"),
+        ]
+        for live, error in cases:
+            with self.subTest(error=error), self.assertRaisesRegex(RuntimeError, error):
+                self.verify(live)
+
+    def test_deploy_persists_compose_environment_before_replacement(self):
+        c = self.cutover
+        c.ensure_image = Mock(return_value={**self.image, "Config": {**self.image["Config"], "Labels": {"org.opencontainers.image.revision": c.revision}}})
+        c.validate_compose = Mock(return_value={"EXTRA": "production"})
+        c.compose_prefix = Mock(return_value=["docker", "compose"])
+        c.compose_env = Mock(return_value={})
+        c.hold_and_drain = Mock()
+        c.wait_idle = Mock(return_value=True)
+        c.snapshot = Mock(return_value=self.before)
+        c.wait_health = Mock()
+        c.warm_kernels = Mock()
+        c.resume = Mock(return_value={"ok": True})
+        c.verify = Mock(return_value={"passed": True})
+        cutover.save(self.root / "compose-environment.json", {})
+        with patch.object(cutover, "inspect_container", return_value=self.before["control"]), \
+             patch.object(cutover.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run:
+            def replace(*args, **kwargs):
+                self.assertEqual(json.loads((self.root / "compose-environment.json").read_text()), {"EXTRA": "production"})
+                return SimpleNamespace(returncode=0)
+            run.side_effect = replace
+            c.deploy(self.root)
+        self.assertTrue(json.loads((self.root / "deployment.json").read_text())["deployed"])
+        c.verify.assert_called_once_with(self.root, self.before, c.image, c.revision)
 
 
 if __name__ == "__main__":
