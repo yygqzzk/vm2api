@@ -141,6 +141,8 @@ jobs:
           cache: npm
           cache-dependency-path: package-lock.json
       - run: npm ci
+      - name: pinned unit-test payload
+        run: node scripts/fetch-payload.mjs
       - run: npm run test:unit
 
   ci-go:
