@@ -381,6 +381,50 @@ test('reload writes transparent egress for local exit without a SOCKS url', asyn
   fs.rmSync(root, { recursive: true, force: true })
 })
 
+for (const running of [true, false]) {
+  test(`slot ${running ? 'restart' : 'start'} keeps peer health timers responsive and reports Docker errors`, async (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-reload-async-'))
+    const previousPath = process.env.PATH
+    t.after(() => {
+      process.env.PATH = previousPath
+      fs.rmSync(root, { recursive: true, force: true })
+    })
+    const marker = path.join(root, 'failed')
+    fs.writeFileSync(
+      path.join(root, 'docker'),
+      `#!${process.execPath}
+const fs = require('node:fs')
+if (process.argv[2] === 'inspect') {
+  console.log('${running}|123|bridge|2026-11-11|test-image|test-host|docker|codex|false|no|[]|true')
+} else if (process.argv[2] === '${running ? 'restart' : 'start'}') {
+  setTimeout(() => {
+    if (fs.existsSync(${JSON.stringify(marker)})) {
+      console.error('restart rejected')
+      process.exit(1)
+    }
+  }, 300)
+} else process.exit(2)
+`,
+      { mode: 0o755 },
+    )
+    process.env.PATH = `${root}${path.delimiter}${previousPath}`
+    const vm = { id: 'vm-async', platform: 'openai', proxy_required: false }
+    for (const fail of [false, true]) {
+      if (fail) fs.writeFileSync(marker, '')
+      let responsive = false
+      const timer = setTimeout(() => {
+        responsive = true
+      }, 50)
+      const result = await reloadSlotWorker(vm, root, { routing: {} })
+      clearTimeout(timer)
+      assert.equal(responsive, true, 'a peer kernel health check must run while Docker is stopping a container')
+      assert.equal(result.ok, !fail)
+      if (fail) assert.match(result.error, /restart rejected/)
+      else assert.equal(result.action, running ? 'reloaded' : 'started')
+    }
+  })
+}
+
 test('IPv6 address spelling does not desynchronize a slot, a changed endpoint does', (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-ipv6-sync-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
