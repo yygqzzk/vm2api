@@ -39,6 +39,7 @@ function isCatalogModelId(id) {
 const SETTINGS_KEY = 'model_policy'
 const CONTEXT_1M = CONTEXT_1M_BETA
 const FABLE_51_ID = 'claude-fable-5-1'
+const FABLE_52_ID = 'claude-fable-5-2'
 const FABLE_51_LEGACY_ID = 'claude-fable-5.1'
 const OPUS_55_ID = 'claude-opus-5-5'
 const OPUS_55_LEGACY_ID = 'claude-opus-5.5'
@@ -378,6 +379,22 @@ export function seedDefaultPolicy() {
     aliases: [FABLE_51_LEGACY_ID],
   })
 
+  add(FABLE_52_ID, {
+    display_name: 'Fable 5.2',
+    family: 'fable',
+    sort: 42,
+    capabilities: CAP_ADAPTIVE_ONLY,
+    betas: { pass_context_1m: false },
+    params: {
+      max_tokens_default: 128000,
+      max_tokens_cap: 128000,
+      on_adaptive: 'passthrough',
+      on_enabled: 'passthrough',
+      default_effort: 'medium',
+    },
+    aliases: ['claude-fable-5.2'],
+  })
+
   add('auto', {
     display_name: 'Auto',
     family: 'auto',
@@ -415,6 +432,7 @@ export function seedDefaultPolicy() {
       'claude-3-5-haiku': 'claude-haiku-4-5-20251001',
       'claude-3-5-haiku-latest': 'claude-haiku-4-5-20251001',
       fable: 'claude-fable-5',
+      'claude-fable-5.2': FABLE_52_ID,
       [FABLE_51_LEGACY_ID]: FABLE_51_ID,
       [OPUS_55_LEGACY_ID]: OPUS_55_ID,
     },
@@ -731,8 +749,41 @@ export function getCapabilities(modelId = '') {
   return getModelEntry(modelId).capabilities
 }
 
-export function getBetaPolicy(modelId = '') {
-  return getModelEntry(modelId).betas
+/**
+ * Preset capability boundary for one model. CRAG's official CLI table is not
+ * this matrix: the pre-clean stage hands the entry across, and CRAG applies it.
+ */
+export function modelDirectiveForCrag(modelId = '') {
+  const entry = getModelEntry(modelId)
+  const caps = entry.capabilities || {}
+  const params = entry.params || {}
+  const positive = (value) => {
+    const n = Number(value)
+    return Number.isSafeInteger(n) && n > 0 ? n : 0
+  }
+  const drop = Array.isArray(entry.betas?.drop)
+    ? entry.betas.drop.map((beta) => String(beta || '')).filter(Boolean)
+    : []
+  return {
+    id: entry.id || String(modelId || ''),
+    capabilities: {
+      thinking_mode: String(caps.thinking_mode || ''),
+      supports_adaptive: caps.supports_adaptive === true,
+      supports_effort: caps.supports_effort === true,
+      supports_context_management: caps.supports_context_management === true,
+      supports_1m: caps.supports_1m === true,
+      supports_interleaved: caps.supports_interleaved === true,
+    },
+    params: {
+      max_tokens_default: positive(params.max_tokens_default),
+      max_tokens_cap: positive(params.max_tokens_cap),
+      thinking_fallback_budget: positive(params.thinking_fallback_budget),
+      on_adaptive: String(params.on_adaptive || ''),
+      on_enabled: String(params.on_enabled || ''),
+      ...(params.default_effort ? { default_effort: String(params.default_effort) } : {}),
+    },
+    betas: { drop },
+  }
 }
 
 export function getContext1mWhitelist() {

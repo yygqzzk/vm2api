@@ -33,7 +33,6 @@ import { PageHeader } from '@/components/page-header'
 import { QueryGate } from '@/components/query-gate'
 import { meQueryOptions } from '@/features/auth/queries'
 import { dashboardQueryOptions } from '@/features/overview/queries'
-import { isRemoteVm } from '@/features/vm/placement'
 import { KernelLicenseDialog } from './license-dialog'
 import {
   installKernelTargets,
@@ -117,7 +116,11 @@ export function WrapSamplePage() {
     },
   })
   const busy = installing || pull.isPending
-  const allTargets = rows.map(({ vm, kernel }) => ({ id: vm.id, kernel }))
+  const eligible = rows.filter(({ vm }) => vm.node_platform !== 'darwin')
+  const allTargets = eligible.map(({ vm, kernel }) => ({ id: vm.id, kernel }))
+  function slotTargets(kernel: KernelId) {
+    return eligible.map(({ vm }) => ({ id: vm.id, kernel }))
+  }
   const failedCount = job
     ? Object.values(job.results).filter((item) => !item.ok).length
     : 0
@@ -139,17 +142,12 @@ export function WrapSamplePage() {
       toast.error(`请先下载 ${KERNEL_NAMES[missingPackage.kernel]} 安装包`)
       return
     }
-    const unsupported = targets.find((target) => {
-      const vm = vmById.get(target.id)
-      return (
-        target.kernel === 'crag' &&
-        vm &&
-        (isRemoteVm(vm) || vm.runtime_type === 'kvm')
-      )
-    })
-    if (unsupported) {
+    const mac = targets.find(
+      (target) => vmById.get(target.id)?.node_platform === 'darwin'
+    )
+    if (mac) {
       toast.error(
-        `${vmById.get(unsupported.id)?.name || unsupported.id} 仅能安装默认内核`
+        `${vmById.get(mac.id)?.name || mac.id} 是 macOS 原生节点，不能在内核页重装`
       )
       return
     }
@@ -194,8 +192,8 @@ export function WrapSamplePage() {
             stopped: false,
             error: '未收到该 VM 的安装结果',
           }
-          if (result.ok && !result.stopped)
-            result = { ...result, ok: false, error: '服务未确认关闭' }
+          if (result.ok && result.restarted !== true)
+            result = { ...result, ok: false, error: '服务未确认重启完成' }
         } catch (error) {
           const data = isApiError(error)
             ? (error.data as { items?: KernelInstallItem[] } | undefined)
@@ -228,7 +226,7 @@ export function WrapSamplePage() {
         toast.error(
           `${targets.length - failures}/${targets.length} 台安装成功，请检查失败项`
         )
-      else toast.success(`${targets.length} 台内核已安装，服务保持关闭`)
+      else toast.success(`${targets.length} 台内核已安装并重启，调度状态已更新`)
     } finally {
       setJob((previous) =>
         previous ? { ...previous, activeId: null } : previous
@@ -341,17 +339,30 @@ export function WrapSamplePage() {
                     </p>
                   ) : null}
                 </div>
-                <Button
-                  variant='outline'
-                  className='h-11'
-                  aria-label={`拉取 ${KERNEL_NAMES[product.id]} 最新二进制`}
-                  disabled={!canEdit || busy}
-                  loading={pull.isPending && pull.variables === product.id}
-                  onClick={() => pull.mutate(product.id)}
-                >
-                  <Download aria-hidden='true' />
-                  拉取最新
-                </Button>
+                <div className='flex flex-wrap gap-2'>
+                  <Button
+                    variant='outline'
+                    className='h-11'
+                    aria-label={`拉取 ${KERNEL_NAMES[product.id]} 最新二进制`}
+                    disabled={!canEdit || busy}
+                    loading={pull.isPending && pull.variables === product.id}
+                    onClick={() => pull.mutate(product.id)}
+                  >
+                    <Download aria-hidden='true' />
+                    拉取最新
+                  </Button>
+                  <Button
+                    variant='outline'
+                    className='h-11'
+                    aria-label={`把 ${KERNEL_NAMES[product.id]} 更新到全部槽位`}
+                    disabled={
+                      !canEdit || busy || !product.ready || !eligible.length
+                    }
+                    onClick={() => requestInstall(slotTargets(product.id))}
+                  >
+                    更新全部槽位
+                  </Button>
+                </div>
               </div>
             ))}
           </section>
@@ -363,7 +374,7 @@ export function WrapSamplePage() {
                   VM 安装
                 </h3>
                 <p className='mt-1 text-base text-muted-foreground sm:text-sm'>
-                  按所选内核重装，完成后保持停用。
+                  按所选内核重装并重启，完成后恢复调度状态。
                 </p>
               </div>
               <Button
@@ -374,7 +385,7 @@ export function WrapSamplePage() {
                 onClick={() => requestInstall(allTargets)}
               >
                 <Power aria-hidden='true' />
-                全部重装并停用{rows.length ? ` · ${rows.length} 台` : ''}
+                全部重装并重启{rows.length ? ` · ${rows.length} 台` : ''}
               </Button>
             </div>
 
@@ -456,8 +467,7 @@ export function WrapSamplePage() {
                     const installed = catalog.data?.installations?.[vm.id]
                     const result = job?.results[vm.id]
                     const active = installing && job?.activeId === vm.id
-                    const nativeUnsupported =
-                      isRemoteVm(vm) || vm.runtime_type === 'kvm'
+                    const macNative = vm.node_platform === 'darwin'
                     const currentKernel =
                       vm.resolved_dataplane === 'crag' &&
                       vm.resolved_crag_kernel_version === 'v2'
@@ -490,11 +500,13 @@ export function WrapSamplePage() {
                               )}
                               aria-hidden='true'
                             />
-                            {result?.stopped
-                              ? '已停用'
-                              : VM_STATUS[vm.status || 'unknown'] ||
-                                vm.status ||
-                                '未知'}
+                            {result?.restarted
+                              ? '运行中'
+                              : result?.stopped
+                                ? '已停用'
+                                : VM_STATUS[vm.status || 'unknown'] ||
+                                  vm.status ||
+                                  '未知'}
                             {installed?.version &&
                             installed.kernel === currentKernel ? (
                               <span>{installed.version}</span>
@@ -520,7 +532,7 @@ export function WrapSamplePage() {
                               )}
                               <span>
                                 {result.ok
-                                  ? '安装完成，服务已停用'
+                                  ? `重启完成${result.schedulable ? '，已恢复调度' : '，原调度限制保留'}`
                                   : `${result.error || '安装失败'}${result.stopped ? '；服务已停用' : ''}`}
                               </span>
                             </p>
@@ -551,10 +563,7 @@ export function WrapSamplePage() {
                               <SelectItem value='cli-node'>
                                 cli-node · 默认
                               </SelectItem>
-                              <SelectItem
-                                value='crag'
-                                disabled={nativeUnsupported}
-                              >
+                              <SelectItem value='crag' disabled={macNative}>
                                 CRAG · 付费
                               </SelectItem>
                             </SelectContent>
@@ -579,8 +588,8 @@ export function WrapSamplePage() {
                                       : 'text-destructive'
                                   }
                                 >
-                                  {nativeUnsupported
-                                    ? '仅支持本地 Docker'
+                                  {macNative
+                                    ? 'macOS 原生节点不支持'
                                     : license
                                       ? LICENSE_LABELS[license.status]
                                       : '状态未知'}
@@ -597,7 +606,7 @@ export function WrapSamplePage() {
                               <Button
                                 variant='ghost'
                                 className='h-11'
-                                disabled={!canEdit || busy || nativeUnsupported}
+                                disabled={!canEdit || busy || macNative}
                                 onClick={() => setLicenseVm(vm)}
                                 aria-label={`管理 ${vm.name || vm.id} CRAG 授权`}
                               >
@@ -618,13 +627,9 @@ export function WrapSamplePage() {
                           <Button
                             variant='outline'
                             className='h-11 w-full sm:w-auto'
-                            disabled={
-                              !canEdit ||
-                              busy ||
-                              (kernel === 'crag' && nativeUnsupported)
-                            }
+                            disabled={!canEdit || busy || macNative}
                             loading={active}
-                            aria-label={`${changed ? '安装' : '重装'} ${vm.name || vm.id} 并停用`}
+                            aria-label={`${changed ? '安装' : '重装'} ${vm.name || vm.id} 并重启`}
                             onClick={() =>
                               requestInstall([{ id: vm.id, kernel }])
                             }
@@ -654,11 +659,11 @@ export function WrapSamplePage() {
         }}
         title={
           confirm?.length === 1
-            ? `重装 ${vmById.get(confirm[0].id)?.name || confirm[0].id} 并停用？`
-            : `重装全部 ${confirm?.length || 0} 台 VM 并停用？`
+            ? `重装 ${vmById.get(confirm[0].id)?.name || confirm[0].id} 并重启？`
+            : `重装全部 ${confirm?.length || 0} 台 VM 并重启？`
         }
-        desc='按所选内核安装，完成后服务保持关闭。凭据、授权和工作数据保留。'
-        confirmText='重装并停用'
+        desc='按所选内核安装并重启，健康检查完成后恢复调度；手动关闭和凭证限制保留。凭据、授权和工作数据不变。'
+        confirmText='重装并重启'
         cancelBtnText='取消'
         disabled={missingLicenses.length > 0}
         destructive

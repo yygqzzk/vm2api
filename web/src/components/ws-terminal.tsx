@@ -22,12 +22,14 @@ import { Button } from '@/components/ui/button'
 
 type Phase = 'connecting' | 'open' | 'closed'
 
-/** 面板侧快捷指令：不进 shell，结果逐行写进终端。 */
+/** 快捷指令可调用面板接口，或在空提示符发送槽内命令。 */
 export type SlashCommand = {
   name: string
   desc: string
-  run: () => Promise<string[]>
-}
+} & (
+  | { run: () => Promise<string[]>; input?: never }
+  | { input: string; run?: never }
+)
 
 const RED = '\x1b[31m'
 const DIM = '\x1b[2m'
@@ -56,6 +58,7 @@ function withBuiltins(own: SlashCommand[]): SlashCommand[] {
  */
 export type LoginTerminalHandle = {
   paste: (text: string) => void
+  focus: () => void
 }
 
 export const WsTerminal = forwardRef<
@@ -66,6 +69,7 @@ export const WsTerminal = forwardRef<
     commands?: SlashCommand[]
     startupCommand?: string
     officialLogin?: boolean
+    fontSize?: number
     onLogin?: () => void
     onAuthUrl?: (url: string) => void
   }
@@ -76,6 +80,7 @@ export const WsTerminal = forwardRef<
     commands,
     startupCommand,
     officialLogin,
+    fontSize,
     onLogin,
     onAuthUrl,
   },
@@ -84,9 +89,11 @@ export const WsTerminal = forwardRef<
   const hostRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
   const sendRef = useRef<(data: string) => void>(() => {})
+  const pendingMessagesRef = useRef<string[]>([])
   const lineRef = useRef<SlashLine>(SLASH_IDLE)
   const busyRef = useRef(false)
   const commandsRef = useRef<SlashCommand[]>([])
+  const shellPromptRef = useRef(false)
   const [phase, setPhase] = useState<Phase>('connecting')
   const [note, setNote] = useState('')
   const [session, setSession] = useState(0)
@@ -113,6 +120,15 @@ export const WsTerminal = forwardRef<
     const shellLineEmpty = echoed > 0 || line.clean || line.buf !== null
     if (!echoed && line.buf !== null) term.write(eraseEcho(line.buf.length))
     lineRef.current = shellLineEmpty ? SLASH_IDLE : line
+    if (cmd.input) {
+      if (!shellLineEmpty || !shellPromptRef.current) {
+        setNote('请先退出前台程序并清空输入，再执行槽内指令')
+        return
+      }
+      if (echoed) term.write(eraseEcho(echoed))
+      sendRef.current(`${cmd.input}\r`)
+      return
+    }
     if (name === '/clear') {
       if (echoed) term.write(eraseEcho(echoed))
       term.clear()
@@ -125,7 +141,7 @@ export const WsTerminal = forwardRef<
     setRunning(name)
     let rows: string[]
     try {
-      rows = await cmd.run()
+      rows = await cmd.run!()
     } catch (err) {
       rows = [`${RED}✗ ${(err as Error).message}${RESET}`]
     } finally {
@@ -157,12 +173,18 @@ export const WsTerminal = forwardRef<
     if (!host) return
     const term = new Terminal({
       cursorBlink: true,
-      fontSize: 13,
+      fontSize: fontSize ?? (officialLogin ? 17 : 13),
+      lineHeight: 1.15,
       fontFamily:
         'ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace',
       scrollback: 5000,
       theme: { background: '#0b0d10' },
       windowOptions: { getWinSizeChars: true, getCellSizePixels: true },
+    })
+    shellPromptRef.current = false
+    term.parser.registerOscHandler(133, (data) => {
+      shellPromptRef.current = data === 'A'
+      return true
     })
     term.parser.registerOscHandler(52, (data) => {
       const payload = data.split(';').pop() || ''
@@ -199,7 +221,10 @@ export const WsTerminal = forwardRef<
     const fit = new FitAddon()
     term.loadAddon(fit)
     term.open(host)
-    fit.fit()
+    const fitTerminal = () => {
+      if (host.clientWidth > 0 && host.clientHeight > 0) fit.fit()
+    }
+    const initialFit = requestAnimationFrame(fitTerminal)
     termRef.current = term
     lineRef.current = SLASH_IDLE
     setPhase('connecting')
@@ -207,8 +232,23 @@ export const WsTerminal = forwardRef<
 
     let ws: WebSocket | null = null
     let disposed = false
+    pendingMessagesRef.current = []
     const send = (msg: unknown) => {
-      if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg))
+      const input = msg as { t?: string; d?: string }
+      if (input.t === 'd' && /[\r\n]/.test(input.d || ''))
+        shellPromptRef.current = false
+      const payload = JSON.stringify(msg)
+      if (ws?.readyState === WebSocket.OPEN) {
+        ws.send(payload)
+        return
+      }
+      // Keep keystrokes typed while the ticket/exec is opening. Dropping the
+      // first pasted callback makes the terminal look broken even though the
+      // TTY is still healthy.
+      if (!ws || ws.readyState === WebSocket.CONNECTING) {
+        const pending = pendingMessagesRef.current
+        if (pending.length < 512) pending.push(payload)
+      }
     }
     sendRef.current = (d) => send({ t: 'd', d })
     const onData = term.onData((d) => {
@@ -217,7 +257,9 @@ export const WsTerminal = forwardRef<
       const step = slashInput(
         lineRef.current,
         d,
-        withBuiltins(commandsRef.current).map((c) => c.name),
+        withBuiltins(commandsRef.current)
+          .filter((c) => !c.input || shellPromptRef.current)
+          .map((c) => c.name),
         term.buffer.active.type === 'normal'
       )
       lineRef.current = step.line
@@ -230,7 +272,8 @@ export const WsTerminal = forwardRef<
     const onResize = term.onResize(({ cols, rows }) =>
       send({ t: 'r', c: cols, r: rows })
     )
-    const observer = new ResizeObserver(() => fit.fit())
+    const observer = new ResizeObserver(fitTerminal)
+    observer.observe(host)
     api<{ ticket: string }>(ticketPath, {
       method: 'POST',
       body: officialLogin ? JSON.stringify({ login: true }) : undefined,
@@ -250,6 +293,8 @@ export const WsTerminal = forwardRef<
         ws.binaryType = 'arraybuffer'
         ws.onopen = () => {
           setPhase('open')
+          for (const payload of pendingMessagesRef.current) ws?.send(payload)
+          pendingMessagesRef.current = []
           term.focus()
           if (startupCommand && !officialLogin)
             send({ t: 'd', d: `${startupCommand}\r` })
@@ -271,26 +316,38 @@ export const WsTerminal = forwardRef<
           if (msg.t === 'error') setNote(msg.message || '终端错误')
         }
         ws.onclose = () => {
+          pendingMessagesRef.current = []
           if (!disposed) setPhase('closed')
         }
       })
       .catch((err: Error) => {
         if (disposed) return
+        pendingMessagesRef.current = []
         setNote(err.message)
         setPhase('closed')
       })
 
     return () => {
       disposed = true
+      cancelAnimationFrame(initialFit)
       observer.disconnect()
       onData.dispose()
       onResize.dispose()
       ws?.close()
+      pendingMessagesRef.current = []
       sendRef.current = () => {}
       termRef.current = null
       term.dispose()
     }
-  }, [ticketPath, socketPath, session, execute, startupCommand, officialLogin])
+  }, [
+    ticketPath,
+    socketPath,
+    session,
+    execute,
+    startupCommand,
+    officialLogin,
+    fontSize,
+  ])
 
   useImperativeHandle(
     ref,
@@ -300,6 +357,9 @@ export const WsTerminal = forwardRef<
         if (!value || !termRef.current) return
         termRef.current.paste(value.endsWith('\n') ? value : `${value}\n`)
         termRef.current.focus()
+      },
+      focus() {
+        termRef.current?.focus()
       },
     }),
     []
@@ -345,7 +405,7 @@ export const WsTerminal = forwardRef<
       </div>
       <div
         ref={hostRef}
-        className='min-h-0 flex-1 overflow-hidden rounded-md border bg-[#0b0d10] p-1'
+        className='h-full min-h-0 min-w-0 flex-1 overflow-hidden rounded-md border bg-[#0b0d10] p-1'
       />
     </div>
   )

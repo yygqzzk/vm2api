@@ -4,10 +4,13 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { prepareOutboundHeaders } from '../protocol/outbound-attempt.mjs'
 import { sanitizeAnthropicBodyForBetaTokens } from '../protocol/anthropic-policy.mjs'
+import { sanitizeAnthropicBody } from '../protocol/sanitize.mjs'
 import { withRequestProtocolBetas } from '../protocol/claude-code-betas.mjs'
 import { pinThreadBetas, rememberThreadTurn } from '../protocol/thread-betas.mjs'
 import { applyThinkingDisplay, ensureOfficialPrintThinking, thinkingDisplayMode } from '../protocol/thinking.mjs'
-import { stripSubagentBilling } from '../identity/crs-persona.mjs'
+import { modelDirectiveForCrag } from '../protocol/model-policy.mjs'
+import { capOutboundBody } from '../protocol/outbound-snapshot.mjs'
+import { ccEntrypointFromRouting, stripSubagentBilling } from '../identity/crs-persona.mjs'
 import { sealClaudeCodeCch } from '../identity/cch.mjs'
 import { credentialModeFromOauth } from '../oauth/credential-mode.mjs'
 import { isCrsMock, writeCrsTrace, mockCrsPayload, emitMockSse } from './crs-mock.mjs'
@@ -26,6 +29,7 @@ import {
 import { isApiKeyMode } from '../oauth/credential-mode.mjs'
 import { runSlotOauth } from './slot-oauth.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
+import { cragConsumesModelDirective, cragV2KernelActive, readSlotKernelConfig } from '../protocol/crag-print-prompt.mjs'
 import { applyClaudeSSELineToMessage, createClaudeMessageAssembler } from '../protocol/convert.mjs'
 import {
   clientCancelledResult,
@@ -403,11 +407,27 @@ function dumpSessionEnvelope(envelope) {
   } catch {}
 }
 
+function stripCragEnvelope(body) {
+  if (!body || typeof body !== 'object') return body
+  if (!body.crag_prompt && !body.crag_model && !body.crag_options?.prompt) return body
+  const out = { ...body }
+  delete out.crag_prompt
+  delete out.crag_model
+  if (out.crag_options && typeof out.crag_options === 'object' && !Array.isArray(out.crag_options)) {
+    const { prompt: _prompt, ...rest } = out.crag_options
+    if (Object.keys(rest).length) out.crag_options = rest
+    else delete out.crag_options
+  }
+  return out
+}
+
 /**
  * `cliHop`: the slot cli-node builds the wire and always sends
  * mid-conversation-system; the kernel drops these envelope headers. Gating the
  * body on the VM's HTTP betas would lift every role=system turn into system[],
  * so system grows each turn and no cached prefix is ever read.
+ * `cragPrint`: explicit hop decision. Null derives it from the VM's own kernel,
+ * never from routing.inference.
  */
 export function prepareWorkerPayload({
   body,
@@ -417,10 +437,15 @@ export function prepareWorkerPayload({
   routing,
   want1m = false,
   cliHop = false,
+  cragPrint = null,
   requestContext = null,
   repaired = false,
 } = {}) {
-  const model = body?.model || ''
+  // This is the last panel-owned boundary before either kernel. Keep the
+  // worker contract Anthropic-shaped even when a caller selected passthrough;
+  // cli-node and CRAG must never receive OpenAI/client-only request fields.
+  const canonicalBody = sanitizeAnthropicBody(body, { preserveContentShape: false }) || body
+  const model = canonicalBody?.model || ''
   const credMode = credentialModeFromOauth(exec?.vm?.claude || {})
   const headers = prepareOutboundHeaders(reqHeaders, exec?.homeDir, identity, model, {
     credentialMode: credMode,
@@ -428,8 +453,11 @@ export function prepareWorkerPayload({
   })
   const displayed =
     requestContext?.purpose === 'auto_mode_classifier' || repaired
-      ? body
-      : ensureOfficialPrintThinking(applyThinkingDisplay(body, thinkingDisplayMode(routing)))
+      ? canonicalBody
+      : ensureOfficialPrintThinking(
+          applyThinkingDisplay(canonicalBody, thinkingDisplayMode(routing)),
+          ccEntrypointFromRouting(routing),
+        )
   const main = stripSubagentBilling(displayed)
   const thread = pinThreadBetas(
     main,
@@ -440,9 +468,24 @@ export function prepareWorkerPayload({
   // Envelope headers are discarded; the existing MessageRequest.betas channel
   // carries request gates to the native CLI, which builds the actual HTTP wire.
   const gated = cliHop ? { ...main, betas } : sanitizeAnthropicBodyForBetaTokens(main, headers['anthropic-beta'])
+  // CRAG's CLI rebuilds the wire from its own model table. Pass the preset
+  // boundary only when that worker applies it locally. A cluster hop forwards
+  // unknown fields and Anthropic rejects `crag_model`.
+  const print =
+    cragPrint == null
+      ? cragV2KernelActive({
+          vm: exec?.vm,
+          health: exec?.workerStatus,
+          kernelConfig: readSlotKernelConfig(exec?.homeDir),
+        })
+      : cragPrint === true
+  const directed =
+    print && cragConsumesModelDirective(exec?.workerStatus)
+      ? { ...gated, crag_model: modelDirectiveForCrag(gated?.model) }
+      : stripCragEnvelope(gated)
   return {
     headers,
-    gated,
+    gated: directed,
     cliHop,
     routing,
     thread: thread.turn,
@@ -478,6 +521,7 @@ async function workerEnvelope({
   cacheTtl = null,
   preserveCacheBreakpoints = null,
   cliHop = false,
+  cragPrint = null,
   repaired = false,
   redactionPrincipal = '',
   redactionSession = '',
@@ -490,6 +534,7 @@ async function workerEnvelope({
     routing,
     want1m,
     cliHop,
+    cragPrint,
     requestContext,
     repaired,
   })
@@ -579,6 +624,7 @@ export async function callGoWorker({
   requestPath = '/internal/v1/messages',
   envelope = null,
   cliHop = false,
+  cragPrint = null,
   repaired = false,
   onEnvelope = null,
   redactionPrincipal = '',
@@ -593,6 +639,7 @@ export async function callGoWorker({
       routing,
       want1m,
       cliHop,
+      cragPrint,
       requestContext,
       repaired,
     })
@@ -625,6 +672,7 @@ export async function callGoWorker({
           cacheTtl,
           preserveCacheBreakpoints,
           cliHop,
+          cragPrint,
           requestContext,
           repaired,
           redactionPrincipal,
@@ -703,6 +751,7 @@ export async function streamGoWorker({
   requestPath = '/internal/v1/messages',
   envelope = null,
   cliHop = false,
+  cragPrint = null,
   repaired = false,
   onEnvelope = null,
   onOutboundHeaders = null,
@@ -718,6 +767,7 @@ export async function streamGoWorker({
       routing,
       want1m,
       cliHop,
+      cragPrint,
       requestContext,
       repaired,
     })
@@ -809,6 +859,7 @@ export async function streamGoWorker({
           cacheTtl,
           preserveCacheBreakpoints,
           cliHop,
+          cragPrint,
           requestContext,
           repaired,
           redactionPrincipal,
@@ -936,7 +987,12 @@ export async function streamGoWorker({
                 typeof onOutboundHeaders === 'function'
               ) {
                 try {
-                  onOutboundHeaders(event.headers)
+                  const body = event.body == null ? undefined : capOutboundBody(event.body)
+                  onOutboundHeaders(event.headers, {
+                    body,
+                    body_truncated:
+                      event.body_truncated === true || (typeof event.body === 'string' && body !== event.body),
+                  })
                 } catch {
                   console.warn('[worker] outbound header observer failed')
                 }
@@ -1187,7 +1243,7 @@ export async function ensureWorkerCredential(exec, { force = false } = {}) {
   })
 }
 
-function credentialSummary(credential, now = Date.now()) {
+export function credentialSummary(credential, now = Date.now()) {
   if (!credential) return undefined
   const expiresAt = credential.expires_at ?? null
   const expiresAtMs =

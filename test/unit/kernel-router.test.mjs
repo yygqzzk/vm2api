@@ -814,30 +814,36 @@ test('writeKernelConfig cli-hop writes local_cli without secrets', () => {
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-test('writeKernelConfig points cc and crag at cc-node', () => {
+test('writeKernelConfig points cc at cc-node and crag at native Claude', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-cc-cfg-'))
   try {
-    for (const dataplane of ['cc', 'crag']) {
-      const written = writeKernelConfig(root, { id: 'vm-09', dataplane }, { token: 'tok' })
-      const doc = JSON.parse(fs.readFileSync(written.configPath, 'utf8'))
-      assert.equal(doc.dataplane, dataplane)
-      assert.equal(doc.claude_bin, '/home/kincli/.kin/cc-node')
-    }
+    const cc = JSON.parse(
+      fs.readFileSync(writeKernelConfig(root, { id: 'vm-09', dataplane: 'cc' }, { token: 'tok' }).configPath, 'utf8'),
+    )
+    assert.equal(cc.dataplane, 'cc')
+    assert.equal(cc.claude_bin, '/home/kincli/.kin/cc-node')
+    const crag = JSON.parse(
+      fs.readFileSync(writeKernelConfig(root, { id: 'vm-09', dataplane: 'crag' }, { token: 'tok' }).configPath, 'utf8'),
+    )
+    assert.equal(crag.dataplane, 'crag')
+    assert.equal(crag.claude_bin, '/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude')
+    assert.equal(crag.crag_kernel_version, 'v2')
+    assert.equal(crag.runtime_variant, 'crag-v2')
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
 
-test('writeKernelConfig adds CRAG v2 fields only for a pinned local slot', () => {
+test('writeKernelConfig adds CRAG v2 fields for a local slot and a cluster Docker slot', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-crag-v2-cfg-'))
   try {
     const legacy = JSON.parse(
       fs.readFileSync(writeKernelConfig(root, { id: 'vm-09', dataplane: 'crag' }, { token: 'tok' }).configPath, 'utf8'),
     )
-    assert.equal(legacy.claude_bin, '/home/kincli/.kin/cc-node')
+    assert.equal(legacy.claude_bin, '/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude')
+    assert.equal(legacy.crag_kernel_version, 'v2')
+    assert.equal(legacy.runtime_variant, 'crag-v2')
     assert.equal(legacy.license_dir, '/run/kin/crag-license')
-    assert.equal(legacy.crag_v2_root, undefined)
-    assert.equal(legacy.node_bin, undefined)
     const v2 = JSON.parse(
       fs.readFileSync(
         writeKernelConfig(root, { id: 'vm-09', dataplane: 'crag', crag_kernel_version: 'v2' }, { token: 'tok' })
@@ -846,7 +852,7 @@ test('writeKernelConfig adds CRAG v2 fields only for a pinned local slot', () =>
       ),
     )
     assert.equal(v2.dataplane, 'crag')
-    assert.equal(v2.claude_bin, '/home/kincli/.kin/crag-v2/claude-code-2.1.317/claude')
+    assert.equal(v2.claude_bin, '/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude')
     assert.equal(v2.crag_kernel_version, 'v2')
     assert.equal(v2.runtime_variant, 'crag-v2')
     assert.equal(v2.license_dir, '/run/kin/crag-license')
@@ -888,8 +894,11 @@ test('writeKernelConfig adds CRAG v2 fields only for a pinned local slot', () =>
         'utf8',
       ),
     )
-    assert.equal(remote.crag_v2_root, undefined)
-    assert.equal(remote.crag_kernel_version, undefined)
+    assert.equal(remote.crag_kernel_version, 'v2')
+    assert.equal(remote.runtime_variant, 'crag-v2')
+    assert.equal(remote.claude_bin, '/opt/kin-live/crag-v2/claude-code-2.1.321/claude')
+    assert.equal(remote.license_dir, '/run/kin/crag-license')
+    assert.equal(remote.asset_dir, '/run/kin/crag-native-assets')
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }

@@ -24,10 +24,14 @@ import { setVmSchedulable, listVms, getVm } from '../vm/vm-registry.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { isKvmRuntime, runtimeKind } from '../vm/runtime-kind.mjs'
 import { slotExecArgv } from '../vm/slot-exec.mjs'
+import { ensureHostPrivateDir } from '../vm/private-dir.mjs'
 import {
   CONTAINER_CLI_NODE_BIN,
   KERNEL_NATIVE_SLOT_COUNT,
   normalizeSessionIdleTtlSeconds,
+  LOCAL_CRAG_CLAUDE,
+  REMOTE_CRAG_CLAUDE,
+  resolveSlotClaude,
   resolveCliSystemLayout,
   resolveCragKernelVersion,
   resolveKernelDataplane,
@@ -146,7 +150,7 @@ export function readExistingKernelConfig(configPath) {
   }
 }
 
-/** Legacy crag and cc use cc-node; native V2 owns its own child lifecycle. */
+/** The cc dataplane runs cc-node. CRAG always runs native Claude. */
 export function dataplaneUsesCcNode(exec) {
   const configPath = rustKernelPaths(exec).configPath
   if (!configPath) return false
@@ -154,7 +158,7 @@ export function dataplaneUsesCcNode(exec) {
   const plane = String(config.dataplane || '')
     .trim()
     .toLowerCase()
-  return (plane === 'crag' && config.crag_kernel_version !== 'v2') || plane === 'cc' || plane === 'cc-node'
+  return plane === 'cc' || plane === 'cc-node'
 }
 function projectRootFromExec(exec = {}) {
   if (exec?.projectRoot) return exec.projectRoot
@@ -671,7 +675,9 @@ async function startRustKernel(
     const ids = slotUidGidFromHomeDir(exec.homeDir)
     ensureOfficialCredentialLink(exec.homeDir, ids || {})
     try {
-      ensureSlotSubscriptionType(exec.homeDir, exec.vm?.claude?.account_tier || exec.vm?.account_tier)
+      ensureSlotSubscriptionType(exec.homeDir, exec.vm?.claude?.account_tier || exec.vm?.account_tier, {
+        source: exec.vm?.claude?.account_tier ? exec.vm.claude.account_tier_source : exec.vm?.account_tier_source,
+      })
     } catch {}
   }
   const paths = rustKernelPaths(exec)
@@ -775,6 +781,55 @@ function kernelConfigText(config) {
   return JSON.stringify(config, null, 2) + '\n'
 }
 
+function acceptNativeClaudeSetup(homeDir, workDir) {
+  // The TUI refuses login, theme, and folder-trust screens. The credential file is
+  // separate; these flags are what Claude reads before it will take a prompt.
+  for (const file of [path.join(homeDir, '.claude', '.claude.json'), path.join(homeDir, '.claude.json')]) {
+    let raw
+    try {
+      raw = fs.readFileSync(file, 'utf8')
+    } catch {
+      continue
+    }
+    let doc
+    try {
+      doc = JSON.parse(raw)
+    } catch {
+      continue
+    }
+    if (!doc || typeof doc !== 'object' || Array.isArray(doc)) continue
+    let changed = false
+    if (doc.hasCompletedOnboarding !== true) {
+      doc.hasCompletedOnboarding = true
+      changed = true
+    }
+    if (typeof doc.theme !== 'string' || !doc.theme) {
+      doc.theme = 'dark'
+      changed = true
+    }
+    if (!doc.projects || typeof doc.projects !== 'object' || Array.isArray(doc.projects)) {
+      doc.projects = {}
+      changed = true
+    }
+    for (const folder of [workDir, '/home/kincli']) {
+      const current = doc.projects[folder]
+      const project = current && typeof current === 'object' && !Array.isArray(current) ? current : {}
+      if (project.hasTrustDialogAccepted === true) continue
+      project.hasTrustDialogAccepted = true
+      doc.projects[folder] = project
+      changed = true
+    }
+    if (!changed) continue
+    const st = fs.statSync(file)
+    const tmp = `${file}.${process.pid}.tmp`
+    fs.writeFileSync(tmp, `${JSON.stringify(doc)}\n`, { mode: st.mode & 0o777 })
+    try {
+      fs.chownSync(tmp, st.uid, st.gid)
+    } catch {}
+    fs.renameSync(tmp, file)
+  }
+}
+
 function writeKernelJsonAtomically(configPath, config, vm) {
   const body = kernelConfigText(config)
   let same = false
@@ -841,7 +896,7 @@ export function writeKernelConfig(
     if (host.native) return null
     throw err
   }
-  const claudeBin = envBin || (dataplane === 'wrap' ? host.bins.cli : host.bins.cc)
+  const claudeBin = envBin || resolveSlotClaude(vm, routing || {}, host).bin
   const tz = String(timezone || vm.timezone || previous.timezone || '').trim()
   const defaultCacheTtl = routing != null ? cacheTtlFromRouting(routing) : normalizeCacheTtl(previous.default_cache_ttl)
   const thinkingDisplay =
@@ -909,34 +964,39 @@ export function writeKernelConfig(
     model_effort: modelEffort,
     ...(!host.native && !isCodexVm(record) ? { telemetry: buildNativeTelemetry(record, projectRoot, routing) } : {}),
   }
-  if (
-    dataplane === 'crag' &&
-    resolveCragKernelVersion({ ...record, ...vm }, routing || {}) === 'v2' &&
-    !String(record?.node_id || '').trim() &&
-    !isKvmRuntime(record)
-  ) {
+  if (dataplane === 'crag' && resolveCragKernelVersion({ ...record, ...vm }, routing || {}) === 'v2' && !host.native) {
     config.crag_kernel_version = 'v2'
     config.runtime_variant = 'crag-v2'
-    config.claude_bin = '/home/kincli/.kin/crag-v2/claude-code-2.1.317/claude'
+    config.claude_bin = resolveSlotClaude({ ...record, ...vm }, routing || {}, host).bin
     config.asset_dir = '/run/kin/crag-native-assets'
     config.work_dir = '/run/kin/work'
-    // Native Claude owns UA/billing version; never inject a legacy profile version.
     config.cli_version = ''
-    if (config.telemetry && isTelemetryEnabled(defaultSeedPolicy(record.seed_policy || {}))) {
-      const workstation = resolveWorkstationProfile(record)
-      config.telemetry = {
-        ...config.telemetry,
-        enabled: true,
-        dmi_dir: '/etc/kin-dmi',
-        identity: {
+    if (!host.bakedKernel) {
+      const owner = runtimeFileOwner(vm)
+      for (const name of ['crag-native-assets', 'work']) {
+        ensureHostPrivateDir(path.join(runDir, name), {
+          uid: owner.uid,
+          gid: owner.gid,
+          privileged,
+        })
+      }
+      acceptNativeClaudeSetup(homeDir, '/run/kin/work')
+      if (config.telemetry && isTelemetryEnabled(defaultSeedPolicy(record.seed_policy || {}))) {
+        const workstation = resolveWorkstationProfile(record)
+        config.telemetry = {
+          ...config.telemetry,
           enabled: true,
-          linux_kernel: workstation.linux_kernel,
-          linux_distro_id: workstation.linux_distro_id,
-          linux_distro_version: workstation.linux_distro_version,
-          shell: workstation.shell,
-          terminal: workstation.terminal,
-          package_managers: workstation.package_managers,
-        },
+          dmi_dir: '/etc/kin-dmi',
+          identity: {
+            enabled: true,
+            linux_kernel: workstation.linux_kernel,
+            linux_distro_id: workstation.linux_distro_id,
+            linux_distro_version: workstation.linux_distro_version,
+            shell: workstation.shell,
+            terminal: workstation.terminal,
+            package_managers: workstation.package_managers,
+          },
+        }
       }
     }
   }

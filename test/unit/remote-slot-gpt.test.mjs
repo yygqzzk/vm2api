@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { SLOT_CAPS_NODE } from '../../src/lib/cluster/placement.mjs'
 import { codexRoleMatches, slotContainerBody } from '../../src/lib/cluster/remote-slot.mjs'
-import { REMOTE_KERNEL_ENTRY } from '../../src/lib/vm/slot-engine.mjs'
+import { REMOTE_CRAG_ENTRY, REMOTE_KERNEL_ENTRY } from '../../src/lib/vm/slot-engine.mjs'
 import { CODEX_SLOT_ROLE, slotContainerCommand } from '../../src/lib/vm/vm-runtime.mjs'
 import { slotHost } from '../../src/lib/vm/slot-host.mjs'
 import { startSlotReady } from '../../src/lib/vm/slot-runtime.mjs'
@@ -34,14 +34,24 @@ test('a remote GPT container idles instead of booting the Claude kernel', () => 
 })
 
 for (const runtime of [undefined, { type: 'docker' }]) {
-  test(`a remote Claude slot uses the baked kernel entry (${runtime?.type || 'default'} runtime)`, () => {
+  test(`a remote Claude slot uses the live kernel entry (${runtime?.type || 'default'} runtime)`, () => {
     const spec = body({ ...claude, runtime })
-    assert.equal(REMOTE_KERNEL_ENTRY, '/opt/kin/kin-kernel')
+    assert.equal(REMOTE_KERNEL_ENTRY, '/opt/kin-live/kin-kernel')
     assert.deepEqual(spec.Cmd, [REMOTE_KERNEL_ENTRY, '--gateway-worker', '--config', '/run/kin/kernel.json'])
     assert.equal(spec.Labels['kin.vm.role'], undefined)
     assert.equal(spec.Labels['kin.vm.runtime'], 'docker')
   })
 }
+
+test('a remote Claude slot switched to CRAG v2 boots the live kernel with the userns sandbox', () => {
+  const spec = body({ ...claude, dataplane: 'crag', crag_kernel_version: 'v2' })
+  assert.deepEqual(spec.Cmd, [REMOTE_CRAG_ENTRY, '--gateway-worker', '--config', '/run/kin/kernel.json'])
+  assert.equal(spec.HostConfig.Init, true)
+  const [privileges, seccomp, apparmor] = spec.HostConfig.SecurityOpt
+  assert.equal(privileges, 'no-new-privileges')
+  assert.equal(apparmor, 'apparmor=unconfined')
+  assert.equal(JSON.parse(seccomp.slice('seccomp='.length)).defaultAction, 'SCMP_ACT_ERRNO')
+})
 
 test('local Claude commands retain their bind-mounted and wrapped kernel entries', () => {
   assert.deepEqual(slotContainerCommand(claude), [

@@ -21,6 +21,8 @@ import {
   applyJevPatch,
   buildScopeInventory,
   listPolicyModels as listDecisionModels,
+  probePolicyBaseline,
+  probePolicyQuota,
   publicJevConfig,
   publicJevKeys,
   readJevConfig,
@@ -149,6 +151,7 @@ import {
   bindVmProxy,
   adoptVmProxyBinding,
   patchVmRecord,
+  parseVmDisplayName,
   vmHasClaudeCredential,
   vmHasSchedulableCredential,
   persistAllowedModels,
@@ -230,7 +233,7 @@ import { recreateVmFiles, seedFreshCliHome } from '../vm/vm-recreate.mjs'
 import { diagnoseSlotServices, powerOnSlot, recoverSlot, redactSecrets } from '../vm/slot-recovery.mjs'
 import { commitVmPackage, exportVmPackage, parseVmPackage } from '../vm/vm-package.mjs'
 import { slotMigrationBusy, slotMigrationJob, startSlotMigration } from '../cluster/slot-migration.mjs'
-import { preflightNode } from '../cluster/placement.mjs'
+import { isNativeNodeVm, preflightNode } from '../cluster/placement.mjs'
 import { probeLocalKvm } from '../vm/kvm-host.mjs'
 import { normalizeVmConfig, resolveMachineSpec, validateVmConfigPatch } from '../vm/machine-spec.mjs'
 import { raiseDockerSlotMemory } from '../vm/docker-slot-memory.mjs'
@@ -285,7 +288,13 @@ import { restartRustKernel, syncClaudeKernelConfigs, writeKernelConfig } from '.
 import { countTokensViaWorker } from '../transport/go-worker-client.mjs'
 import { apiKeyBetaHeader, setupTokenBetaHeader } from '../protocol/claude-code-betas.mjs'
 import { rustKernelHealth, toPublicKernelHealth } from '../transport/rust-kernel-client.mjs'
-import { activateCragLicense, checkCragLicense, CragLicenseError, getCragLicense } from '../vm/crag-license.mjs'
+import {
+  activateCragLicense,
+  checkCragLicense,
+  CragLicenseError,
+  distributeCragUniversalGrant,
+  getCragLicense,
+} from '../vm/crag-license.mjs'
 import { applyNativeTelemetry } from '../vm/fleet-update.mjs'
 import { codexKernelHealth } from '../transport/codex-kernel-client.mjs'
 import { normalizeHealthProbeConfig } from './health-probe.mjs'
@@ -317,6 +326,8 @@ function logsOwner(req, u) {
 }
 
 const LOCAL_PROXY_MISMATCH_MESSAGE = '本地代理只能绑定到它所在 VPS 上的槽位'
+// Room for a full allowed_models list (200 names) next to the other key fields.
+const API_KEY_BODY_MAX = 32 * 1024
 
 function clusterNodesOf(ctx) {
   try {
@@ -1005,6 +1016,31 @@ export function createPanelHandler(ctx) {
     }
   }
 
+  function withJevEndpointStatus(config) {
+    const keys = (config.endpoints || []).flatMap((endpoint) => endpoint.keys || [])
+    if (!keys.length) return config
+    try {
+      const rows = new JevUsageRepo().configuredKeys(keys)
+      const byFp = new Map(rows.map((row) => [row.key_fingerprint, row]))
+      return {
+        ...config,
+        endpoints: config.endpoints.map((endpoint) => ({
+          ...endpoint,
+          keys: endpoint.keys.map((key) => {
+            const row = byFp.get(key.key_fingerprint)
+            return {
+              ...key,
+              status: key.retired ? 'paused' : row?.status || key.status,
+              last_http_status: row?.last_http_status ?? key.last_http_status ?? null,
+            }
+          }),
+        })),
+      }
+    } catch {
+      return config
+    }
+  }
+
   function jevInterceptSnapshot() {
     let config
     try {
@@ -1013,7 +1049,10 @@ export function createPanelHandler(ctx) {
     } catch {
       config = publicJevConfig(null)
     }
-    return { ...config, account_scope: jevScopeInventory(config.account_platform_plans) }
+    return {
+      ...withJevEndpointStatus(config),
+      account_scope: jevScopeInventory(config.account_platform_plans),
+    }
   }
 
   function deactivateVmSlot(id) {
@@ -1125,6 +1164,14 @@ export function createPanelHandler(ctx) {
     const versionChanged =
       previousVersion !== targetVersion && (previousDataplane === 'crag' || targetDataplane === 'crag')
     const kernelSwitch = dataplaneChanged || versionChanged
+    if (kernelSwitch && targetDataplane === 'crag' && targetVersion === 'v2') {
+      if (isKvmRuntime(desired)) {
+        return { ok: false, id, code: 'remote_unsupported', error: 'crag 数据面暂不支持 KVM 槽' }
+      }
+      if (isNativeNodeVm(desired)) {
+        return { ok: false, id, code: 'native_crag_unsupported', error: 'crag 数据面暂不支持 macOS 原生节点' }
+      }
+    }
     let switched = null
     if (Object.prototype.hasOwnProperty.call(patch, 'inference_engine') && previousEngine !== targetEngine) {
       switched = await switchSlotInferenceEngine(desired, cfg.paths.project, targetEngine)
@@ -1150,17 +1197,40 @@ export function createPanelHandler(ctx) {
         }
         writeKernelConfig(cfg.paths.project, saved, { routing: ctx.routingConfig })
         if (kernelSwitch && saved.status === 'running') {
-          const exec = slotExec(cfg.paths.project, saved)
-          const restarted = await (ctx.kernelPolicyOps?.restartRustKernel || restartRustKernel)(exec).catch((e) => ({
-            ok: false,
-            error: String(e?.message || e).slice(0, 200),
-          }))
-          if (!restarted?.ok) {
-            return {
+          const remoteDocker =
+            Boolean(String(saved.node_id || '').trim()) && !isKvmRuntime(saved) && !isNativeNodeVm(saved)
+          const recreateNative =
+            !isKvmRuntime(saved) &&
+            (remoteDocker ||
+              (targetDataplane === 'crag' && targetVersion === 'v2' && !String(saved.node_id || '').trim()))
+          // docker restart keeps HostConfig. A CRAG v2 command, or any cluster
+          // kernel change, has to recreate the container.
+          if (recreateNative) {
+            const booted = await startSlotReady(saved, cfg.paths.project, {
+              recreate: true,
+              routing: ctx.routingConfig,
+            })
+            if (!booted?.ok) {
+              return {
+                ok: false,
+                id,
+                code: booted?.code || 'kernel_restart_failed',
+                error: booted?.error || 'kernel recreate failed',
+              }
+            }
+          } else {
+            const exec = slotExec(cfg.paths.project, saved)
+            const restarted = await (ctx.kernelPolicyOps?.restartRustKernel || restartRustKernel)(exec).catch((e) => ({
               ok: false,
-              id,
-              code: 'kernel_restart_failed',
-              error: restarted?.error || 'kernel restart failed',
+              error: String(e?.message || e).slice(0, 200),
+            }))
+            if (!restarted?.ok) {
+              return {
+                ok: false,
+                id,
+                code: 'kernel_restart_failed',
+                error: restarted?.error || 'kernel restart failed',
+              }
             }
           }
         }
@@ -1629,6 +1699,7 @@ export function createPanelHandler(ctx) {
             role: body.role || 'user',
             enabled: body.enabled !== false,
             vm_create_quota: body.vm_create_quota,
+            concurrency: body.concurrency,
           })
           return json(res, 201, panel.ok({ item: publicUserView(rec) }))
         } catch (e) {
@@ -1740,7 +1811,7 @@ export function createPanelHandler(ctx) {
         return json(res, 200, { ok: true, item: publicKeyView(rec, { reveal: false }), usage_stats })
       }
       if (req.method === 'POST' && p === '/api/panel/api-keys') {
-        const body = await readBody(req, 8192).catch(() => ({}))
+        const body = await readBody(req, API_KEY_BODY_MAX).catch(() => ({}))
         const ident = panelIdentity(req)
         if (ident.role !== 'admin' && body?.vm_pool_id != null && String(body.vm_pool_id).trim() !== '') {
           return json(res, 403, {
@@ -1787,6 +1858,7 @@ export function createPanelHandler(ctx) {
             group_type: scope.group_type,
             allowed_vms: scope.allowed_vms,
             vm_pool_id: scope.vm_pool_id,
+            allowed_models: body?.allowed_models,
             max_concurrency: body?.max_concurrency ?? defaultConc,
             default_concurrency: defaultConc,
             quota_requests: input.quota_requests,
@@ -1817,7 +1889,7 @@ export function createPanelHandler(ctx) {
       if (req.method === 'PATCH' && /^\/api\/panel\/api-keys\/[^/]+$/.test(p)) {
         const id = p.split('/').pop()
         if (denyIfUserMissesKey(req, res, { apiKeyStore, json, keyId: id })) return true
-        const body = await readBody(req, 8192).catch(() => ({}))
+        const body = await readBody(req, API_KEY_BODY_MAX).catch(() => ({}))
         const ident = panelIdentity(req)
         if (ident.role !== 'admin' && body?.vm_pool_id != null && String(body.vm_pool_id).trim() !== '') {
           return json(res, 403, {
@@ -2543,6 +2615,7 @@ export function createPanelHandler(ctx) {
           targets: body.targets,
           routing: ctx.routingConfig,
           watchdog: ctx.kernelWatchdog,
+          poolScheduler: ctx.poolScheduler,
           ops: ctx.kernelInstallOps,
         })
         return json(res, 200, panel.ok(report))
@@ -2943,19 +3016,36 @@ export function createPanelHandler(ctx) {
           })
         const vm = getVm(cfg.paths.project, p.split('/')[4])
         if (!vm) return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'vm not found' } })
-        if (isCodexVm(vm) || vm.node_id || isKvmRuntime(vm))
+        if (isCodexVm(vm) || isKvmRuntime(vm) || isNativeNodeVm(vm))
           return json(res, 400, {
             ok: false,
             error: {
               code: 'crag_v2_unsupported_placement',
-              message: 'CRAG activation requires a local Linux Docker Claude slot.',
+              message: isCodexVm(vm)
+                ? '请选择 Claude 虚拟机'
+                : isKvmRuntime(vm)
+                  ? 'CRAG v2 不支持 KVM 槽'
+                  : 'CRAG v2 不支持 macOS 原生节点',
             },
           })
+        const remotePlacement = Boolean(vm.node_id) || isKvmRuntime(vm)
         try {
           if (req.method === 'GET')
             return json(res, 200, panel.ok(getCragLicense(cfg.paths.project, vm, { initialize: true })))
           const body = await readBody(req, 32768)
-          return json(res, 200, panel.ok(activateCragLicense(cfg.paths.project, vm, body?.registration_code)))
+          const registrationCode = typeof body?.registration_code === 'string' ? body.registration_code.trim() : ''
+          if (remotePlacement && !registrationCode.startsWith('CRAGU1.')) {
+            return json(res, 400, {
+              ok: false,
+              error: {
+                code: 'crag_v2_unsupported_placement',
+                message: '集群槽只能激活离线通用码。设备注册码仍需要本机 Linux Docker 槽。',
+              },
+            })
+          }
+          const activated = activateCragLicense(cfg.paths.project, vm, registrationCode)
+          if (activated.license?.scope === 'kernel') await distributeCragUniversalGrant(cfg.paths.project)
+          return json(res, 200, panel.ok(activated))
         } catch (error) {
           const typed = error instanceof CragLicenseError
           return json(res, typed ? 403 : 400, {
@@ -3024,6 +3114,7 @@ export function createPanelHandler(ctx) {
           const hasActiveHours = body && Object.prototype.hasOwnProperty.call(body, 'active_hours')
           const hasTimezone = body && Object.prototype.hasOwnProperty.call(body, 'timezone')
           const hasWeight = body && Object.prototype.hasOwnProperty.call(body, 'weight')
+          const hasName = body && Object.prototype.hasOwnProperty.call(body, 'name')
           const hasMemory =
             body &&
             (Object.prototype.hasOwnProperty.call(body, 'memory') ||
@@ -3055,6 +3146,7 @@ export function createPanelHandler(ctx) {
             !hasActiveHours &&
             !hasTimezone &&
             !hasWeight &&
+            !hasName &&
             !hasMemory &&
             !followProxyTz
           ) {
@@ -3062,9 +3154,25 @@ export function createPanelHandler(ctx) {
               ok: false,
               error: {
                 message:
-                  'max_concurrency, max_rpm, max_sessions, session_slots, quota_override, allowed_models, auth_scheme, inference_engine, persona_preset, dataplane, crag_kernel_version, schedule_level, active_hours, timezone, weight, machine.memory or timezone_follow_proxy required',
+                  'max_concurrency, max_rpm, max_sessions, session_slots, quota_override, allowed_models, auth_scheme, inference_engine, persona_preset, dataplane, crag_kernel_version, schedule_level, active_hours, timezone, weight, name, machine.memory or timezone_follow_proxy required',
               },
             })
+          }
+          let nextName = null
+          if (hasName) {
+            const parsedName = parseVmDisplayName(body.name)
+            if (!parsedName.ok) {
+              return json(res, 400, {
+                ok: false,
+                error: {
+                  type: 'invalid_request_error',
+                  code: 'invalid_name',
+                  message: parsedName.error,
+                  param: 'name',
+                },
+              })
+            }
+            nextName = parsedName.value
           }
           try {
             if (hasConcurrency && next !== null) strictInteger(next, 1, 256, 'max_concurrency')
@@ -3265,6 +3373,10 @@ export function createPanelHandler(ctx) {
               timezoneSync.kernel_hot = kernel?.changed === true
             }
           }
+          if (nextName != null && nextName !== String(currentVm.name || '')) {
+            const renamed = patchVmRecord(cfg.paths.project, id, { name: nextName })
+            if (!renamed) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          }
           if (hasWeight) {
             const nextWeight = body.weight === null ? 1 : body.weight
             const vm = patchVmRecord(cfg.paths.project, id, (record) => ({
@@ -3280,7 +3392,7 @@ export function createPanelHandler(ctx) {
                 : body.memory
             const liveVm = getVm(cfg.paths.project, id) || currentVm
             const raiseMemory = ctx.raiseDockerSlotMemory || raiseDockerSlotMemory
-            const raised = raiseMemory(cfg.paths.project, liveVm, requestedMemory, {
+            const raised = await raiseMemory(cfg.paths.project, liveVm, requestedMemory, {
               routing: ctx.routingConfig,
             })
             if (!raised.ok) {
@@ -3300,6 +3412,13 @@ export function createPanelHandler(ctx) {
                   requested: raised.requested ?? requestedMemory ?? null,
                   container_memory: raised.container_memory ?? null,
                   current: raised.current ?? null,
+                  application_state: raised.application_state ?? null,
+                  config_unchanged: raised.config_unchanged ?? null,
+                  rollback_attempted: raised.rollback_attempted ?? false,
+                  rollback_succeeded: raised.rollback_succeeded ?? false,
+                  before_memory: raised.before_memory ?? null,
+                  before_swap_bytes: raised.before_swap_bytes ?? null,
+                  observed_memory_swap: raised.observed_memory_swap ?? null,
                 },
               })
             }
@@ -4423,6 +4542,22 @@ export function createPanelHandler(ctx) {
             error: { code: 'invalid_locale', message: `语言必须是 ${SLOT_LOCALES.join('、')}` },
           })
         }
+        let displayLabel = padVm(idx)
+        if (body.name != null && String(body.name).trim() !== '') {
+          const parsedName = parseVmDisplayName(body.name)
+          if (!parsedName.ok) {
+            return json(res, 400, {
+              ok: false,
+              error: {
+                type: 'invalid_request_error',
+                code: 'invalid_name',
+                message: parsedName.error,
+                param: 'name',
+              },
+            })
+          }
+          displayLabel = parsedName.value
+        }
         let generated
         try {
           generated = assignComputerFingerprint(
@@ -4447,7 +4582,7 @@ export function createPanelHandler(ctx) {
         }
         const vm = {
           id,
-          name: body.name || padVm(idx),
+          name: displayLabel,
           status: startNow ? 'running' : body.status || 'stopped',
           kernel: wantKernel,
           timezone: requestedTimezone || null,
@@ -5857,6 +5992,32 @@ export function createPanelHandler(ctx) {
               type: 'api_error',
               code: error?.code || 'fetch_models_failed',
               message: error?.message || '获取模型失败',
+            },
+          })
+        }
+      }
+      if (req.method === 'POST' && (p === '/api/panel/jev-intercept/probe' || p === '/api/panel/jev-intercept/quota')) {
+        const body = await readBody(req, 16 * 1024).catch(() => ({}))
+        const stored = readJevConfig((key, fallback) => new SettingsRepo().get(key, fallback))
+        const run = p.endsWith('/quota') ? probePolicyQuota : probePolicyBaseline
+        try {
+          const result = await run({
+            config: stored,
+            baseUrl: body?.base_url,
+            apiKey: body?.api_key,
+            apiKeys: body?.api_keys,
+            model: Object.hasOwn(body || {}, 'model') ? body.model : undefined,
+            timeoutMs: Number(body?.timeout_ms) || stored.timeout_ms,
+          })
+          return json(res, 200, panel.ok(result))
+        } catch (error) {
+          const code = error?.code || (p.endsWith('/quota') ? 'quota_failed' : 'probe_failed')
+          return json(res, code === 'base_url_required' ? 400 : 502, {
+            ok: false,
+            error: {
+              type: 'api_error',
+              code,
+              message: error?.message || '测试失败',
             },
           })
         }
