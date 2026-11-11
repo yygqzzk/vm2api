@@ -120,6 +120,12 @@ docker run --rm --platform linux/amd64 --entrypoint node \
 
 ## 标准化切换（cutover.py）
 
+线上抽样重载时，先向 `/api/panel/vms/schedule/hold` 发送
+`{ "reason": "本次唯一标记", "ids": ["目标槽位ID"] }`，确认 `paused: 1`、
+`drained: true` 后，仅对该 ID 执行 `fleet-update`。排空同时统计 Claude 和 Codex
+在途请求；在 `finally` 中向 `/api/panel/vms/schedule/resume` 发送同一 `reason`。
+原手动停调与自动测试停调保留。省略 `ids` 仍表示整组维护，空数组会被拒绝。
+
 `deploy/fork/cutover.py` 固化本轮验证过的切换流程：一致性备份 → 暂停调度排空 →
 仅替换控制面 → 逐项验收，失败自动回退程序（不覆盖业务数据库）。
 

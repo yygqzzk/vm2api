@@ -17,6 +17,8 @@ import {
   waitForSlotDrain,
 } from '../../src/lib/vm/vm-registry.mjs'
 import { restoreScheduleAfterLiveCredential } from '../../src/lib/oauth/oauth-credentials.mjs'
+import { tryAcquireOpenAISlot } from '../../src/lib/pool/openai-account-runtime.mjs'
+import { createPanelHandler } from '../../src/lib/admin/panel-routes.mjs'
 
 function project(records) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-sched-'))
@@ -118,6 +120,100 @@ test('setVmSchedulable routes legacy reasons onto the owned fields', (t) => {
   const failed = setVmSchedulable(root, 'vm-01', false, 'boot timed out')
   assert.equal(failed.unschedulable.reason, 'runtime_start_failed')
   assert.equal(failed.unschedulable.detail.message, 'boot timed out')
+})
+
+test('targeted maintenance preserves peer records and the selected slot scheduling gates', (t) => {
+  const testHold = { token: 'keep-test-owner', outcome: 'pending' }
+  const root = project([
+    {
+      id: 'vm-selected',
+      status: 'running',
+      schedule_off: true,
+      test_schedule_hold: testHold,
+      schedule_operator_revision: 7,
+    },
+    { id: 'vm-peer', status: 'running', schedulable: true },
+    { id: 'vm-held', status: 'running', schedule_hold: { reason: 'proxy_cooldown', detail: { tag: 'keep' } } },
+  ])
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const peer = fs.readFileSync(path.join(root, 'vms', 'vm-peer.json'), 'utf8')
+  const held = read(root, 'vm-held')
+  assert.deepEqual(holdSchedulableSlots(root, 'one-slot', ['vm-selected', 'vm-held']), ['vm-selected'])
+  assert.equal(getVm(root, 'vm-selected').schedule_hold.detail.tag, 'one-slot')
+  resumeSchedulableSlots(root, ['vm-selected'], 'one-slot')
+  const selected = read(root, 'vm-selected')
+  assert.equal(selected.schedule_off, true)
+  assert.equal(selected.schedule_operator_revision, 7)
+  assert.deepEqual(selected.test_schedule_hold, testHold)
+  assert.equal(selected.schedulable, false)
+  assert.equal(selected.schedule_hold, undefined)
+  assert.equal(fs.readFileSync(path.join(root, 'vms', 'vm-peer.json'), 'utf8'), peer)
+  assert.deepEqual(read(root, 'vm-held'), held)
+  assert.deepEqual(holdSchedulableSlots(root, 'none', []), [])
+})
+
+test('maintenance drain waits for Codex requests on the selected slot only', async (t) => {
+  const selected = tryAcquireOpenAISlot('drain-codex-selected')
+  const peer = tryAcquireOpenAISlot('drain-codex-peer')
+  t.after(() => {
+    selected.release()
+    peer.release()
+  })
+  assert.deepEqual(await waitForSlotDrain(null, ['drain-codex-selected'], { timeoutMs: 0 }), { ok: false, inflight: 1 })
+  const timer = setTimeout(() => selected.release(), 20)
+  t.after(() => clearTimeout(timer))
+  assert.deepEqual(await waitForSlotDrain(null, ['drain-codex-selected'], { timeoutMs: 1000 }), {
+    ok: true,
+    inflight: 0,
+  })
+  assert.deepEqual(await waitForSlotDrain(null, ['drain-codex-peer'], { timeoutMs: 0 }), { ok: false, inflight: 1 })
+})
+
+test('panel maintenance accepts an explicit slot scope and rejects invalid scopes without writes', async (t) => {
+  const root = project([
+    { id: 'vm-a', status: 'running', schedulable: true },
+    { id: 'vm-b', status: 'running', schedulable: true },
+    { id: 'vm-held', status: 'running', schedule_hold: { reason: 'proxy_cooldown' } },
+  ])
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  async function call(body, action = 'hold') {
+    let result
+    const handler = createPanelHandler({
+      cfg: { paths: { project: root } },
+      requireAuth(req) {
+        req.apiKeyKind = 'master'
+        return true
+      },
+      readBody: async () => body,
+      json(_res, status, payload) {
+        result = { status, payload }
+        return true
+      },
+    })
+    await handler({ method: 'POST', headers: {} }, {}, new URL(`http://localhost/api/panel/vms/schedule/${action}`))
+    return result
+  }
+  for (const ids of [[], null, 'vm-a', ['missing'], ['../escape'], ['vm-a', 'missing']]) {
+    assert.equal((await call({ ids, reason: 'sample' })).status, 400)
+    assert.equal(read(root, 'vm-a').schedule_hold, undefined)
+    assert.equal(read(root, 'vm-b').schedule_hold, undefined)
+  }
+  assert.equal((await call({ ids: ['vm-a', 'vm-held'], reason: 'sample' })).status, 409)
+  assert.equal(read(root, 'vm-a').schedule_hold, undefined)
+  const lease = tryAcquireOpenAISlot('vm-a')
+  t.after(() => lease.release())
+  const pending = call({ ids: ['vm-a'], reason: 'sample' })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(read(root, 'vm-a').schedulable, false)
+  assert.equal(read(root, 'vm-b').schedulable, true)
+  lease.release()
+  const result = await pending
+  assert.equal(result.status, 200)
+  assert.equal(result.payload.data.paused, 1)
+  assert.equal(result.payload.data.drained, true)
+  await call({ reason: 'sample' }, 'resume')
+  assert.equal(read(root, 'vm-a').schedulable, true)
+  assert.equal(read(root, 'vm-held').schedule_hold.reason, 'proxy_cooldown')
 })
 
 test('boot migration backs up and rewrites legacy records once', (t) => {
