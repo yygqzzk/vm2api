@@ -78,7 +78,7 @@ jobs:
       - name: format and syntax
         run: |
           npx biome format
-          test -z "$(gofmt -l worker api-kernel redact)" || { gofmt -l worker api-kernel; exit 1; }
+          test -z "$(gofmt -l worker api-kernel redact)" || { gofmt -l worker api-kernel redact; exit 1; }
           find src scripts -name '*.mjs' -print0 | xargs -0 -n1 node --check
 
   ci-prep:
@@ -262,6 +262,9 @@ jobs:
               cp -a image-wrap-cli/. share/wrap-cli/
               cp -a image-crag/. share/crag/
               exec node --test test/unit/fork-codex-stream.test.mjs \
+                test/unit/codex-kernel-client.test.mjs \
+                test/unit/codex-models.test.mjs \
+                test/unit/vm-test-chat-codex.test.mjs \
                 test/unit/oauth-auth-url.test.mjs \
                 test/unit/gpt-model-policy.test.mjs \
                 test/unit/codex-image-tool.test.mjs \

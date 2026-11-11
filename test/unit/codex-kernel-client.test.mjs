@@ -5,6 +5,7 @@ import { spawn } from 'node:child_process'
 import { codexKernelPaths, withCodexKernelExec } from '../../src/lib/transport/codex-kernel-client.mjs'
 import {
   ensureCodexKernel,
+  codexKernelRequestOptions,
   finishCodexRecycle,
   stopCodexKernel,
   writeCodexKernelConfig,
@@ -28,6 +29,18 @@ const LOCAL_CODEX = {
   platform: 'openai',
   proxy: { id: 'px-local', scheme: 'local', host: 'local', port: 0 },
 }
+
+test('saved Codex factory identity is upgraded in kernel config and per-request options', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-identity-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const routing = { codex: { user_agent: 'codex_cli_rs/0.160.0 (linux x86_64)' } }
+  const written = writeCodexKernelConfig(root, LOCAL_CODEX, { routing })
+  const config = JSON.parse(fs.readFileSync(written.configPath, 'utf8'))
+  assert.equal(config.user_agent, 'codex_cli_rs/0.167.1 (linux x86_64)')
+  assert.equal(codexKernelRequestOptions(routing).user_agent, config.user_agent)
+  assert.equal(routing.codex.user_agent, 'codex_cli_rs/0.160.0 (linux x86_64)')
+  assert.equal(codexKernelRequestOptions({ codex: { user_agent: 'custom-codex/1.0' } }).user_agent, 'custom-codex/1.0')
+})
 
 function setEnv(t, values) {
   const keys = [...new Set([...PROXY_ENV_KEYS, ...Object.keys(values)])]

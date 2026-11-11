@@ -4,16 +4,17 @@
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { normalizeOpenAIQuotaPolicy } from '../pool/openai-quota-policy.mjs'
 import { normalizeCodexModelMappings, validateCodexModelMappingsPatch } from './codex-model-mapping.mjs'
+import { CODEX_USER_AGENT } from './codex-models.mjs'
 
 export { isCodexVm, normalizeVmKind } from '../vm/vm-kind.mjs'
 
-export const DEFAULT_CODEX_USER_AGENT = 'codex_cli_rs/0.160.0 (linux x86_64)'
+export const DEFAULT_CODEX_USER_AGENT = CODEX_USER_AGENT
 export const CODEX_UPSTREAM_TRANSPORTS = Object.freeze(['prefer_websocket', 'http'])
 
 export const DEFAULT_CODEX_ROUTING = Object.freeze({
   enabled: true,
   // `auto` resolves the official Codex catalog client version at sync time,
-  // falling back to 0.160.0 when the registry is unavailable.
+  // falling back to the bundled client identity when the registry is unavailable.
   catalog_client_version: 'auto',
   user_agent: DEFAULT_CODEX_USER_AGENT,
   upstream_transport: 'prefer_websocket',
@@ -60,7 +61,9 @@ export function normalizeInferenceWebsocket(raw = {}) {
 }
 
 function normalizeUserAgent(raw) {
-  return typeof raw === 'string' && raw.trim() ? raw.trim() : DEFAULT_CODEX_USER_AGENT
+  const value = typeof raw === 'string' ? raw.trim() : ''
+  // Saved factory defaults must advance with the client identity required by newer models.
+  return !value || value === 'codex_cli_rs/0.160.0 (linux x86_64)' ? DEFAULT_CODEX_USER_AGENT : value
 }
 
 function normalizeUpstreamTransport(raw) {

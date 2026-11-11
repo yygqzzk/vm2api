@@ -27,9 +27,8 @@ export const CODEX_OAUTH_REDIRECT_URI = 'http://localhost:1455/auth/callback'
 export const CODEX_OAUTH_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann'
 export const CODEX_OAUTH_SCOPE = 'openid profile email offline_access api.connectors.read api.connectors.invoke'
 export const CODEX_OAUTH_ORIGINATOR = 'Codex Desktop'
-// This is the version embedded in the shipped kernel. Catalog discovery uses
-// the separately resolved official Codex client version below.
-export const CODEX_APP_VERSION = '0.160.0'
+// Official client identity for panel probes and direct Codex requests; independent of the kernel binary.
+export const CODEX_APP_VERSION = '0.167.1'
 // The model endpoint validates that Originator matches the User-Agent prefix.
 // OAuth still uses CODEX_OAUTH_ORIGINATOR (the desktop login surface), while
 // catalog requests use the resolved catalog client identity below.
@@ -38,7 +37,7 @@ export const CODEX_USER_AGENT = `${CODEX_CATALOG_ORIGINATOR}/${CODEX_APP_VERSION
 export const CODEX_CATALOG_VERSION_URL = 'https://registry.npmjs.org/@openai%2fcodex/latest'
 export const CODEX_CATALOG_VERSION_TTL_MS = 6 * 60 * 60 * 1000
 export const CODEX_CATALOG_VERSION_CACHE_FILE = 'codex-catalog-client.json'
-export const CODEX_CATALOG_DEFAULT_VERSION = '0.160.0'
+export const CODEX_CATALOG_DEFAULT_VERSION = CODEX_APP_VERSION
 
 const SEMVER_RE = /^\d+\.\d+\.\d+$/
 

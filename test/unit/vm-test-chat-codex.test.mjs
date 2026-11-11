@@ -118,7 +118,7 @@ test('runVmTestChat Codex slot loopbacks /v1/responses and never /v1/messages', 
   assert.equal(calls.length, 1)
   assert.equal(calls[0].headers['x-kin-vm'], 'vm-codex-01')
   assert.equal(calls[0].headers.authorization, 'Bearer test-master-key')
-  assert.match(String(calls[0].headers['user-agent'] || ''), /codex_cli_rs/i)
+  assert.equal(calls[0].headers['user-agent'], 'codex_cli_rs/0.167.1 (linux x86_64)')
   assert.ok(calls[0].headers['x-codex-installation-id'])
   assert.equal(calls[0].body.model, 'gpt-5.4')
   assert.equal(Array.isArray(calls[0].body.input), true)
