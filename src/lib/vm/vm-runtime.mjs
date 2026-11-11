@@ -4,11 +4,11 @@
  * The slot joins the bound SOCKS5's transparent network; the worker
  * dials origin directly. Missing bound proxy refuses start.
  */
-import { execFileSync } from 'node:child_process'
+import { execFile, execFileSync } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
-import { isDeepStrictEqual } from 'node:util'
+import { isDeepStrictEqual, promisify } from 'node:util'
 import { slotHost } from './slot-host.mjs'
 import { maxRequestBytes, readRoutingConfigFile, streamIdleTimeoutMs } from '../core/config.mjs'
 import { US_TIMEZONES, validTimezone } from '../core/timezone.mjs'
@@ -173,6 +173,26 @@ function sh(argv, opts = {}) {
       stdout: String(e.stdout || '').trim(),
       stderr: String(e.stderr || e.message || '').trim(),
       code: e.status,
+    }
+  }
+}
+
+const runFile = promisify(execFile)
+
+// A container stop can take ten seconds; let peer kernel health checks run meanwhile.
+async function shAsync(argv, opts = {}) {
+  try {
+    const { stdout } = await runFile(argv[0], argv.slice(1), {
+      encoding: 'utf8',
+      timeout: opts.timeout ?? 90_000,
+    })
+    return { ok: true, stdout: stdout.trim(), stderr: '' }
+  } catch (e) {
+    return {
+      ok: false,
+      stdout: String(e.stdout || '').trim(),
+      stderr: String(e.stderr || e.message || '').trim(),
+      code: e.code,
     }
   }
 }
@@ -557,7 +577,7 @@ export async function reloadSlotWorker(vm, projectRoot, { routing } = {}) {
   }
   if (isKvmRuntime(vm)) {
     if (!existing.running) {
-      const r = sh(['docker', 'start', name], { timeout: 60_000 })
+      const r = await shAsync(['docker', 'start', name], { timeout: 60_000 })
       if (!r.ok) return { ok: false, error: r.stderr || 'docker start failed' }
       const chownErr = applyKvmBindChown(name, vm)
       if (chownErr) return chownErr
@@ -570,7 +590,7 @@ export async function reloadSlotWorker(vm, projectRoot, { routing } = {}) {
     }
     const chownErr = applyKvmBindChown(name, vm)
     if (chownErr) return chownErr
-    const r = sh(
+    const r = await shAsync(
       [
         'docker',
         ...slotExecArgv(
@@ -590,7 +610,7 @@ export async function reloadSlotWorker(vm, projectRoot, { routing } = {}) {
     return { ok: true, action: 'reloaded', runtime: vm.runtime }
   }
   const cmd = existing.running ? ['docker', 'restart', name] : ['docker', 'start', name]
-  const r = sh(cmd, { timeout: 60_000 })
+  const r = await shAsync(cmd, { timeout: 60_000 })
   if (!r.ok) return { ok: false, error: r.stderr || `${cmd.join(' ')} failed` }
   runtimePatch(vm, inspectContainer(name), { ...workerRuntimeExtra(worker), memory: slotMemory(vm, routing), routing })
   return { ok: true, action: existing.running ? 'reloaded' : 'started', runtime: vm.runtime }

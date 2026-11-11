@@ -5,7 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import http from 'node:http'
 import { runFleetUpdate, fleetStatus, isWorkerProcessUp, applyNativeTelemetry } from '../../src/lib/vm/fleet-update.mjs'
-import { withVmLock } from '../../src/lib/vm/vm-file.mjs'
+import { atomicWriteJson, withVmLock } from '../../src/lib/vm/vm-file.mjs'
 
 function writeSlot(root, id, extra = {}) {
   const dir = path.join(root, 'vms')
@@ -138,7 +138,7 @@ test('warm rechecks running intent after waiting for an ongoing slot action', as
   const stopping = withVmLock(file, async () => {
     entered()
     await gate
-    writeSlot(root, 'vm-warm', { platform: 'openai', status: 'stopped' })
+    atomicWriteJson(file, { ...JSON.parse(fs.readFileSync(file, 'utf8')), status: 'stopped' })
   })
   await locked
   const pending = runFleetUpdate(root, { action: 'warm' })
