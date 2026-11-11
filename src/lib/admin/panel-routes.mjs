@@ -265,7 +265,7 @@ import {
   writeGuestMachineIdFile,
 } from '../identity/workstation-fingerprint.mjs'
 import { assignComputerFingerprint } from '../identity/slot-computer.mjs'
-import { runFleetUpdate, fleetStatus } from '../vm/fleet-update.mjs'
+import { runFleetUpdate, fleetStatus, FLEET_ACTIONS } from '../vm/fleet-update.mjs'
 import {
   captureWrapSample,
   describeWrapSample,
@@ -2530,7 +2530,7 @@ export function createPanelHandler(ctx) {
       }
       // GET /api/panel/vms/fleet-status — must be before /vms/:id
       if (req.method === 'GET' && p === '/api/panel/vms/fleet-status') {
-        return json(res, 200, panel.ok({ items: fleetStatus(cfg.paths.project) }))
+        return json(res, 200, panel.ok({ items: fleetStatus(cfg.paths.project), actions: FLEET_ACTIONS }))
       }
       // GET /api/panel/vms/create-options — same ACL as POST /vms/create; tenants cannot read cluster/local
       if (req.method === 'GET' && p === '/api/panel/vms/create-options') {

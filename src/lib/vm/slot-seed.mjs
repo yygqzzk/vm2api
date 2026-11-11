@@ -10,8 +10,45 @@ import { buildKinSeedJson } from '../identity/workstation-profile.mjs'
 import { OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
 import crypto from 'node:crypto'
 import { runtimeFileOwner } from '../oauth/oauth-credentials.mjs'
+import { slotHost } from './slot-host.mjs'
+import { withVmLock } from './vm-file.mjs'
 
 const SEED_FILES = ['settings.json', 'claude.setting', 'kin-seed.json']
+
+/** Refresh seeds from the slot record before boot/reload, preserving owner settings. */
+export async function syncSlotSeedFiles(projectRoot, vm) {
+  const file = path.join(projectRoot, 'vms', `${vm.id}.json`)
+  return withVmLock(`seed-publication:${file}`, async () => {
+    const stored = fs.existsSync(file)
+    const current = () => (stored ? JSON.parse(fs.readFileSync(file, 'utf8')) : vm)
+    const revision = (record) =>
+      JSON.stringify([
+        record.node_id,
+        record.runtime,
+        record.kernel,
+        record.timezone,
+        record.locale,
+        record.seed_policy,
+        record.fingerprint,
+      ])
+    const record = current()
+    const expected = revision(record)
+    const host = slotHost(record)
+    const slotDir = path.join(projectRoot, 'vms', record.id)
+    const existing = await host.seedFiles(record, slotDir)
+    const assertCurrent = () => {
+      if (revision(current()) !== expected) throw new Error('seed_publication_superseded')
+    }
+    assertCurrent()
+    writeSlotSeedFiles(projectRoot, record, null, {
+      existingSettings: existing.files['settings.json'] === null ? {} : JSON.parse(existing.files['settings.json']),
+    })
+    const published = await host.syncSeed(record, slotDir)
+    if (published?.published !== true) throw new Error('seed_publish_failed')
+    assertCurrent()
+    return { wrote: true, published: true }
+  })
+}
 
 function withSeedDirectory(slotDir, create, fn) {
   if (create) fs.mkdirSync(slotDir, { recursive: true, mode: 0o700 })

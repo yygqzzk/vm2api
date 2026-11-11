@@ -136,6 +136,37 @@ class CutoverVerification(unittest.TestCase):
         self.assertTrue(json.loads((self.root / "deployment.json").read_text())["deployed"])
         c.verify.assert_called_once_with(self.root, self.before, c.image, c.revision)
 
+    def test_warm_kernels_uses_controller_only_for_previously_running_slots(self):
+        self.cutover.api = Mock(side_effect=[{"actions": ["warm"]},
+                                            {"action": "warm", "ok_count": 1, "failed_count": 0},
+                                            {"action": "warm", "ok_count": 1, "failed_count": 0}])
+        before = {"slots": {"vm-a": {"status": "running"}, "vm-stopped": {"status": "stopped"},
+                            "vm-b": {"status": "running"}}}
+        with patch.object(cutover.subprocess, "run") as run:
+            self.cutover.warm_kernels(self.root, before)
+        run.assert_not_called()
+        self.assertEqual([call.args[0] for call in self.cutover.api.call_args_list],
+                         ["/api/panel/vms/fleet-status", "/api/panel/vms/fleet-update", "/api/panel/vms/fleet-update"])
+        self.assertEqual([call.kwargs["body"] for call in self.cutover.api.call_args_list[1:]],
+                         [{"action": "warm", "ids": [vid], "concurrency": 1} for vid in ("vm-a", "vm-b")])
+        self.assertEqual(json.loads((self.root / "warm.json").read_text()), {"started": ["vm-a", "vm-b"]})
+
+    def test_warm_kernel_api_failure_aborts_without_claiming_the_slot_warmed(self):
+        self.cutover.api = Mock(side_effect=[{"actions": ["warm"]},
+                                            {"action": "warm", "ok_count": 0, "failed_count": 1}])
+        with self.assertRaisesRegex(RuntimeError, "Controller kernel warm-up failed"):
+            self.cutover.warm_kernels(self.root, {"slots": {"vm-a": {"status": "running"}}})
+        self.assertFalse((self.root / "warm.json").exists())
+
+    def test_warm_kernel_rollback_supports_images_without_the_warm_action(self):
+        self.cutover.api = Mock(return_value={"items": []})
+        with patch.object(cutover.subprocess, "run",
+                          return_value=SimpleNamespace(returncode=0, stdout="", stderr="")) as run:
+            self.cutover.warm_kernels(self.root, {"slots": {"vm-a": {"status": "running"}}})
+        self.assertEqual(run.call_args.args[0][:5], ["docker", "exec", "-i", "vm2api", "node"])
+        self.assertIn('"vm-a"', run.call_args.kwargs["input"])
+        self.assertEqual(len(self.cutover.api.call_args_list), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
