@@ -31,6 +31,7 @@ import { isLocalEgressProxy } from './egress.mjs'
 import { vmNodeId } from '../cluster/placement.mjs'
 import { hostProxyUrlForVm, slotHost } from './slot-host.mjs'
 import { checkCragLicense } from './crag-license.mjs'
+import { syncSlotSeedFiles } from './slot-seed.mjs'
 
 export { runtimeKind }
 
@@ -54,6 +55,7 @@ function persistNodeRuntime(vm, projectRoot, boot) {
 export async function startSlotReady(vm, projectRoot, opts = {}) {
   if (isCodexVm(vm)) {
     if (!slotHost(vm).supports('codex')) return unsupportedOnHost('codex')
+    await (opts.ops?.syncSlotSeedFiles || syncSlotSeedFiles)(projectRoot, vm)
     const boot = await (opts.ops?.startSlot || startSlot)(vm, projectRoot, opts)
     if (!boot?.ok) return boot
     persistNodeRuntime(vm, projectRoot, boot)
@@ -61,6 +63,7 @@ export async function startSlotReady(vm, projectRoot, opts = {}) {
     if (!kernel.ok) return kernel
     return { ok: true, engine: 'codex', docker: boot, kernel }
   }
+  await (opts.ops?.syncSlotSeedFiles || syncSlotSeedFiles)(projectRoot, vm)
   const boot = await startSlot(vm, projectRoot, opts)
   if (!boot?.ok) return boot
   persistNodeRuntime(vm, projectRoot, boot)
@@ -83,6 +86,7 @@ export async function reloadSlot(vm, projectRoot, opts = {}) {
 }
 
 export async function reloadSlotReady(vm, projectRoot, opts = {}) {
+  await (opts.ops?.syncSlotSeedFiles || syncSlotSeedFiles)(projectRoot, vm)
   const boot = await (opts.ops?.reloadSlot || reloadSlot)(vm, projectRoot, opts)
   if (!boot?.ok) return boot
   persistVmRuntime(projectRoot, vm.id, boot.runtime)

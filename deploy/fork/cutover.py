@@ -333,7 +333,10 @@ class Cutover:
         ids = [vid for vid, slot in before["slots"].items() if slot["status"] == "running"]
         if not ids:
             return
-        code = """
+        actions = self.api("/api/panel/vms/fleet-status").get("actions", [])
+        if "warm" not in actions:
+            # Rollback to pre-warm-action images retains their original startup path.
+            code = """
 import fs from 'node:fs';
 import {ensureCodexKernel} from '/opt/vm2api/src/lib/transport/codex-kernel-supervisor.mjs';
 import {slotExec} from '/opt/vm2api/src/lib/vm/slot-runtime.mjs';
@@ -343,11 +346,25 @@ for (const id of IDS) {
   if (!result.ok) process.exit(1);
 }
 """.replace("IDS", json.dumps(ids))
-        result = subprocess.run(["docker", "exec", "-i", "vm2api", "node", "--input-type=module"],
-                                input=code, capture_output=True, text=True, timeout=timeout)
-        (folder / "warm.log").write_text(result.stdout + result.stderr)
-        (folder / "warm.log").chmod(0o600)
-        require(result.returncode == 0, "Kernel warm-up failed; see restricted warm.log")
+            result = subprocess.run(["docker", "exec", "-i", "vm2api", "node", "--input-type=module"],
+                                    input=code, capture_output=True, text=True, timeout=timeout)
+            (folder / "warm.log").write_text(result.stdout + result.stderr)
+            (folder / "warm.log").chmod(0o600)
+            require(result.returncode == 0, "Kernel warm-up failed; see restricted warm.log")
+            return
+        deadline = time.monotonic() + timeout
+        warmed = []
+        for vid in ids:
+            remaining = deadline - time.monotonic()
+            require(remaining > 0, "Kernel warm-up timed out")
+            # The long-lived controller must own the children it will later reload.
+            report = self.api("/api/panel/vms/fleet-update",
+                              body={"action": "warm", "ids": [vid], "concurrency": 1}, timeout=min(120, remaining))
+            require(report.get("action") == "warm" and report.get("ok_count") == 1
+                    and report.get("failed_count") == 0 and report.get("skipped_count", 0) == 0,
+                    "Controller kernel warm-up failed")
+            warmed.append(vid)
+            save(folder / "warm.json", {"started": warmed})
 
     def verify(self, folder, before, target_image, revision):
         after = self.snapshot()

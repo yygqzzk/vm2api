@@ -3,7 +3,9 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import http from 'node:http'
 import { runFleetUpdate, fleetStatus, isWorkerProcessUp, applyNativeTelemetry } from '../../src/lib/vm/fleet-update.mjs'
+import { withVmLock } from '../../src/lib/vm/vm-file.mjs'
 
 function writeSlot(root, id, extra = {}) {
   const dir = path.join(root, 'vms')
@@ -79,6 +81,74 @@ test('fleet reload awaits engine-aware runtime and passes routing', async () => 
 test('degraded worker without OAuth still counts as up', () => {
   assert.equal(isWorkerProcessUp({ ok: false, status: 'degraded', vm_id: 'vm-02' }), true)
   assert.equal(isWorkerProcessUp({ code: 'worker_unavailable' }), false)
+})
+
+test('fleet roll checks the Codex socket rather than waiting for a Rust kernel', async (t) => {
+  const root = fs.mkdtempSync('/tmp/fleet-codex-')
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  writeSlot(root, 'vm-codex', { platform: 'openai', family: 'codex' })
+  const run = path.join(root, 'vms', 'vm-codex', 'run')
+  fs.mkdirSync(run, { recursive: true })
+  const server = http.createServer((_req, res) => {
+    res.setHeader('content-type', 'application/json')
+    res.end(JSON.stringify({ ok: true, engine: 'codex' }))
+  })
+  await new Promise((resolve) => server.listen(path.join(run, 'codex-kernel.sock'), resolve))
+  t.after(() => new Promise((resolve) => server.close(resolve)))
+
+  const report = await runFleetUpdate(root, {
+    action: 'roll',
+    reloadFn: async () => ({ ok: true }),
+    collectFn: async () => ({ ok: true }),
+    readyTimeoutMs: 1000,
+  })
+
+  assert.equal(report.ok_count, 1)
+  assert.equal(report.items[0].ready, true)
+})
+
+test('fleet roll reports an unready runtime as failed without collecting it', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-fleet-unready-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  writeSlot(root, 'vm-unready')
+  const report = await runFleetUpdate(root, {
+    action: 'roll',
+    reloadFn: async () => ({ ok: true }),
+    healthFn: async () => ({ ok: false, code: 'worker_unavailable' }),
+    collectFn: async () => assert.fail('must not collect an unready runtime'),
+    readyTimeoutMs: 1,
+  })
+  assert.equal(report.failed_count, 1)
+  assert.equal(report.items[0].code, 'worker_not_ready')
+  assert.equal(report.items[0].collect, undefined)
+})
+
+test('warm rechecks running intent after waiting for an ongoing slot action', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-fleet-warm-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  writeSlot(root, 'vm-warm', { platform: 'openai' })
+  const file = path.join(root, 'vms', 'vm-warm.json')
+  let release, entered
+  const gate = new Promise((resolve) => {
+    release = resolve
+  })
+  const locked = new Promise((resolve) => {
+    entered = resolve
+  })
+  const stopping = withVmLock(file, async () => {
+    entered()
+    await gate
+    writeSlot(root, 'vm-warm', { platform: 'openai', status: 'stopped' })
+  })
+  await locked
+  const pending = runFleetUpdate(root, { action: 'warm' })
+  release()
+  await stopping
+  const report = await pending
+  assert.equal(report.failed_count, 0)
+  assert.equal(report.skipped_count, 1)
+  assert.equal(report.items[0].skip_reason, 'vm_not_running')
+  assert.equal(fs.existsSync(path.join(root, 'vms', 'vm-warm')), false)
 })
 
 test('fleet collect skips reload', async () => {

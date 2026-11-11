@@ -100,6 +100,7 @@ test('a failed remote GPT boot is returned and does not start the Codex kernel',
   const boot = { ok: false, code: 'slot_image_build_failed', error: 'node image build failed' }
   const result = await startSlotReady(gpt, '/tmp/vm2api-unused', {
     ops: {
+      syncSlotSeedFiles: async () => ({ wrote: true, published: true }),
       startSlot: async () => boot,
       ensureCodexKernel: async () => {
         kernelStarts += 1

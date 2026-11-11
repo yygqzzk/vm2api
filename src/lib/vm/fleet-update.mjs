@@ -5,12 +5,13 @@
  */
 import { listVms, getVm } from './vm-registry.mjs'
 import { runtimeKind } from './runtime-kind.mjs'
-import { reloadSlotReady, slotExec } from './slot-runtime.mjs'
+import { reloadSlotReady, slotExec, ensureSlotInferenceRuntime } from './slot-runtime.mjs'
 import { collectSlotIdentity } from './guest-identity.mjs'
 import { rustKernelHealth } from '../transport/rust-kernel-client.mjs'
+import { codexKernelHealth } from '../transport/codex-kernel-client.mjs'
 import path from 'node:path'
 import { syncNativeTelemetry } from './vm-runtime.mjs'
-import { writeSlotSeedFiles } from './slot-seed.mjs'
+import { writeSlotSeedFiles, syncSlotSeedFiles } from './slot-seed.mjs'
 import { readVmProxyGeo, writeVmProxyTelemetryEgress } from './native-telemetry.mjs'
 import { slotHost } from './slot-host.mjs'
 import { readSlotProcessStatus, retireLegacyTelemetry } from './slot-process-status.mjs'
@@ -42,7 +43,8 @@ function publicationPlacement(vm) {
   ])
 }
 
-const ACTIONS = new Set(['collect', 'reload', 'roll', 'telemetry'])
+export const FLEET_ACTIONS = Object.freeze(['collect', 'reload', 'roll', 'telemetry', 'warm'])
+const ACTIONS = new Set(FLEET_ACTIONS)
 
 /** Acknowledged publication followed by native state, never a sidecar/egress restart. */
 export async function applyNativeTelemetry({
@@ -201,7 +203,7 @@ export async function updateOneSlot(
     routing = {},
     reloadFn = reloadSlotReady,
     collectFn = collectSlotIdentity,
-    healthFn = rustKernelHealth,
+    healthFn = normalizeVmKind(vm).kind === 'codex' ? codexKernelHealth : rustKernelHealth,
     telemetryFn,
     telemetryEnabled,
     readyTimeoutMs = 15000,
@@ -211,6 +213,27 @@ export async function updateOneSlot(
   const kind = runtimeKind(vm)
   const result = { id, ok: false, action, runtime_kind: kind }
   try {
+    if (action === 'warm') {
+      return await withVmLock(path.join(projectRoot, 'vms', `${id}.json`), async () => {
+        const current = getVm(projectRoot, id)
+        if (!current) return { ...result, code: 'vm_not_found', error: 'vm not found' }
+        if (current.status !== 'running') {
+          return { ...result, ok: true, skipped: true, skip_reason: 'vm_not_running' }
+        }
+        await syncSlotSeedFiles(projectRoot, current)
+        const warm = await ensureSlotInferenceRuntime(current, projectRoot, { routing })
+        result.warm = warm
+        if (warm?.skipped) {
+          return { ...result, ok: true, skipped: true, skip_reason: warm.reason || 'kernel_warm_skipped' }
+        }
+        if (!warm?.ok) {
+          result.error = warm?.error || warm?.reason || 'kernel warm-up failed'
+          result.code = warm?.code || 'kernel_warm_failed'
+          return result
+        }
+        return { ...result, ok: true }
+      })
+    }
     if (action === 'reload' || action === 'roll') {
       const reloaded = await reloadFn(vm, projectRoot, { routing })
       result.reload = reloaded
@@ -219,13 +242,14 @@ export async function updateOneSlot(
         result.code = reloaded?.code || 'reload_failed'
         return result
       }
-      const ready = await waitWorkerReady(slotExec(projectRoot, vm), {
+      const ready = await waitWorkerReady(slotExec(projectRoot, getVm(projectRoot, id) || vm), {
         timeoutMs: readyTimeoutMs,
         healthFn,
       })
       result.ready = !!ready.ok
-      if (!ready.ok && action === 'reload') {
+      if (!ready.ok) {
         result.error = ready.error || 'worker_not_ready'
+        result.code = 'worker_not_ready'
         return result
       }
     }

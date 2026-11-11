@@ -13,6 +13,7 @@ import {
   writeCodexKernelConfig,
 } from '../../src/lib/transport/codex-kernel-supervisor.mjs'
 import { reloadSlotReady } from '../../src/lib/vm/slot-runtime.mjs'
+import { runFleetUpdate } from '../../src/lib/vm/fleet-update.mjs'
 
 async function fixture(t) {
   // Keep the Unix-socket path below macOS's length limit.
@@ -77,6 +78,60 @@ test('GPT reload replaces the host kernel and adopts the new proxy without touch
   assert.notEqual(current.pid, first.health.pid, 'a container reload must not reuse the old host kernel')
   assert.equal(current.proxy, first.vm.proxy.url, 'the process must read the new proxy at startup')
   assert.equal((await codexKernelHealth(peer.exec)).pid, peer.health.pid)
+})
+
+test('GPT reload repairs timezone seeds while preserving the slot identity and owner settings', async (t) => {
+  const f = await fixture(t)
+  const first = await f.slot('vm-seed')
+  const vmPath = path.join(f.root, 'vms', `${first.vm.id}.json`)
+  const vm = {
+    ...first.vm,
+    timezone: 'America/Chicago',
+    locale: 'en_US.UTF-8',
+    fingerprint: { device_id: 'stable-device', session_id: 'stable-session' },
+  }
+  fs.writeFileSync(vmPath, JSON.stringify(vm))
+  const dir = path.join(first.exec.homeDir, '.claude')
+  fs.mkdirSync(dir, { recursive: true })
+  fs.writeFileSync(path.join(dir, 'settings.json'), JSON.stringify({ env: { CUSTOM: 'keep' } }))
+  fs.writeFileSync(path.join(dir, 'kin-seed.json'), JSON.stringify({ timezone: null }))
+  const installation = fs.readFileSync(path.join(f.root, 'vms', vm.id, 'run', 'codex-installation-id'), 'utf8')
+
+  const result = await reloadSlotReady(vm, f.root, { ops: { reloadSlot: reloadContainer } })
+
+  assert.equal(result.ok, true)
+  const seed = JSON.parse(fs.readFileSync(path.join(dir, 'kin-seed.json'), 'utf8'))
+  const settings = JSON.parse(fs.readFileSync(path.join(dir, 'settings.json'), 'utf8'))
+  assert.equal(seed.timezone, vm.timezone)
+  assert.equal(seed.locale, vm.locale)
+  assert.equal(settings.env.TZ, vm.timezone)
+  assert.equal(settings.env.LANG, vm.locale)
+  assert.equal(settings.env.CUSTOM, 'keep')
+  assert.deepEqual(JSON.parse(fs.readFileSync(vmPath, 'utf8')).fingerprint, vm.fingerprint)
+  assert.equal(fs.readFileSync(path.join(f.root, 'vms', vm.id, 'run', 'codex-installation-id'), 'utf8'), installation)
+})
+
+test('controller warm preserves a live kernel and slot records, repairs seeds and leaves stopped slots alone', async (t) => {
+  const f = await fixture(t)
+  const first = await f.slot('vm-warm')
+  const vm = { ...first.vm, status: 'running', timezone: 'America/Los_Angeles', locale: 'en_US.UTF-8' }
+  const record = path.join(f.root, 'vms', `${vm.id}.json`)
+  fs.writeFileSync(record, JSON.stringify(vm))
+  const stopped = path.join(f.root, 'vms', 'vm-stopped.json')
+  fs.writeFileSync(stopped, JSON.stringify({ id: 'vm-stopped', platform: 'openai', status: 'stopped' }))
+  const before = fs.readFileSync(record, 'utf8')
+  const report = await runFleetUpdate(f.root, { action: 'warm' })
+
+  assert.equal(report.action, 'warm')
+  assert.equal(report.failed_count, 0)
+  assert.equal(report.skipped_count, 1)
+  assert.equal((await codexKernelHealth(first.exec)).pid, first.health.pid)
+  assert.equal(codexKernelTracked(vm.id), true)
+  assert.equal(fs.readFileSync(record, 'utf8'), before)
+  assert.equal(fs.existsSync(path.join(f.root, 'vms', 'vm-stopped')), false)
+  const seed = JSON.parse(fs.readFileSync(path.join(first.exec.homeDir, '.claude', 'kin-seed.json'), 'utf8'))
+  assert.equal(seed.timezone, vm.timezone)
+  assert.equal(report.items.find((item) => item.id === vm.id).warm.kernel.reused, true)
 })
 
 test('GPT reload with eager_start disabled stops the old kernel and leaves lazy startup enabled', async (t) => {
