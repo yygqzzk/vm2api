@@ -51,6 +51,7 @@ import { evaluateCodexQuotaSchedule } from '../pool/codex-slot-pool.mjs'
 import { effectiveOpenAIPolicy, normalizeOpenAIQuotaPolicy } from '../pool/openai-quota-policy.mjs'
 import { runtimeKind } from './runtime-kind.mjs'
 import { hasBoundExit } from './egress.mjs'
+import { openAIRuntimeSignals } from '../pool/openai-account-runtime.mjs'
 import { ensureSlotSmbios } from './machine-spec.mjs'
 
 export { isCodexVm, normalizeVmKind } from './vm-kind.mjs'
@@ -648,10 +649,12 @@ export function setVmSchedulable(
 }
 export const KERNEL_UPDATE_HOLD = 'kernel_update'
 
-export function holdSchedulableSlots(project, reason = KERNEL_UPDATE_HOLD) {
+export function holdSchedulableSlots(project, reason = KERNEL_UPDATE_HOLD, ids = null) {
+  const wanted = ids === null ? null : new Set(ids)
   const held = []
   for (const vm of listVms(project)) {
-    if (vm?.schedulable === false) continue
+    if (wanted ? !wanted.has(vm.id) : vm?.schedulable === false) continue
+    if (vm.schedule_hold && !isMaintenanceHold(vm, reason)) continue
     const summary = setScheduleHold(project, vm.id, HOLD_MAINTENANCE, { tag: reason })
     if (summary) held.push(vm.id)
   }
@@ -715,6 +718,7 @@ export async function waitForSlotDrain(poolScheduler, ids, { timeoutMs = 120000 
     for (const [vmId, value] of poolScheduler?.vmInflight || []) {
       if (wanted.has(String(vmId))) inflight += Number(value) || 0
     }
+    for (const id of wanted) inflight += openAIRuntimeSignals(id).inFlight
     return inflight
   }
   const deadline = Date.now() + timeoutMs

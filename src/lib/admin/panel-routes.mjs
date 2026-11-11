@@ -3601,7 +3601,25 @@ export function createPanelHandler(ctx) {
       if (req.method === 'POST' && p === '/api/panel/vms/schedule/hold') {
         const body = await readBody(req, 8192).catch(() => ({}))
         const reason = String(body?.reason || KERNEL_UPDATE_HOLD).slice(0, 64)
-        const ids = holdSchedulableSlots(cfg.paths.project, reason)
+        const selected = body?.ids
+        if (selected !== undefined) {
+          if (
+            !Array.isArray(selected) ||
+            !selected.length ||
+            selected.some((id) => typeof id !== 'string' || !isValidVmId(id) || !getVm(cfg.paths.project, id))
+          ) {
+            return json(res, 400, { ok: false, error: { message: 'ids must be a non-empty list of existing slots' } })
+          }
+          if (
+            selected.some((id) => {
+              const vm = getVm(cfg.paths.project, id)
+              return vm.schedule_hold && !isMaintenanceHold(vm, reason)
+            })
+          ) {
+            return json(res, 409, { ok: false, error: { code: 'slot_held', message: '槽位正在其他维护中' } })
+          }
+        }
+        const ids = holdSchedulableSlots(cfg.paths.project, reason, selected ?? null)
         const drain = await waitForSlotDrain(ctx.poolScheduler, ids)
         if (!drain.ok) {
           const restored = resumeSchedulableSlots(cfg.paths.project, ids, reason)
