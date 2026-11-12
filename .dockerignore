@@ -18,6 +18,7 @@ test
 crates
 patches
 .local
+docker/fork/slot-browser/archives/*.zip
 local-src
 skills
 src/lib/oauth/auth.js

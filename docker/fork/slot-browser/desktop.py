@@ -3,9 +3,13 @@ import hmac
 import http.server
 import json
 import os
+import secrets
+import shutil
 import signal
 import socketserver
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -17,17 +21,69 @@ VNC_SOCKET = "/run/browser/vnc.sock"
 MAX_MESSAGE = 32768
 LEASE_SECONDS = 45
 IDLE_SECONDS = 300
+IDENTITY_FILE = "browser-identity.json"
 
 
-def browser_args():
+def identity_seed(root=Path("/profile")):
+    file = root / IDENTITY_FILE
+    if file.is_symlink():
+        raise RuntimeError("browser_identity_unreadable; identity must be a regular file")
+    if file.exists():
+        try:
+            data = json.loads(file.read_text())
+            seed = data["seed"]
+            if (data["version"] != 1 or not isinstance(seed, str) or not seed.isascii()
+                    or not seed.isdecimal() or not 0 < int(seed) < 2**63):
+                raise ValueError("invalid browser identity")
+            return seed
+        except (ValueError, KeyError, TypeError, OSError) as error:
+            raise RuntimeError("browser_identity_unreadable; preserve identity before repair") from error
+    seed = str(secrets.randbits(63) or 1)
+    name = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", dir=root, prefix=".browser-identity-", delete=False) as temp:
+            name = Path(temp.name)
+            json.dump({"version": 1, "seed": seed}, temp)
+            temp.flush()
+            os.fsync(temp.fileno())
+        name.replace(file)
+        directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if name is not None:
+            name.unlink(missing_ok=True)
+    return seed
+
+
+def reset_profile(root=Path("/profile")):
+    for entry in root.iterdir():
+        if entry.name == IDENTITY_FILE:
+            continue
+        if entry.is_symlink() or not entry.is_dir():
+            entry.unlink()
+        else:
+            shutil.rmtree(entry)
+
+
+def browser_args(seed):
     return ["/usr/bin/chromium", "--user-data-dir=/profile/chromium", "--no-first-run",
             "--no-default-browser-check", "--disable-quic",
             "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
-            f"--lang={os.environ['BROWSER_LANGUAGE']}", "--window-size=1280,800"]
+            f"--lang={os.environ['BROWSER_LANGUAGE']}", "--window-size=1280,800",
+            f"--fingerprint={seed}", "--fingerprint-platform=linux",
+            "--fingerprint-pixel-noise=seeded", "--fingerprint-audio-render=isolated",
+            f"--fingerprint-timezone={os.environ['TZ']}",
+            f"--fingerprint-locale={os.environ['BROWSER_LANGUAGE']}",
+            "--fingerprint-screen-width=1280", "--fingerprint-screen-height=800",
+            "--fingerprint-taskbar-height=0"]
 
 
 class Desktop:
-    def __init__(self):
+    def __init__(self, seed):
+        self.seed = seed
         self.lock = threading.Lock()
         self.lease_at = time.monotonic()
         self.view_at = self.lease_at
@@ -55,7 +111,7 @@ class Desktop:
                     self.grant = {"state": grant["state"], "session_id": str(grant["session_id"]),
                                   "expires": time.monotonic() + 600}
                     self.callback = None
-                subprocess.Popen([*browser_args(), "--new-tab", url], stdout=subprocess.DEVNULL,
+                subprocess.Popen([*browser_args(self.seed), "--new-tab", url], stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL, start_new_session=True)
                 self.view_at = time.monotonic()
             elif op == "callback":
@@ -142,7 +198,7 @@ def preferences():
 def main():
     os.umask(0o077)
     preferences()
-    desktop = Desktop()
+    desktop = Desktop(identity_seed())
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_args: stop.set())
     signal.signal(signal.SIGINT, lambda *_args: stop.set())
@@ -165,7 +221,7 @@ def main():
                 raise RuntimeError("display_start_failed")
             time.sleep(0.1)
         desktop.children.append(subprocess.Popen(["openbox"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
-        browser = subprocess.Popen([*browser_args(), "about:blank"],
+        browser = subprocess.Popen([*browser_args(desktop.seed), "about:blank"],
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         desktop.children.append(browser)
         # A failed Chromium sandbox normally exits during startup. Never retry
@@ -208,4 +264,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:] == ["reset-profile"]:
+        reset_profile()
+    elif sys.argv[1:]:
+        raise SystemExit(2)
+    else:
+        main()

@@ -1,8 +1,13 @@
 """Offline contracts for the browser's network plan and OAuth callback."""
 import importlib.util
+import hashlib
+import os
+import tempfile
 import time
 import unittest
+import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2] / "docker/fork/slot-browser"
 
@@ -18,6 +23,7 @@ def load(name):
 
 entrypoint = load("entrypoint")
 desktop = load("desktop")
+installer = load("install_chromix")
 
 
 class BrowserContracts(unittest.TestCase):
@@ -40,7 +46,7 @@ class BrowserContracts(unittest.TestCase):
                 entrypoint.network_rules(host, port)
 
     def grant(self):
-        instance = desktop.Desktop()
+        instance = desktop.Desktop("123456")
         instance.grant = {"state": "test-state-0123456789", "session_id": "session-a", "expires": time.monotonic() + 30}
         return instance
 
@@ -62,6 +68,79 @@ class BrowserContracts(unittest.TestCase):
         instance = self.grant()
         instance.grant["expires"] = time.monotonic() - 1
         self.assertFalse(instance.accept_callback("localhost:1455", "/auth/callback?code=a&state=test-state-0123456789"))
+
+    def test_identity_is_created_once_without_changing_legacy_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            legacy = root / "chromium" / "Default"
+            legacy.mkdir(parents=True)
+            (legacy / "Cookies").write_bytes(b"synthetic existing login")
+            first = desktop.identity_seed(root)
+            self.assertEqual(desktop.identity_seed(root), first)
+            self.assertEqual((legacy / "Cookies").read_bytes(), b"synthetic existing login")
+            with tempfile.TemporaryDirectory() as other:
+                self.assertNotEqual(desktop.identity_seed(Path(other)), first)
+
+    def test_login_reset_preserves_identity_and_does_not_follow_symlinks(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as outside:
+            root = Path(directory)
+            first = desktop.identity_seed(root)
+            identity = (root / desktop.IDENTITY_FILE).read_bytes()
+            (root / "chromium").mkdir()
+            (root / "chromium" / "Cookies").write_bytes(b"synthetic login")
+            target = Path(outside) / "untouched"
+            target.write_text("outside profile")
+            (root / "external").symlink_to(outside, target_is_directory=True)
+            desktop.reset_profile(root)
+            self.assertEqual([p.name for p in root.iterdir()], [desktop.IDENTITY_FILE])
+            self.assertEqual((root / desktop.IDENTITY_FILE).read_bytes(), identity)
+            self.assertEqual(desktop.identity_seed(root), first)
+            self.assertEqual(target.read_text(), "outside profile")
+            (root / desktop.IDENTITY_FILE).unlink()
+            self.assertNotEqual(desktop.identity_seed(root), first)
+
+    def test_invalid_identity_is_not_silently_replaced(self):
+        for value in ["broken", '{"version":2,"seed":"12"}', '{"version":1,"seed":"0"}',
+                      '{"version":1,"seed":12}', '{"version":1,"seed":"9223372036854775808"}']:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                record = root / desktop.IDENTITY_FILE
+                record.write_text(value)
+                with self.assertRaises(RuntimeError):
+                    desktop.identity_seed(root)
+                self.assertEqual(record.read_text(), value)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / desktop.IDENTITY_FILE).symlink_to(root / "missing")
+            with self.assertRaises(RuntimeError):
+                desktop.identity_seed(root)
+            self.assertTrue((root / desktop.IDENTITY_FILE).is_symlink())
+
+    def test_native_flags_align_screen_language_timezone_and_keep_sandbox(self):
+        with patch.dict(os.environ, {"TZ": "Asia/Tokyo", "BROWSER_LANGUAGE": "ja-JP"}):
+            args = desktop.browser_args("123456")
+        for flag in ["--fingerprint=123456", "--fingerprint-platform=linux", "--fingerprint-pixel-noise=seeded",
+                     "--fingerprint-audio-render=isolated", "--fingerprint-timezone=Asia/Tokyo",
+                     "--fingerprint-locale=ja-JP", "--lang=ja-JP", "--fingerprint-screen-width=1280",
+                     "--fingerprint-screen-height=800", "--fingerprint-taskbar-height=0"]:
+            self.assertIn(flag, args)
+        self.assertNotIn("--no-sandbox", args)
+        self.assertNotIn("--enable-unsafe-swiftshader", args)
+
+    def test_installer_rejects_wrong_hash_and_unsafe_archives(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "test.zip"
+            with zipfile.ZipFile(archive, "w") as bundle:
+                bundle.writestr("../escape", "unsafe")
+            with patch.dict(installer.ARCHIVES, {"test": (archive.name, "wrong")}):
+                with self.assertRaisesRegex(ValueError, "SHA-256"):
+                    installer.install("test", root, root / "out")
+            digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            with patch.dict(installer.ARCHIVES, {"test": (archive.name, digest)}):
+                with self.assertRaisesRegex(ValueError, "archive entry"):
+                    installer.install("test", root, root / "out")
+            self.assertFalse((root / "out").exists())
 
 
 if __name__ == "__main__":

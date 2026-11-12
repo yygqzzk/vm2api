@@ -131,7 +131,7 @@ export function createSlotBrowser({
     }
   }
 
-  async function stopVm(vm, { deleteProfile = false, reason = 'Browser stopped' } = {}) {
+  async function stopVm(vm, { deleteProfile = false, resetProfile = false, reason = 'Browser stopped' } = {}) {
     const session = sessions.get(vm.id)
     if (session) {
       session.stopping = true
@@ -141,7 +141,7 @@ export function createSlotBrowser({
       session.transport?.close()
     }
     for (const [key, ticket] of tickets) if (ticket.vmId === vm.id) tickets.delete(key)
-    await runtime.stop(session?.vm || vm, { deleteProfile })
+    await runtime.stop(resetProfile ? vm : session?.vm || vm, { deleteProfile, resetProfile })
     sessions.delete(vm.id)
     if (![...sessions.values()].some((entry) => entry.vm.proxy?.id === vm.proxy?.id)) exitChecks.delete(vm.proxy?.id)
   }
@@ -259,7 +259,7 @@ export function createSlotBrowser({
         const body = await readBody(req, 4096)
         if (body?.confirm_vm_id !== id)
           throw new BrowserError('browser_reset_confirmation', '请确认要清空的槽位 ID', 400)
-        await exclusive(() => stopVm(accessible(req, id), { deleteProfile: true }))
+        await exclusive(() => stopVm(accessible(req, id), { resetProfile: true }))
         result = { running: false, profile_deleted: true }
       } else if (req.method === 'POST' && action === 'ticket') {
         const origin = browserOrigin(req)

@@ -397,7 +397,8 @@ test('only an administrator with explicit slot confirmation can reset browser lo
   assert.equal((await f.call('vm-a', '/reset-profile', { confirm_vm_id: 'vm-b' }, { 'x-role': 'admin' })).status, 400)
   assert.equal(f.stopped.length, 0)
   assert.equal((await f.call('vm-a', '/reset-profile', { confirm_vm_id: 'vm-a' }, { 'x-role': 'admin' })).status, 200)
-  assert.equal(f.stopped.at(-1)[1].deleteProfile, true)
+  assert.equal(f.stopped.at(-1)[1].deleteProfile, false)
+  assert.equal(f.stopped.at(-1)[1].resetProfile, true)
 })
 
 test('configured cross-origin panel is accepted, null and lookalike origins are rejected', () => {

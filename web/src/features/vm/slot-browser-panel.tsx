@@ -176,7 +176,7 @@ export function SlotBrowserButton({
         open={confirmReset}
         onOpenChange={setConfirmReset}
         title='清空该槽浏览器登录态？'
-        desc='将停止浏览器并删除该槽的 Cookie、网站存储及下载文件。无法撤销；不会删除或修改槽位 API 凭证。'
+        desc='将停止浏览器并删除该槽的 Cookie、网站存储及下载文件，保留浏览器指纹身份。槽位属主或机器身份已改变时会同时清除旧指纹。无法撤销；不会修改槽位 API 凭证。'
         destructive
         isLoading={busy}
         confirmText='确认清空'

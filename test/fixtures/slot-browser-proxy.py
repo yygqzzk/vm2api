@@ -17,11 +17,35 @@ PAGE = r"""<!doctype html><meta charset=utf-8><title>Slot browser acceptance</ti
 <style>body{font:20px sans-serif;background:#eef6ff;padding:40px}button,input{font:inherit;margin:12px}</style>
 <h1>Isolated slot browser</h1><input aria-label="Smoke input" id="input" autofocus placeholder="Type here"><button id="click">Click test</button><pre id="status">Checking…</pre>
 <script>
+function canvasFingerprint(){
+  const hash=bytes=>{let h=2166136261;for(const b of bytes)h=Math.imul(h^b,16777619);return (h>>>0).toString(16)};
+  const canvas=new OffscreenCanvas(240,80),ctx=canvas.getContext('2d');
+  ctx.fillStyle='#faecd1';ctx.fillRect(0,0,240,80);ctx.fillStyle='#2378ae';ctx.font='19px Arial';ctx.fillText('vm2api fingerprint 012345',8,30);
+  ctx.fillStyle='rgba(170,20,90,0.7)';ctx.beginPath();ctx.arc(90,44,27,0,Math.PI*1.7);ctx.fill();
+  const pixels=ctx.getImageData(0,0,240,80).data,crop=ctx.getImageData(20,10,60,30).data;
+  let cropMatches=true;for(let y=0;y<30;y++)for(let x=0;x<60;x++)for(let c=0;c<4;c++)if(crop[(y*60+x)*4+c]!==pixels[((y+10)*240+x+20)*4+c])cropMatches=false;
+  return {pixels:hash(pixels),repeated:hash(ctx.getImageData(0,0,240,80).data),cropMatches};
+}
+async function audioFingerprint(){
+  const audio=new OfflineAudioContext(1,5000,44100),osc=audio.createOscillator(),comp=audio.createDynamicsCompressor();
+  osc.type='triangle';osc.frequency.value=10000;comp.threshold.value=-50;comp.knee.value=40;comp.ratio.value=12;comp.attack.value=0;comp.release.value=0.25;
+  osc.connect(comp);comp.connect(audio.destination);osc.start();
+  let h=2166136261;for(const b of new Uint8Array((await audio.startRendering()).getChannelData(0).buffer))h=Math.imul(h^b,16777619);
+  return (h>>>0).toString(16);
+}
 (async()=>{
 const slot=new URL(location.href).searchParams.get('slot');
 const oldCookie=document.cookie;const oldStorage=localStorage.getItem('slot');
 if(slot){document.cookie='slot='+encodeURIComponent(slot)+';path=/;SameSite=Lax;Max-Age=600';localStorage.setItem('slot',slot)}
 const report={slot,oldCookie,oldStorage,cookie:document.cookie,storage:localStorage.getItem('slot'),timezone:Intl.DateTimeFormat().resolvedOptions().timeZone,language:navigator.language,languages:navigator.languages,screen:[screen.width,screen.height],candidates:[]};
+try{
+  report.fingerprint={canvas:canvasFingerprint(),audio:await audioFingerprint(),audioRepeated:await audioFingerprint()};
+  report.fingerprint.worker=await new Promise((resolve,reject)=>{
+    const url=URL.createObjectURL(new Blob(['onmessage=()=>postMessage(('+canvasFingerprint.toString()+')())'],{type:'text/javascript'})),worker=new Worker(url);
+    const timer=setTimeout(()=>{worker.terminate();URL.revokeObjectURL(url);reject(new Error('worker timeout'))},5000);
+    worker.onmessage=e=>{clearTimeout(timer);worker.terminate();URL.revokeObjectURL(url);resolve(e.data)};worker.onerror=()=>reject(new Error('worker error'));worker.postMessage('sample');
+  });
+}catch(e){report.fingerprintError=String(e)}
 try{const pc=new RTCPeerConnection({iceServers:[{urls:'stun:198.51.100.99:3478'}]});pc.onicecandidate=e=>{if(e.candidate)report.candidates.push(e.candidate.candidate)};pc.createDataChannel('smoke');await pc.setLocalDescription(await pc.createOffer());await new Promise(r=>setTimeout(r,1200));pc.close()}catch(e){report.webrtcError=e.name}
 const rect=document.querySelector('#click').getBoundingClientRect();report.button={x:screenX+(outerWidth-innerWidth)/2+rect.x+rect.width/2,y:screenY+outerHeight-innerHeight+rect.y+rect.height/2};
 const send=()=>fetch('/report?data='+encodeURIComponent(JSON.stringify(report)));
