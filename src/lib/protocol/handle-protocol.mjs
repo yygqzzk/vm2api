@@ -5,6 +5,7 @@
 import { gatewayRetryDecision } from '../fork/gateway-retry.mjs'
 import { applyIntercept } from '../core/intercept.mjs'
 import { resolveStreamIdleTimeoutMs, inboundBodyLimit, queueKeepaliveDelayMs } from '../core/config.mjs'
+import { hashKey } from '../core/security.mjs'
 import { applyEagerToolStreaming } from './eager-tool-streaming.mjs'
 import { validateBetweenToolsThinking, validateToolChoice, getCapabilities } from './model-policy.mjs'
 import { ToolResultPruneCache, dshPruneScope } from './tool-result-prune-cache.mjs'
@@ -94,10 +95,13 @@ import { resolveWorkspaceMode, isOfficialClaudeClient } from './workspace-mode.m
 import { officialMessagesBody } from './anthropic-messages.mjs'
 import { prepareOutboundEnvelope, prepareCliHopBody, prepareCliPersonaInput } from './outbound-attempt.mjs'
 import {
+  callerCwdDeclaration,
   cragV2KernelActive,
   prepareCragPrintBody,
+  projectCallerSystem,
   readSlotKernelConfig,
   resolveCragPrintPersona,
+  trackCallerSystemBlock,
 } from './crag-print-prompt.mjs'
 import { repairAnthropicRequest } from '../pool/upstream-error-policy.mjs'
 import { profileForPreset } from '../identity/official-profiles.mjs'
@@ -172,7 +176,7 @@ import {
 import { createRequestBodyContext, shallowCopyBody } from './request-body-context.mjs'
 import { jevInterceptSessionCache } from './jev-intercept.mjs'
 import { ensureClaudeWebSearch, shouldInjectClaudeWebSearch } from './web-search.mjs'
-import { dispatchStreamInference } from '../transport/kernel-router.mjs'
+import { dispatchStreamInference, prepareInferenceHop } from '../transport/kernel-router.mjs'
 import { syncClaudeKernelConfigsFromFile } from '../transport/rust-kernel-supervisor.mjs'
 import { ensureWorkerCredential } from '../transport/go-worker-client.mjs'
 import { formatPoolSelectionSummary } from '../pool/pool-scheduler.mjs'
@@ -553,6 +557,8 @@ export function createHandleProtocol(deps) {
     preserveCacheBreakpoints = false,
     cliHop = false,
     cragPrint = false,
+    preparedHop = null,
+    callerCwd = null,
     repaired = false,
     requestContext = null,
     routing = {},
@@ -561,6 +567,7 @@ export function createHandleProtocol(deps) {
     onOutboundHeaders = null,
     redactionPrincipal = '',
     redactionSession = '',
+    tenantId = '',
   }) {
     const assembler = createClaudeMessageAssembler()
     const workerResult = await dispatchStreamInference({
@@ -577,9 +584,13 @@ export function createHandleProtocol(deps) {
       preserveCacheBreakpoints,
       cliHop,
       cragPrint,
+      preparedHop,
+      callerCwd,
       repaired,
       requestContext,
       slotWaitMs: candidate.slotWaitMs,
+      slotWaitDeadlineMs: candidate.slotWaitDeadlineMs,
+      tenantId,
       noGoFallback,
       ensureCredential: (exec) => ensureWorkerCredential(exec),
       redactionPrincipal,
@@ -807,6 +818,7 @@ export function createHandleProtocol(deps) {
       )
     }
 
+    const callerEnvironment = protocol === 'anthropic.messages' ? callerCwdDeclaration(inbound?.system) : null
     const autoCompactWindow = callerAutoCompactWindow(inbound)
     let ctx = {
       path: pathName,
@@ -1091,6 +1103,10 @@ export function createHandleProtocol(deps) {
       rewrite: rewriteEnabled,
       model_map: false,
       preserve_content_shape: officialPassthrough,
+      onSystemBlock:
+        inferenceBackend !== 'api' && !officialPassthrough
+          ? trackCallerSystemBlock(ctx.body?.system, callerEnvironment)
+          : undefined,
     })
     stats.requests++
     stats.by_route[protocol] = (stats.by_route[protocol] || 0) + 1
@@ -1116,6 +1132,8 @@ export function createHandleProtocol(deps) {
       }
     } else if (!apiOpenAI) ctx.body = applyMinMaxTokens(ctx.body, getRouting()?.compatibility?.min_max_tokens)
     let inboundToolReverse = {}
+    const cragSystem = projectCallerSystem(ctx.body.system, callerEnvironment)
+    const hasCragSystem = cragSystem !== ctx.body.system
     if (!apiOpenAI && !requestContext && !officialPassthrough) {
       const standard = toStandardAnthropicBody(ctx.body, {
         official: officialTraffic === true,
@@ -1465,6 +1483,14 @@ export function createHandleProtocol(deps) {
     const queueKeepaliveDelay = queueKeepaliveDelayMs(getRouting(), cfg.limits?.queue_keepalive_delay_ms)
     const streamIdleTimeoutMs = resolveStreamIdleTimeoutMs(getRouting(), cfg)
     const managedKey = req.apiKeyRecord || null
+    // Only the authentication layer supplies these identities. Namespace the
+    // sources so a key ID cannot share native sessions with a panel login.
+    let tenantPrincipal = ''
+    if (managedKey?.id != null) tenantPrincipal = `key:${managedKey.id}`
+    else if (req.apiKeyKind === 'master') tenantPrincipal = 'master'
+    else if (req.panelUserId != null) tenantPrincipal = `panel-id:${req.panelUserId}`
+    else if (req.panelUser) tenantPrincipal = `panel-user:${req.panelUser}`
+    const tenantId = tenantPrincipal ? hashKey(`crag-tenant:${tenantPrincipal}`) : ''
     if (managedKey) {
       const gate = apiKeyStore.acquire(managedKey)
       if (!gate.ok) {
@@ -1663,11 +1689,19 @@ export function createHandleProtocol(deps) {
           )
           let hopBody = body
           if (cliHop) {
+            const transportRouting = getRouting()
+            const preparedHop = await prepareInferenceHop({
+              exec: selected.exec,
+              routing: transportRouting,
+              slotWaitMs: selected.slotWaitMs,
+              slotWaitDeadlineMs: selected.slotWaitDeadlineMs,
+            })
             const cragPrint =
               !requestContext &&
+              preparedHop.ready?.ok === true &&
               cragV2KernelActive({
                 vm: selected.vm,
-                health: selected.workerStatus,
+                health: preparedHop.ready.health,
                 kernelConfig: readSlotKernelConfig(selected.exec?.homeDir),
               })
             if (cragPrint) {
@@ -1675,7 +1709,8 @@ export function createHandleProtocol(deps) {
               // CRAG print bypasses the cli-node envelope builder. Canonicalize
               // once more at this boundary so passthrough traffic cannot carry
               // client/OpenAI fields into the native worker.
-              const cragStandard = toStandardAnthropicBody(personaIn, {
+              const cragInput = hasCragSystem ? { ...personaIn, system: cragSystem } : personaIn
+              const cragStandard = toStandardAnthropicBody(cragInput, {
                 official: officialTraffic === true,
                 rewriteTools: routingNow?.compatibility?.tool_name_rewrite !== false,
               })
@@ -1687,7 +1722,12 @@ export function createHandleProtocol(deps) {
               // makes the tool continuation fail with tool_result history mismatch.
               let source = shallowCopyBody(cragStandard.body)
               for (const policy of extra.repairs || []) source = repairAnthropicRequest(source, policy)
-              hopBody = prepareCragPrintBody(source, { preset: cragPersona, officialPassthrough })
+              const caps = preparedHop.ready.health?.capabilities
+              hopBody = prepareCragPrintBody(source, {
+                preset: cragPersona,
+                officialPassthrough,
+                capabilities: Array.isArray(caps) ? caps : [],
+              })
               hopBody = await materializeRemoteImageSources(hopBody)
               if (identity) {
                 hopBody = applyCrsIdentityReplace(hopBody, identity, inbound, req.headers, {
@@ -1728,6 +1768,9 @@ export function createHandleProtocol(deps) {
                   sessionId: attemptSessionId,
                   cliHop: true,
                   cragPrint: true,
+                  callerCwd: callerEnvironment?.cwd,
+                  preparedHop,
+                  transportRouting,
                   requestContext,
                   repaired,
                 },
@@ -1827,6 +1870,8 @@ export function createHandleProtocol(deps) {
                 sessionId: attemptSessionId,
                 cliHop: true,
                 cragPrint: false,
+                preparedHop,
+                transportRouting,
                 requestContext,
                 repaired,
               },
@@ -1930,15 +1975,18 @@ export function createHandleProtocol(deps) {
               preserveCacheBreakpoints,
               cliHop: attemptMeta?.cliHop === true,
               cragPrint: attemptMeta?.cragPrint === true,
+              callerCwd: attemptMeta?.callerCwd,
+              preparedHop: attemptMeta?.preparedHop,
               repaired: attemptMeta?.repaired === true,
               requestContext: attemptMeta?.requestContext || requestContext,
               want1m,
-              routing: getRouting(),
+              routing: attemptMeta?.transportRouting ?? getRouting(),
               noGoFallback: !!pinVmId,
               onEnvelope: noteOutboundEnvelope,
               onOutboundHeaders: noteOutboundHeaders,
               redactionPrincipal: req.apiKeyRecord?.id || (req.apiKeyKind === 'master' ? 'master' : ''),
               redactionSession: String(req.headers?.['x-claude-code-session-id'] || ''),
+              tenantId,
             })
           }
           let state
@@ -1973,6 +2021,8 @@ export function createHandleProtocol(deps) {
               preserveCacheBreakpoints,
               cliHop: attemptMeta?.cliHop === true,
               cragPrint: attemptMeta?.cragPrint === true,
+              callerCwd: attemptMeta?.callerCwd,
+              preparedHop: attemptMeta?.preparedHop,
               repaired: attemptMeta?.repaired === true,
               requestContext: attemptMeta?.requestContext || requestContext,
               body,
@@ -1983,8 +2033,10 @@ export function createHandleProtocol(deps) {
               signal,
               deliveryMode: attemptDelivery,
               want1m,
-              routing: getRouting(),
+              routing: attemptMeta?.transportRouting ?? getRouting(),
               slotWaitMs: candidate.slotWaitMs,
+              slotWaitDeadlineMs: candidate.slotWaitDeadlineMs,
+              tenantId,
               noGoFallback: !!pinVmId,
               ensureCredential: (exec) => ensureWorkerCredential(exec),
               redactionPrincipal: req.apiKeyRecord?.id || (req.apiKeyKind === 'master' ? 'master' : ''),

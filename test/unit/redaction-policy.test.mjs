@@ -56,4 +56,19 @@ describe('redaction policy', () => {
       },
     )
   })
+
+  it('trims rule prefixes and normalizes the allow list', () => {
+    const policy = normalizeRedaction({
+      enabled: true,
+      secrets: true,
+      personal: true,
+      rules: [{ kind: 'GATEWAY_KEY', prefix: ' oc_sk_ ' }, { prefix: ' ' }],
+      allow: [' build-01 ', 'build-01', ''],
+    })
+    assert.deepEqual(policy.allow, ['build-01'])
+    assert.deepEqual(
+      policy.rules.map(({ kind, prefix }) => ({ kind, prefix })),
+      [{ kind: 'GATEWAY_KEY', prefix: 'oc_sk_' }],
+    )
+  })
 })

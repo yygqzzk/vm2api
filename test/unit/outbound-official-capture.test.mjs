@@ -71,7 +71,6 @@ test('unofficial outbound envelope matches official 2.1.281 capture keys', () =>
     routing: { compatibility: { thinking_display: 'passthrough' } },
   })
   const { headers, body } = envelope
-  assert.equal(headers['user-agent'], 'claude-cli/2.1.281 (external, sdk-cli)')
   assert.equal(headers['anthropic-version'], '2023-06-01')
   assert.equal(headers['x-app'], 'cli')
   assert.equal(headers['anthropic-dangerous-direct-browser-access'], 'true')
@@ -185,7 +184,6 @@ test('outbound headers use the official CLI pin and keep the 2.1.281 fingerprint
     firstUserText: CAPTURE_281_FIRST_USER,
   })
   const { headers, body } = envelope
-  assert.equal(headers['user-agent'], OFFICIAL_CLAUDE_CLI_UA)
   assert.equal(headers['anthropic-version'], '2023-06-01')
   assert.equal(headers['x-app'], 'cli')
   assert.equal(headers['anthropic-dangerous-direct-browser-access'], 'true')

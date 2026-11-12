@@ -156,6 +156,8 @@ vm2api-cutover preflight --release <完整SHA>   # 只读：拉取 + Compose 合
 vm2api-cutover deploy    --release <完整SHA>   # 备份 -> 排空 -> 替换 -> 验收
 ```
 
+同时升级槽位浏览器时，为两个命令加上 `--browser-image ghcr.io/yygqzzk/vm2api-slot-browser@sha256:<已验收digest>`。脚本核对浏览器与控制面的 revision、amd64 架构和指纹镜像标记，只允许额外修改 `VM2API_BROWSER_IMAGE`；旧 Compose 链保留原浏览器引用供回滚。已有 profile 卷会在无浏览器运行时一并备份，不清空登录态或身份文件。
+
 也可用 `--image <repo>@sha256:... --revision <SHA>` 指定 digest。
 回滚脚本写在每次备份目录的 `rollback.sh`（恢复原 Compose 链，不动数据库）。
 线上 GHCR 拉取凭证用只读 PAT 配置一次：`docker login ghcr.io`。

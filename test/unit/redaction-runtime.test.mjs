@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
+import { once } from 'node:events'
 import fs from 'node:fs'
 import http from 'node:http'
 import os from 'node:os'
@@ -18,10 +19,17 @@ const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-redact-runtime-'))
 const bin = process.env.KIN_REDACT_BIN || path.join(root, 'kin-redact')
 let helper = null
 
-afterEach(() => {
-  helper?.kill()
-  helper = null
-  publishRedactionForTests(null)
+afterEach(async () => {
+  try {
+    if (helper && helper.exitCode === null && helper.signalCode === null) {
+      const closed = once(helper, 'close')
+      helper.kill()
+      await closed
+    }
+  } finally {
+    helper = null
+    publishRedactionForTests(null)
+  }
 })
 after(() => fs.rmSync(root, { recursive: true, force: true }))
 

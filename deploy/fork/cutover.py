@@ -86,6 +86,7 @@ class Cutover:
         self.root = Path(args.root)
         self.repo = args.repo
         self.image = args.image
+        self.browser_image = args.browser_image
         self.revision = args.revision
         self.keep = args.keep_backups
         self.drain_timeout = args.drain_timeout
@@ -123,6 +124,16 @@ class Cutover:
         require(image["Config"]["Labels"].get("org.opencontainers.image.revision") == self.revision,
                 "Image revision label does not match --revision")
         require(image["Os"] == "linux" and image["Architecture"] == "amd64", "Image is not linux/amd64")
+        if self.browser_image:
+            try:
+                browser = json.loads(output(["docker", "image", "inspect", self.browser_image]))[0]
+            except subprocess.CalledProcessError:
+                subprocess.run(["docker", "pull", self.browser_image], check=True)
+                browser = json.loads(output(["docker", "image", "inspect", self.browser_image]))[0]
+            labels = browser["Config"].get("Labels") or {}
+            require(labels.get("org.opencontainers.image.revision") == self.revision, "Browser revision mismatch")
+            require(labels.get("io.vm2api.browser.fingerprint") == "chromix-1", "Browser fingerprint image required")
+            require(browser["Os"] == "linux" and browser["Architecture"] == "amd64", "Browser is not linux/amd64")
         return image
 
     def _inspect_after_pull(self):
@@ -212,7 +223,10 @@ class Cutover:
     def write_candidate(self, folder):
         candidate = self.candidate_file(folder)
         require(not candidate.exists(), "Candidate compose already exists in backup folder")
-        candidate.write_text(f"services:\n  vm2api:\n    image: {self.image}\n    pull_policy: never\n")
+        content = f"services:\n  vm2api:\n    image: {self.image}\n    pull_policy: never\n"
+        if self.browser_image:
+            content += "    environment:\n      VM2API_BROWSER_IMAGE: " + json.dumps(self.browser_image) + "\n"
+        candidate.write_text(content)
         candidate.chmod(0o600)
         return candidate
 
@@ -223,11 +237,15 @@ class Cutover:
         old = json.loads(output(prefix + ["config", "--format", "json"], cwd=self.root, env=env))
         new = json.loads(output(prefix + ["-f", str(candidate), "config", "--format", "json"], cwd=self.root, env=env))
         require(new["services"]["vm2api"]["image"] == self.image, "Candidate image mismatch")
+        environment = dict(new["services"]["vm2api"].get("environment", {}))
+        if self.browser_image:
+            require(environment.get("VM2API_BROWSER_IMAGE") == self.browser_image, "Candidate browser image mismatch")
+            old["services"]["vm2api"].setdefault("environment", {})["VM2API_BROWSER_IMAGE"] = self.browser_image
         for config in (old, new):
             config["services"]["vm2api"].pop("image", None)
             config["services"]["vm2api"].pop("pull_policy", None)
         require(old == new, "Candidate changes more than the image")
-        return new["services"]["vm2api"].get("environment", {})
+        return environment
 
     # ---------- backup ----------
 
@@ -563,6 +581,7 @@ def main():
     parser.add_argument("--release", help="Commit SHA; resolves ghcr.io/yygqzzk/vm2api:fork-<SHA>")
     parser.add_argument("--repo", default=os.environ.get("VM2API_IMAGE_REPO", "ghcr.io/yygqzzk/vm2api"))
     parser.add_argument("--image", help="Image reference (default with --release: <repo>:fork-<SHA>)")
+    parser.add_argument("--browser-image", help="Optional same-revision browser image reference; preserves the previous image for rollback")
     parser.add_argument("--revision", help="Expected OCI revision label (default with --release: release SHA)")
     parser.add_argument("--root", default="/opt/vm2api")
     parser.add_argument("--container", default="vm2api")

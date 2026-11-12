@@ -105,6 +105,7 @@ export async function browserFixture() {
     docker([
       'network',
       'create',
+      ...(process.env.KIN_BROWSER_SMOKE_SUBNET ? ['--subnet', process.env.KIN_BROWSER_SMOKE_SUBNET] : []),
       '--ipv6=false',
       '--opt',
       `com.docker.network.bridge.name=${bridgeName(proxyId)}`,
@@ -274,6 +275,19 @@ async function main() {
     assert.equal(rb.report.webrtcError, undefined)
     assert.deepEqual(ra.report.candidates, [])
     assert.deepEqual(rb.report.candidates, [])
+    for (const report of [ra.report, rb.report]) {
+      assert.equal(report.fingerprintError, undefined)
+      assert.equal(report.fingerprint.canvas.pixels, report.fingerprint.canvas.repeated)
+      assert.equal(report.fingerprint.canvas.cropMatches, true)
+      assert.deepEqual(report.fingerprint.worker, report.fingerprint.canvas)
+      assert.equal(report.fingerprint.audio, report.fingerprint.audioRepeated)
+    }
+    assert.notEqual(ra.report.fingerprint.canvas.pixels, rb.report.fingerprint.canvas.pixels)
+    assert.notEqual(ra.report.fingerprint.audio, rb.report.fingerprint.audio)
+    const seed = (vm) =>
+      fixture.exec(vm, "import json; print(json.load(open('/profile/browser-identity.json'))['seed'])")
+    const originalSeed = seed(a)
+    assert.notEqual(originalSeed, seed(b))
     assert.ok(fixture.reports().some((entry) => entry.dns === 'browser.test'))
     for (const vm of [a, b]) {
       const status = fixture.exec(
@@ -284,6 +298,27 @@ async function main() {
       assert.match(status, /CapEff:\s+0000000000000000/)
       assert.match(status, /CapBnd:\s+0000000000000000/)
       assert.match(status, /NoNewPrivs:\s+1/)
+      const sandbox = fixture.exec(
+        vm,
+        `
+from pathlib import Path
+baseline = int(next(line.split(':')[1] for line in Path('/proc/1/status').read_text().splitlines() if line.startswith('Seccomp_filters:')))
+filtered = False
+for process in Path('/proc').iterdir():
+    if not process.name.isdigit():
+        continue
+    try:
+        if not (process / 'comm').read_text().startswith(('chrome', 'chromium')):
+            continue
+        state = dict(line.split(':', 1) for line in (process / 'status').read_text().splitlines() if ':' in line)
+        filtered |= int(state.get('Seccomp_filters', '0')) > baseline and state.get('Seccomp', '').strip() == '2'
+    except OSError:
+        pass
+assert filtered, 'no Chromium process has an additional sandbox seccomp filter'
+print('sandboxed')
+`,
+      )
+      assert.equal(sandbox, 'sandboxed')
       const info = fixture.inspect(vm)
       assert.equal(Object.keys(info.HostConfig.PortBindings || {}).length, 0, 'no published host ports')
       assert.equal(info.HostConfig.Privileged, false)
@@ -306,7 +341,32 @@ async function main() {
     const again = await waitForReport(fixture, (report) => report.slot === 'slot-a-after-restart')
     assert.equal(again.report.oldCookie, 'slot=slot-a')
     assert.equal(again.report.oldStorage, 'slot-a')
-    console.log('PASS: cookies and LocalStorage survive a stopped/recreated browser container')
+    assert.equal(seed(a), originalSeed)
+    assert.deepEqual(again.report.fingerprint, ra.report.fingerprint)
+    console.log(
+      'PASS: distinct Canvas/Audio identities and worker consistency; identity and login persist across restart',
+    )
+
+    fixture.sessions.delete(a.id)
+    await fixture.runtime.stop(a, { resetProfile: true })
+    fixture.sessions.set(a.id, await fixture.runtime.start(a))
+    fixture.navigate(a, 'http://browser.test/?slot=slot-a-after-reset')
+    const reset = await waitForReport(fixture, (report) => report.slot === 'slot-a-after-reset')
+    assert.equal(reset.report.oldCookie, '')
+    assert.equal(reset.report.oldStorage, null)
+    assert.equal(seed(a), originalSeed)
+    assert.deepEqual(reset.report.fingerprint, ra.report.fingerprint)
+    fixture.sessions.delete(a.id)
+    await fixture.runtime.stop(a, { deleteProfile: true })
+    fixture.sessions.set(a.id, await fixture.runtime.start(a))
+    fixture.navigate(a, 'http://browser.test/?slot=slot-a-new-identity')
+    const fresh = await waitForReport(fixture, (report) => report.slot === 'slot-a-new-identity')
+    assert.equal(fresh.report.oldCookie, '')
+    assert.equal(fresh.report.oldStorage, null)
+    assert.notEqual(seed(a), originalSeed)
+    assert.notEqual(fresh.report.fingerprint.canvas.pixels, ra.report.fingerprint.canvas.pixels)
+    assert.notEqual(fresh.report.fingerprint.audio, ra.report.fingerprint.audio)
+    console.log('PASS: login reset clears storage and preserves identity; full purge creates a clean new identity')
 
     const failNetwork = (vm, host, port, ipv6 = false) =>
       Number(

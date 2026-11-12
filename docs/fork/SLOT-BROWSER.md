@@ -1,16 +1,22 @@
 # 槽位浏览器（fork）
 
-Linux Docker 槽的按需登录浏览器。原版 Debian Chromium、有头桌面、TigerVNC、noVNC；不修改 Chromium 或 vm2api 推理内核。每节点共享一份镜像，每槽独立容器及持久化 profile。控制面同时最多 2 个浏览器，每节点也检查 2 个上限。
+Linux Docker 槽的按需登录浏览器。使用基于 Chromium 的 Chromix、有头桌面、TigerVNC、noVNC，不改变 vm2api 推理内核。每节点共享一份镜像，每槽独立容器、持久化 profile 和固定浏览器指纹种子。控制面同时最多 2 个浏览器，每节点也检查 2 个上限。
 
 ## 使用前
 
 在**每个承载槽位的 Linux Docker 节点**构建一次：
 
 ```bash
-docker build -t local/vm2api-slot-browser:1 docker/fork/slot-browser
+docker build -t local/vm2api-slot-browser:2 docker/fork/slot-browser
 ```
 
 控制面默认只使用节点上已经存在的这个镜像，不自动下载、构建或更新。可以通过 `VM2API_BROWSER_IMAGE` 指定自己已构建的固定镜像 ID/digest；所有节点必须有对应镜像。发布时记录镜像身份和 Chromium 版本，定期重建安全更新，不长期冻结旧浏览器。
+
+当前固定 [Chromix v156.0.8078.79](https://github.com/xiaozhou26/Chromix/releases/tag/v156.0.8078.79)，支持 Linux amd64/arm64。构建时下载官方 ZIP 并核对代码中固定的 SHA-256；也可以把同名、未修改的 `chromix-linux-x64.zip` 或 `chromix-linux-arm64.zip` 放入 `docker/fork/slot-browser/archives/` 离线构建，仍须通过相同校验。ZIP 被 git 和控制面构建上下文忽略，不进入最终浏览器镜像。浏览器发行包自带的许可证文件随二进制保留；更新内核时同时复核其许可及依赖声明。
+
+镜像 CPU 架构必须与 Docker Engine 一致。启动时拒绝跨架构模拟：模拟环境可能让 Chrome 运行却无法安装其内部 seccomp 过滤器，不能拿“页面可打开”当作沙箱正常。Mac 上的 Docker 应构建和使用原生 arm64 镜像；amd64 的完整容器验收须在原生 amd64 Linux 节点/CI 执行。
+
+控制面要求镜像带有 `io.vm2api.browser.fingerprint=chromix-1` 标记，拒绝原版 `:1` 镜像；检查后使用实际 image ID 启动，避免 tag 切换造成版本错配。升级前停止浏览器并备份 profile 卷，再构建新镜像和更新控制面。旧 profile 首次启动只新增种子文件，保留已有网站数据；恢复旧程序/浏览器前使用升级前备份，不能假设新版 Chrome profile 可向后兼容。
 
 需要 Docker Engine、可用的 unprivileged user namespaces 和允许其运行的宿主 AppArmor 配置。运行时使用固定 Moby 默认 seccomp 加 Chromium sandbox 所需的命名空间调用，不授予 `SYS_ADMIN`，不使用 `--privileged`、`seccomp=unconfined` 或 `--no-sandbox`。宿主禁止 user namespaces 时启动失败，不静默降低隔离。
 
@@ -47,7 +53,9 @@ docker build -t local/vm2api-slot-browser:1 docker/fork/slot-browser
 
 代理断开时不回落直连。换代理、变更属主、重建/停止槽位等控制面操作先停浏览器；操作结束前阻止重新启动。用户编辑自己的代理不会停止其他租户的浏览器。直接在宿主修改 Docker/iptables 不在控制面事务保护范围，运维必须保持出口网络规则。
 
-环境来自槽的 `timezone` / UTF-8 `locale`；`navigator.language/languages`、Intl、Accept-Language 对齐配置。显示固定 1280×800，控制面只缩放画面。UA/Client Hints 保持真实 Chromium/Linux，不随机覆盖 Canvas/WebGL/Audio 或伪造 Windows/macOS。不同槽可能仍有相同硬件/字体/渲染指纹；不承诺无法关联或绕过网站风控。同代理 IP 也不会因 profile 隔离变成不同 IP。
+环境来自槽的 `timezone` / UTF-8 `locale`；`navigator.language/languages`、Intl、Accept-Language 对齐配置。显示及暴露的 screen 固定 1280×800，控制面只缩放画面。UA/Client Hints 使用 Chromium/Linux，不伪造 Windows/macOS。每槽首次启动生成随机种子，以 Chromix 原生参数启用 `fingerprint-pixel-noise=seeded` 和 `fingerprint-audio-render=isolated`，让同槽 Canvas/Audio 输出稳定、不同槽产生不同输出；没有注入网页 JavaScript。仅设置 seed 并不足以得到上述效果。
+
+WebGL 沿用默认可用性，不开启不安全的软件渲染开关；无 GPU 容器可能返回 null。硬件、字体、GPU、屏幕等特征仍可能相同，这不是整套商业指纹浏览器或防关联保证，也不承诺绕过网站风控。同代理 IP 不会因 profile/seed 隔离变成不同 IP。升级 Chromix 也可能改变输出，需重新验收。
 
 不支持本机安全密钥/生物识别自动转发、摄像头/音频、自动验证码、KVM 或 macOS 原生槽。需要这些能力另行评估。
 
@@ -66,12 +74,12 @@ docker build -t local/vm2api-slot-browser:1 docker/fork/slot-browser
 
 ## 数据、重建与删除
 
-浏览器 profile 放在**槽位节点的 Docker 命名卷** `kin-browser-profile-<slot-id-sha256前24位>`，不是放进现有 CLI home。这样不会暴露 API 凭证目录，也不受原槽的 home 重建影响。只读镜像没有账号或代理凭证。
+浏览器 profile 放在**槽位节点的 Docker 命名卷** `kin-browser-profile-<slot-id-sha256前24位>`，不是放进现有 CLI home。这样不会暴露 API 凭证目录，也不受原槽的 home 重建影响。只读镜像没有账号或代理凭证。卷内 `/profile/browser-identity.json` 保存版本与固定种子，网站数据位于 `/profile/chromium/`；身份文件损坏时拒绝启动，不静默生成新身份。
 
-- 正常停止、浏览器容器重建、槽位「保留数据」重建：保留 profile。
-- 槽位删除、明确「重建新特征」：在原操作通过门禁后清理该 profile。删除槽位被拒绝时不清空 profile。
-- 管理员可以在浏览器窗口点「重置浏览器登录态」，二次确认后清空 Cookie、网站存储与下载文件，**不改 API 凭证**。
-- profile 卷标记创建时属主和 guest machine ID。身份改变后拒绝复用旧登录态，需管理员明确重置，不把前任用户的会话交给新属主。
+- 正常停止、浏览器容器重建、槽位「保留数据」重建：保留 profile 与浏览器种子。
+- 槽位删除、明确「重建新特征」：在原操作通过门禁后清理整个 profile 卷及种子，下次启动获得新浏览器身份。删除槽位被拒绝时不清空 profile。
+- 管理员可以在浏览器窗口点「重置浏览器登录态」，二次确认后清空 Cookie、网站存储与下载文件，**保留浏览器种子、不改 API 凭证**。清理由固定的临时容器完成，仅挂载该 profile，无网络、无 capabilities，以 UID 1000 运行；失败会报错。
+- profile 卷标记创建时属主和 guest machine ID。身份改变后拒绝复用旧登录态，需管理员明确重置；此时清理整个旧卷及种子，新属主不会继承前任用户的会话或指纹。
 - 不自动跨节点同步 profile。移动槽位前关闭浏览器；旧节点命名卷不会自动复制或删除，需在批准的数据迁移/清理中处理。不要让两个节点同时写同一 profile。
 
 当前 vm2api 备份和单槽导出**不包含浏览器命名卷**。要保留网页登录态，必须在浏览器停止后对这个卷做额外备份，排除临时锁、缓存可节省空间；备份按凭证保护并加密存放，不提交仓库、不传到不可信服务。恢复时确认对应槽位、属主和机器身份；浏览器 keyring/站点规则可能要求重新登录，不能承诺跨系统 profile 可移植。未另做备份时可重新网页登录，API 凭证不受影响。
@@ -88,6 +96,8 @@ pnpm -C web typecheck
 ```
 
 实际容器网络验收在专用随机名称的测试网桥上运行真实 kin-egress、离线 SOCKS5/DNS/HTTP fixture 与两份 Chromium。fixture 不转发 Internet；不使用真实账号、代理或供应商额度。测试期间需要 Docker 管理权限；只为测试网桥安装规则，finally 停浏览器后移除测试规则/容器/卷。
+
+同时检查两槽 Canvas/Audio 差异、重复采样和 Worker 一致性、重启保留身份/登录态、清理登录态保留身份，以及完整删除后生成新身份。Docker 默认地址池耗尽时，可用 `KIN_BROWSER_SMOKE_SUBNET=10.253.253.0/24` 指定已确认空闲的测试子网；不要为此清理已有业务网络。
 
 ```bash
 mkdir -p .local/slot-browser-test
@@ -129,3 +139,22 @@ UI 验收加载真实 React 组件、service 与 Docker/RFB 链路，模拟 Pane
 - 真实 noVNC 测试验证了变更停止、4001 原因提示、手动重开以及既有键鼠/剪贴板/回调无回归。测试服务器与生产构建先后执行，避免构建输出触发开发服务器页面刷新。
 - 本地 `18788` 已换为源码快照 `09f13e84d8db7ec6c171793a4172543781654ab2be9ed16c244c49f41887a103` 的开发预览；实际新开浏览器、槽位记录和面板均为 `Asia/Tokyo`，公共 HTTPS 200、DNS 正常，页面无 error。profile 卷身份、代理/调度/凭证元数据保留；更新前有 SQLite 一致性备份及 profile 备份，均在 `.local/docker-preview/timezone-20261101T120956Z/`。
 - 只更新本机，没有部署线上，也没有自动切换用户代理、登录真实账号或发送推理请求。没有重跑未改变的浏览器镜像完整防漏验收。
+
+### Chromix 接入验证（2026-11-12）
+
+开发基线 `97068cd361e175723e3a4f14f5769b8634970963`，隔离 worktree `../vm2api-slot-browser-fingerprint`，分支 `fork/slot-browser-fingerprint` 的未提交工作区。以下是本地开发结果，尚未推送或取得本次 CI 结果，也未切换线上。
+
+- Node 槽位浏览器专项 **37/37**，Python 契约 **9/9**；前端相关 **3/3**、TypeScript、修改组件的 ESLint/Prettier 与后端修改文件的格式检查通过。
+- 原生 `linux/arm64` 从本次 Dockerfile 完整构建并实际运行：两槽独立网站数据、不同 Canvas/Audio、重复读值/Canvas 裁剪/Worker 一致性、重启保留身份和登录态、清理登录态保留身份、完整删除生成新身份通过。额外检查了 Chrome 子进程具有比容器入口更多的 seccomp 过滤器。
+- RFB、UID/capabilities、语言/时区/屏幕/请求头、代理 DNS、WebRTC、内网/元数据/IPv6/非 DNS UDP 阻断、代理失效无直连回退，以及断心跳独立停止通过。实际 React/noVNC、键鼠、中文剪贴板、窄屏和模拟 OAuth 回调通过。
+- 用原版 `:1` Chromium `156.0.8078.73` 生成的合成 profile 升级到 Chromix `156.0.8078.79`，Cookie/LocalStorage 保留并新增首次身份文件。没有测试真实账号迁移或供应商登录。
+- `linux/amd64` 完整镜像构建及 `--version` 通过；本机 ARM 的 x86 模拟运行在内部 seccomp 检查处失败，不算该架构完整通过。同一个独立最小 BPF 程序在原生 ARM 上成功增加过滤器，在 x86 模拟环境返回 `EINVAL`。已增加启动时架构匹配门禁；**原生 amd64 Linux/CI 的完整验收仍待执行，上线前必须通过**。
+
+本次测试镜像的本地 Docker inspect image ID：
+
+| 平台 | 镜像 | ID |
+| --- | --- | --- |
+| linux/arm64 | `local/vm2api-slot-browser:2` | `sha256:b97ba3b099fd89ab4283948bbc639c2a7fd9afcc26a9be682f8e6a66a1436ec2` |
+| linux/amd64 | `local/vm2api-slot-browser:2-amd64` | `sha256:03604344a0595b0be5c83dc90319b91934d05d1cc6ee1a79fe3e3b49d3a5d2c9` |
+
+日志、合成迁移/沙箱诊断脚本及 UI 截图保存在本 worktree 的 `.local/slot-browser-test/`，不进入产品镜像或源码提交。它们不替代目标节点、真实远程 SSH 或生产 TLS/WSS 验收；固定种子也不构成网站无法关联账号的保证。

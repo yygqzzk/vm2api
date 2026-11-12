@@ -498,7 +498,7 @@ test('billing attribution leaves caller-supplied billing unchanged', () => {
   assert.equal(out.system[0].text, caller)
 })
 
-test('missing billing receives cli and turn indexes; caller billing keeps entrypoint', () => {
+test('missing billing uses the supplied version and session; caller billing stays unchanged', () => {
   const messages = [
     { role: 'user', content: 'ping' },
     { role: 'assistant', content: 'pong' },
@@ -545,7 +545,7 @@ test('routing.json cc_entrypoint reaches the rendered template billing without a
   }
 })
 
-test('one routing read keeps billing, system identity and env on the same entrypoint', () => {
+test('routing entrypoint switches rendered billing between cli and sdk-cli', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-entrypoint-sync-'))
   const file = path.join(dir, 'routing.json')
   const body = { model: 'claude-opus-5-5', messages: [{ role: 'user', content: 'hello' }] }
@@ -560,7 +560,6 @@ test('one routing read keeps billing, system identity and env on the same entryp
       forceConfigured: true,
       routingFile: file,
       mode: 'official_full',
-      entrypoint,
     })
   }
   try {
