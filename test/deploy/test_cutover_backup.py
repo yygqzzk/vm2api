@@ -64,11 +64,43 @@ class CutoverVerification(unittest.TestCase):
         self.cutover.control = self.before["control"]
         self.cutover.port = "8787"
         self.cutover.image = "registry.example/vm2api@sha256:manifest"
+        self.cutover.browser_image = None
         self.cutover.revision = "new-revision"
         cutover.save(self.root / "before.json", self.before)
         cutover.save(self.root / "database.json", self.before["database"])
         cutover.save(self.root / "manifest.json", {"database_quick_check": "ok"})
         cutover.save(self.root / "compose-environment.json", {"EXTRA": "production"})
+
+    def test_browser_upgrade_changes_only_the_explicit_browser_reference(self):
+        c = self.cutover
+        c.browser_image = "registry.example/browser@sha256:new"
+        c.compose_prefix = Mock(return_value=["docker", "compose"])
+        c.compose_env = Mock(return_value={})
+        old = {"services": {"vm2api": {"image": "old", "environment": {"EXTRA": "production", "VM2API_BROWSER_IMAGE": "old-browser"}}}}
+        new = {"services": {"vm2api": {"image": c.image, "pull_policy": "never", "environment": {"EXTRA": "production", "VM2API_BROWSER_IMAGE": c.browser_image}}}}
+        c.write_candidate(self.root)
+        self.assertIn(c.browser_image, c.candidate_file(self.root).read_text())
+        with patch.object(cutover, "output", side_effect=[json.dumps(old), json.dumps(new)]):
+            self.assertEqual(c.validate_compose(self.root), new["services"]["vm2api"]["environment"])
+        new["services"]["vm2api"]["environment"]["EXTRA"] = "modified"
+        with patch.object(cutover, "output", side_effect=[json.dumps(old), json.dumps(new)]), \
+             self.assertRaisesRegex(RuntimeError, "changes more than the image"):
+            c.validate_compose(self.root)
+
+    def test_browser_upgrade_requires_matching_revision_architecture_and_fingerprint(self):
+        c = self.cutover
+        c.browser_image = "registry.example/browser@sha256:new"
+        control = {"Os": "linux", "Architecture": "amd64", "Config": {"Labels": {"org.opencontainers.image.revision": c.revision}}}
+        browser = {"Os": "linux", "Architecture": "amd64", "Config": {"Labels": {"org.opencontainers.image.revision": c.revision, "io.vm2api.browser.fingerprint": "chromix-1"}}}
+        with patch.object(cutover, "output", side_effect=[json.dumps([control]), json.dumps([browser])]):
+            self.assertEqual(c.ensure_image(), control)
+        for bad in [
+            {**browser, "Architecture": "arm64"},
+            {**browser, "Config": {"Labels": {"org.opencontainers.image.revision": "old"}}},
+            {**browser, "Config": {"Labels": {"org.opencontainers.image.revision": c.revision}}},
+        ]:
+            with patch.object(cutover, "output", side_effect=[json.dumps([control]), json.dumps([bad])]), self.assertRaises(RuntimeError):
+                c.ensure_image()
 
     def test_snapshot_refreshes_control_without_replacing_the_rollback_baseline(self):
         self.cutover.api = Mock(return_value=[])
