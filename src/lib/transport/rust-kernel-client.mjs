@@ -12,6 +12,7 @@ import {
   workerPaths,
 } from './go-worker-client.mjs'
 import { readWorkerCredentialFile } from '../oauth/oauth-credentials.mjs'
+import { cragV2KernelActive } from '../protocol/crag-print-prompt.mjs'
 import { checkCragLicense, cragLicenseDeniedResult } from '../vm/crag-license.mjs'
 
 function licenseCheck(opts) {
@@ -87,6 +88,21 @@ export async function rustKernelHealth(exec, opts = {}) {
   return withCragCredential(exec, reported)
 }
 
+export function supportsGatewayPolicy(health) {
+  return health?.gateway_policy_v1 === true && cragV2KernelActive({ health })
+}
+
+export function gatewayPolicyReady(health) {
+  return (
+    supportsGatewayPolicy(health) &&
+    health.ok === true &&
+    (health.status == null || health.status === 200) &&
+    health.healthy !== false &&
+    health.ready !== false &&
+    health.recovering !== true
+  )
+}
+
 export function rustKernelProcessUp(health) {
   if (!health) return false
   if (health.ok) return true
@@ -96,6 +112,7 @@ export function rustKernelProcessUp(health) {
 }
 
 export function rustKernelCliReady(health) {
+  if (health?.ready === false || health?.license_valid === false) return false
   if (health?.ready_slots == null) return true
   const n = Number(health.ready_slots)
   return Number.isFinite(n) && n > 0
@@ -109,15 +126,25 @@ export function rustKernelCliReady(health) {
  */
 export function rustKernelBusy(health) {
   if (!rustKernelProcessUp(health)) return false
-  if (health?.healthy === false) return false
+  if (health?.healthy === false || health?.license_valid === false) return false
   if (health?.recovering === true) return true
   if (rustKernelCliReady(health)) return false
+  if (cragV2KernelActive({ health })) {
+    return (
+      Number(health.active) > 0 || Number(health.waiting) > 0 || Number(health.queued) > 0 || health.pids?.length > 0
+    )
+  }
   const pid = finiteNumber(health?.cli_pid)
   return pid != null && pid > 0
 }
 
 export function rustKernelReachable(health) {
-  return rustKernelProcessUp(health) && health?.healthy !== false && rustKernelCliReady(health)
+  return (
+    rustKernelProcessUp(health) &&
+    health?.healthy !== false &&
+    health?.recovering !== true &&
+    rustKernelCliReady(health)
+  )
 }
 
 /** Only the container restart (L4) can help: the kernel is gone, gave up on CLI, or all slots are closed. */
