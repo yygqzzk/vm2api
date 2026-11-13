@@ -190,6 +190,36 @@ class CutoverVerification(unittest.TestCase):
             self.cutover.warm_kernels(self.root, {"slots": {"vm-a": {"status": "running"}}})
         self.assertFalse((self.root / "warm.json").exists())
 
+    def test_warm_preserves_a_healthy_previously_unschedulable_credentialless_slot(self):
+        report = {"action": "warm", "ok_count": 1, "failed_count": 0, "skipped_count": 1,
+                  "items": [{"id": "vm-a", "ok": True, "skipped": True, "skip_reason": "no_credential"}]}
+        health = {"status": 200, "healthy": True, "process_up": True}
+        self.cutover.api = Mock(side_effect=[{"actions": ["warm"]}, report, {"kernel": {"rust_health": health}}])
+        before = {"slots": {"vm-a": {"status": "running", "schedulable": False, "healthy": True}}}
+        self.cutover.warm_kernels(self.root, before)
+        self.assertFalse((self.root / "warm.json").exists())
+        self.assertEqual(json.loads((self.root / "warm-skipped.json").read_text()), {"vm-a": "no_credential"})
+        self.assertEqual(self.cutover.api.call_args.args[0], "/api/panel/vms/vm-a")
+
+    def test_warm_still_rejects_new_or_unhealthy_credentialless_skips(self):
+        for schedulable, was_healthy, health, reason in [
+            (True, True, {"status": 200, "healthy": True, "process_up": True}, "no_credential"),
+            (False, False, {"status": 200, "healthy": True, "process_up": True}, "no_credential"),
+            (False, True, {"status": 200, "healthy": False, "process_up": True}, "no_credential"),
+            (False, True, {"status": 200, "healthy": True, "process_up": False}, "no_credential"),
+            (False, True, {"status": 503, "healthy": True, "process_up": True}, "no_credential"),
+            (False, True, {"status": 200, "healthy": True, "process_up": True}, "eager_start_off"),
+        ]:
+            with self.subTest(schedulable=schedulable, was_healthy=was_healthy, health=health, reason=reason):
+                report = {"action": "warm", "ok_count": 1, "failed_count": 0, "skipped_count": 1,
+                          "items": [{"id": "vm-a", "ok": True, "skipped": True, "skip_reason": reason}]}
+                self.cutover.api = Mock(side_effect=[{"actions": ["warm"]}, report,
+                                                    {"kernel": {"rust_health": health}}])
+                before = {"slots": {"vm-a": {"status": "running", "schedulable": schedulable,
+                                             "healthy": was_healthy}}}
+                with self.assertRaisesRegex(RuntimeError, "Controller kernel warm-up failed"):
+                    self.cutover.warm_kernels(self.root, before)
+
     def test_warm_kernel_rollback_supports_images_without_the_warm_action(self):
         self.cutover.api = Mock(return_value={"items": []})
         with patch.object(cutover.subprocess, "run",
