@@ -8,7 +8,7 @@ COPY archives/ /tmp/archives/
 RUN python3 /tmp/install_chromix.py "$TARGETARCH" /tmp/archives /opt
 
 FROM debian:bookworm-slim
-LABEL io.vm2api.browser.fingerprint="chromix-1" \
+LABEL io.vm2api.browser.fingerprint="chromix-2" \
       io.vm2api.browser.engine="Chromix/156.0.8078.79"
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \

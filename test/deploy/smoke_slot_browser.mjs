@@ -271,6 +271,8 @@ async function main() {
     assert.match(ra.accept_language, /^ja-JP/)
     assert.match(rb.accept_language, /^en-US/)
     assert.deepEqual(ra.report.screen, [1280, 800])
+    assert.equal(ra.report.device.cpu, 8)
+    assert.equal(ra.report.device.memory, ra.report.secureContext ? 8 : undefined)
     assert.equal(ra.report.webrtcError, undefined)
     assert.equal(rb.report.webrtcError, undefined)
     assert.deepEqual(ra.report.candidates, [])
@@ -334,9 +336,18 @@ print('sandboxed')
       'PASS: headed browsers, RFB, zero capabilities, independent profiles, TZ/language/headers, proxy DNS and WebRTC',
     )
 
+    fixture.navigate(a, 'http://browser.test/?slot=slot-a&tab=second')
+    await waitForReport(fixture, (report) => report.slot === 'slot-a' && report.tab === 'second')
+    const beforeRestore = fixture.reports().length
     fixture.sessions.delete(a.id)
     await fixture.runtime.stop(a)
     fixture.sessions.set(a.id, await fixture.runtime.start(a))
+    const restored = await waitForReport(
+      { reports: () => fixture.reports().slice(beforeRestore) },
+      (report) => report.slot === 'slot-a' && report.tab === 'second',
+    )
+    assert.equal(restored.report.oldStorage, 'slot-a')
+    assert.deepEqual(restored.report.device, ra.report.device)
     fixture.navigate(a, 'http://browser.test/?slot=slot-a-after-restart')
     const again = await waitForReport(fixture, (report) => report.slot === 'slot-a-after-restart')
     assert.equal(again.report.oldCookie, 'slot=slot-a')
@@ -344,8 +355,24 @@ print('sandboxed')
     assert.equal(seed(a), originalSeed)
     assert.deepEqual(again.report.fingerprint, ra.report.fingerprint)
     console.log(
-      'PASS: distinct Canvas/Audio identities and worker consistency; identity and login persist across restart',
+      'PASS: distinct Canvas/Audio identities and worker consistency; device, login and tabs persist across restart',
     )
+
+    const beforeEnvironment = fixture.reports().length
+    fixture.sessions.delete(a.id)
+    await fixture.runtime.stop(a)
+    a.timezone = 'Europe/Paris'
+    a.locale = 'fr_FR.UTF-8'
+    fixture.sessions.set(a.id, await fixture.runtime.start(a))
+    const changed = await waitForReport(
+      { reports: () => fixture.reports().slice(beforeEnvironment) },
+      (report) => report.slot === 'slot-a-after-restart' && report.language === 'fr-FR',
+    )
+    assert.equal(changed.report.timezone, 'Europe/Paris')
+    assert.match(changed.accept_language, /^fr-FR/)
+    assert.equal(seed(a), originalSeed)
+    assert.deepEqual(changed.report.device, ra.report.device)
+    assert.deepEqual(changed.report.fingerprint, ra.report.fingerprint)
 
     fixture.sessions.delete(a.id)
     await fixture.runtime.stop(a, { resetProfile: true })

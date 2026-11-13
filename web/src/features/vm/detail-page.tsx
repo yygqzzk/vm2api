@@ -89,6 +89,7 @@ import {
 } from '@/features/vm/schedulable-switch'
 import { SeedPolicyCard } from '@/features/vm/seed-policy-card'
 import { seedSaveState } from '@/features/vm/seed-settings'
+import { SlotBrowserButton } from '@/features/vm/slot-browser-panel'
 import { usePoolSeatStream } from '@/features/vm/use-pool-seat-stream'
 import { useVmTestChat } from '@/features/vm/use-vm-test-chat'
 import { VmNameField } from '@/features/vm/vm-name-field'
@@ -446,6 +447,10 @@ function VmDetailBody({
             调度
             <SchedulableSwitch {...vmSchedulableProps(vm)} />
           </div>
+          <SlotBrowserButton
+            vm={vm}
+            disabled={!vmRunning(vm) || busy('/start') || busy('/stop')}
+          />
           {perms.power ? (
             <div className='ms-auto flex flex-wrap gap-2'>
               {vmRunning(vm) ? (

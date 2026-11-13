@@ -132,7 +132,7 @@ class Cutover:
                 browser = json.loads(output(["docker", "image", "inspect", self.browser_image]))[0]
             labels = browser["Config"].get("Labels") or {}
             require(labels.get("org.opencontainers.image.revision") == self.revision, "Browser revision mismatch")
-            require(labels.get("io.vm2api.browser.fingerprint") == "chromix-1", "Browser fingerprint image required")
+            require(labels.get("io.vm2api.browser.fingerprint") == "chromix-2", "Browser fingerprint image required")
             require(browser["Os"] == "linux" and browser["Architecture"] == "amd64", "Browser is not linux/amd64")
         return image
 

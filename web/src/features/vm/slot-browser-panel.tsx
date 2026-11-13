@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { Vm } from '@/types/panel-vm'
 import type RFB from '@novnc/novnc'
-import { Monitor } from 'lucide-react'
+import { Monitor, Square } from 'lucide-react'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
 import { copyText } from '@/lib/clipboard'
@@ -102,6 +102,25 @@ export function SlotBrowserButton({
     }
   }
 
+  async function stopBrowser() {
+    const current = ++generation.current
+    setBusy(true)
+    try {
+      await api(`/api/panel/vms/${encodeURIComponent(vm.id)}/browser/stop`, {
+        method: 'POST',
+        body: '{}',
+      })
+      if (generation.current === current) {
+        changeOpen(false)
+        toast.success('浏览器已停止，资料已保留')
+      }
+    } catch (error) {
+      if (generation.current === current) toast.error((error as Error).message)
+    } finally {
+      if (generation.current === current) setBusy(false)
+    }
+  }
+
   function changeOpen(value: boolean) {
     if (!value) {
       generation.current += 1
@@ -131,21 +150,42 @@ export function SlotBrowserButton({
               槽位浏览器 · {vm.name || vm.id}
             </DialogTitle>
             <DialogDescription>
-              独立保存登录态。关闭窗口后最多保留 5
-              分钟；停止浏览器不会删除登录态。 网页登录不等于完成槽位授权。
+              每槽独立保存浏览器身份和网站资料，重新打开恢复上次标签页。
+              语言、时区跟随槽位。关闭画面后闲置 5
+              分钟停止；手动停止也保留资料。
+              {authUrl ? ' 网页登录不等于完成槽位授权。' : ''}
             </DialogDescription>
-            {perms.admin ? (
+            <div className='flex flex-wrap gap-2'>
               <Button
                 type='button'
                 size='sm'
-                variant='ghost'
-                className='self-start'
-                disabled={busy}
-                onClick={() => setConfirmReset(true)}
+                variant='outline'
+                onClick={() => changeOpen(false)}
               >
-                重置浏览器登录态
+                关闭画面
               </Button>
-            ) : null}
+              <Button
+                type='button'
+                size='sm'
+                variant='outline'
+                disabled={busy}
+                onClick={() => void stopBrowser()}
+              >
+                <Square className='size-3.5' aria-hidden='true' />
+                {busy ? '正在处理…' : '停止浏览器并保存'}
+              </Button>
+              {perms.admin ? (
+                <Button
+                  type='button'
+                  size='sm'
+                  variant='ghost'
+                  disabled={busy}
+                  onClick={() => setConfirmReset(true)}
+                >
+                  重置浏览器登录态
+                </Button>
+              ) : null}
+            </div>
           </DialogHeader>
           {note ? (
             <p role='status' className='text-sm'>
@@ -176,7 +216,7 @@ export function SlotBrowserButton({
         open={confirmReset}
         onOpenChange={setConfirmReset}
         title='清空该槽浏览器登录态？'
-        desc='将停止浏览器并删除该槽的 Cookie、网站存储及下载文件，保留浏览器指纹身份。槽位属主或机器身份已改变时会同时清除旧指纹。无法撤销；不会修改槽位 API 凭证。'
+        desc='将停止浏览器并删除该槽的 Cookie、网站存储、书签、历史、标签页及下载文件，保留浏览器指纹身份。槽位属主或机器身份已改变时会同时清除旧指纹。无法撤销；不会修改槽位 API 凭证。'
         destructive
         isLoading={busy}
         confirmText='确认清空'
@@ -211,7 +251,6 @@ function BrowserView({
   const [reconnect, setReconnect] = useState(0)
   const [clipboard, setClipboard] = useState('')
   const [remoteClipboard, setRemoteClipboard] = useState('')
-  const [stopping, setStopping] = useState(false)
   const [oauthNote, setOauthNote] = useState('')
   const [oauthFailed, setOauthFailed] = useState(false)
   const [retry, setRetry] = useState(0)
@@ -354,18 +393,6 @@ function BrowserView({
     }
   }, [root, codexSessionId, retry, restartRequired])
 
-  async function stop() {
-    setStopping(true)
-    try {
-      await api(`${root}/browser/stop`, { method: 'POST', body: '{}' })
-      onStopped()
-    } catch (error) {
-      toast.error((error as Error).message)
-    } finally {
-      setStopping(false)
-    }
-  }
-
   return (
     <>
       <div className='flex flex-wrap items-center gap-2 text-xs'>
@@ -377,6 +404,7 @@ function BrowserView({
         <span>
           时区 {status.timezone} · 语言 {status.language} · 屏幕 {status.screen}
         </span>
+        {status.identity ? <span>环境标识 {status.identity}</span> : null}
         <span role='status'>{phase}</span>
         {restartRequired ? (
           <Button type='button' size='sm' variant='outline' onClick={onStopped}>
@@ -392,15 +420,6 @@ function BrowserView({
             重连画面
           </Button>
         ) : null}
-        <Button
-          type='button'
-          size='sm'
-          variant='outline'
-          disabled={stopping}
-          onClick={() => void stop()}
-        >
-          {stopping ? '正在停止…' : '停止浏览器'}
-        </Button>
       </div>
       {environmentWarning ? (
         <p role='alert' className='text-sm text-amber-600'>
@@ -473,7 +492,7 @@ function BrowserView({
                 void copyText(remoteClipboard).then((ok) => {
                   if (ok) {
                     setRemoteClipboard('')
-                    toast.success('已复制远端剪贴板，可回填授权码')
+                    toast.success('已复制远端剪贴板')
                   } else toast.error('复制失败，请在远端浏览器中重试复制')
                 })
               }}

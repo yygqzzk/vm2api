@@ -4,7 +4,6 @@ import { getVm } from '../../vm/vm-registry.mjs'
 import { hasCapability, panelIdentity } from '../../admin/panel-acl.mjs'
 import { vmOwnerId } from '../../admin/resource-owner.mjs'
 import { parsePanelCorsOrigins } from '../../http/cors.mjs'
-import { isCodexVm } from '../../vm/vm-kind.mjs'
 import { createBrowserRuntime } from './runtime.mjs'
 import {
   BROWSER_LIMIT,
@@ -189,7 +188,7 @@ export function createSlotBrowser({
         session = null
       }
       let grant = null
-      let url = navigationUrl(body.auth_url || (isCodexVm(vm) ? 'https://chatgpt.com/' : 'https://claude.ai/'))
+      const url = body.auth_url == null ? null : navigationUrl(body.auth_url)
       if (body.oauth_session_id) {
         grant = grants.get(id)
         if (!grant || grant.sessionId !== body.oauth_session_id || grant.expiresAt <= now() || grant.url !== url) {
@@ -218,13 +217,15 @@ export function createSlotBrowser({
         await stopVm(vm)
         throw new BrowserError('browser_binding_changed', '槽位、出口或权限已改变，请重新打开')
       }
-      await runtime.rpc(session, {
-        op: 'open',
-        url,
-        ...(grant ? { grant: { state: grant.state, session_id: grant.sessionId } } : {}),
-      })
+      if (url) {
+        await runtime.rpc(session, {
+          op: 'open',
+          url,
+          ...(grant ? { grant: { state: grant.state, session_id: grant.sessionId } } : {}),
+        })
+        session.oauthSessionId = grant?.sessionId || null
+      }
       session.lastViewed = now()
-      session.oauthSessionId = grant?.sessionId || null
       session.environmentWarning = ''
       exitChecks.set(vm.proxy?.id, now())
       return view(session)

@@ -91,7 +91,7 @@ class CutoverVerification(unittest.TestCase):
         c = self.cutover
         c.browser_image = "registry.example/browser@sha256:new"
         control = {"Os": "linux", "Architecture": "amd64", "Config": {"Labels": {"org.opencontainers.image.revision": c.revision}}}
-        browser = {"Os": "linux", "Architecture": "amd64", "Config": {"Labels": {"org.opencontainers.image.revision": c.revision, "io.vm2api.browser.fingerprint": "chromix-1"}}}
+        browser = {"Os": "linux", "Architecture": "amd64", "Config": {"Labels": {"org.opencontainers.image.revision": c.revision, "io.vm2api.browser.fingerprint": "chromix-2"}}}
         with patch.object(cutover, "output", side_effect=[json.dumps([control]), json.dumps([browser])]):
             self.assertEqual(c.ensure_image(), control)
         for bad in [

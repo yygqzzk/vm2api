@@ -6,6 +6,8 @@ import path from 'node:path'
 import { once } from 'node:events'
 import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
+import { setTimeout as delay } from 'node:timers/promises'
+import { WebSocketServer } from 'ws'
 import { browserFixture, waitForReport } from './smoke_slot_browser.mjs'
 import { createSlotBrowser, BROWSER_PATH } from '../../src/lib/fork/slot-browser/service.mjs'
 
@@ -20,10 +22,21 @@ const output = path.join(root, '.local/slot-browser-test')
 fs.mkdirSync(output, { recursive: true, mode: 0o700 })
 const fixture = await browserFixture()
 const vm = fixture.vms[0]
+const openedUrls = []
+const terminal = new WebSocketServer({ noServer: true })
+const claudeAuthUrl = 'https://claude.com/cai/oauth/authorize?state=offline-claude-state'
+const claudeCode = 'offline-code#offline-claude-state'
+let terminalInput = ''
 const service = createSlotBrowser({
   readVm: (id) => fixture.vms.find((entry) => entry.id === id),
   principalFor: () => ({ key: 'offline-acceptance', valid: () => true }),
-  runtime: fixture.runtime,
+  runtime: {
+    ...fixture.runtime,
+    async rpc(session, message) {
+      if (message.op === 'open') openedUrls.push(message.url)
+      return fixture.runtime.rpc(session, message)
+    },
+  },
 })
 let browser,
   vite,
@@ -57,10 +70,16 @@ try {
   vite = await createServer({
     configFile: false,
     root,
+    cacheDir: path.join(output, 'vite-cache'),
     plugins: [react(), tailwindcss()],
+    optimizeDeps: {
+      entries: [path.join(root, 'test/fixtures/slot-browser-preview.tsx')],
+      include: ['@novnc/novnc'],
+    },
     resolve: {
       alias: {
         '@': path.join(root, 'web/src'),
+        '@novnc/novnc': webRequire.resolve('@novnc/novnc'),
         react: path.join(root, 'web/node_modules/react'),
         'react-dom': path.join(root, 'web/node_modules/react-dom'),
         '@tanstack/react-query': path.join(root, 'web/node_modules/@tanstack/react-query'),
@@ -82,6 +101,8 @@ try {
       }
       if (url.pathname === '/api/panel/me')
         return json(res, 200, { ok: true, data: { user: 'acceptance', role: 'admin' } })
+      if (url.pathname === `/api/panel/vms/${vm.id}/shell-ticket`)
+        return json(res, 200, { ok: true, data: { ticket: 'offline-terminal', cli_bin: '/fixture/claude' } })
       if (BROWSER_PATH.test(url.pathname)) return await service.handle(req, res, url, { json, readBody })
       if (url.pathname.endsWith('/oauth/exchange-code')) {
         const body = await readBody(req)
@@ -93,8 +114,9 @@ try {
       if (url.pathname === '/browser-preview') {
         const codex = url.searchParams.has('codex')
         const data = {
-          vm,
-          authUrl: codex ? auth.href : 'https://example.invalid/',
+          vm: { ...vm, status: 'running', can_import_credential: true },
+          claude: url.searchParams.has('claude'),
+          authUrl: url.searchParams.has('browse') ? undefined : codex ? auth.href : 'https://example.invalid/',
           codexSessionId: codex ? generated.session_id : undefined,
         }
         const html = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body><div id="root"></div><script type="application/json" id="fixture-data">${JSON.stringify(data).replaceAll('<', '\\u003c')}</script><script type="module" src="/test/fixtures/slot-browser-preview.tsx"></script></body></html>`
@@ -106,7 +128,20 @@ try {
       json(res, 500, { ok: false, error: { message: error.message } })
     }
   })
-  server.on('upgrade', (req, socket, head) => service.handleUpgrade(req, socket, head))
+  server.on('upgrade', (req, socket, head) => {
+    const url = new URL(req.url, 'http://local')
+    if (url.pathname === `/api/panel/vms/${vm.id}/shell` && url.searchParams.get('ticket') === 'offline-terminal') {
+      terminal.handleUpgrade(req, socket, head, (ws) => {
+        ws.send(Buffer.from(`Authorize at: ${claudeAuthUrl}\r\n`))
+        ws.on('message', (raw) => {
+          const message = JSON.parse(raw.toString())
+          if (message.t !== 'd') return
+          terminalInput += message.d
+          if (terminalInput.includes(claudeCode)) ws.send(JSON.stringify({ t: 'login' }))
+        })
+      })
+    } else service.handleUpgrade(req, socket, head)
+  })
   server.listen(0, '127.0.0.1')
   await once(server, 'listening')
   const origin = `http://127.0.0.1:${server.address().port}`
@@ -117,6 +152,19 @@ try {
   page.on('console', (message) => {
     if (message.type() === 'error') errors.push(message.text())
   })
+  await page.goto(`${origin}/browser-preview?browse=1`)
+  await page.getByRole('button', { name: '打开槽位浏览器', exact: true }).click()
+  await page.getByText('已连接', { exact: true }).waitFor({ timeout: 45_000 })
+  const identity = await page.getByText(/^环境标识 /).innerText()
+  await page.getByRole('button', { name: '关闭画面', exact: true }).click()
+  await page.getByRole('dialog').waitFor({ state: 'hidden' })
+  await page.getByRole('button', { name: '打开槽位浏览器', exact: true }).click()
+  await page.getByText('已连接', { exact: true }).waitFor({ timeout: 15_000 })
+  assert.equal(await page.getByText(/^环境标识 /).innerText(), identity)
+  assert.deepEqual(openedUrls, [])
+  await page.getByRole('button', { name: '关闭画面', exact: true }).click()
+  console.log('PASS: everyday entry reuses the same browser identity and does not open a provider tab')
+
   await page.goto(`${origin}/browser-preview`)
   await page.getByRole('button', { name: '在槽位浏览器中授权' }).click()
   await page.getByText('已连接', { exact: true }).waitFor({ timeout: 45_000 })
@@ -173,6 +221,11 @@ try {
     'mobile dialog must keep its header and close control visible',
   )
   await page.screenshot({ path: path.join(output, 'browser-mobile.png') })
+  await page.getByRole('button', { name: '停止浏览器并保存', exact: true }).click()
+  await page.getByRole('dialog').waitFor({ state: 'hidden', timeout: 20_000 })
+  assert.equal(await fixture.runtime.rpc(fixture.sessions.get(vm.id), { op: 'status' }).catch(() => null), null)
+  await page.getByRole('button', { name: '在槽位浏览器中授权' }).click()
+  await page.getByText('已连接', { exact: true }).waitFor({ timeout: 45_000 })
   const simulatedChange = { method: 'PUT' }
   await service.beforeProxyMutation(simulatedChange, { proxyId: vm.proxy.id })
   service.afterMutation(simulatedChange)
@@ -197,6 +250,32 @@ try {
   console.log(
     'PASS: loopback callback reaches only its slot and existing exchange endpoint, without a real provider request',
   )
+
+  await page.goto(`${origin}/browser-preview?claude=1`)
+  await page.getByRole('button', { name: '打开原生 CC 登录终端', exact: true }).click()
+  await page.getByLabel('授权链接', { exact: true }).waitFor()
+  await page.waitForFunction((value) => document.querySelector('#native-auth-url')?.value === value, claudeAuthUrl)
+  await page.getByRole('button', { name: '在槽位浏览器中授权', exact: true }).click()
+  const remote = page.getByRole('dialog', { name: /槽位浏览器/ })
+  await remote.getByText('已连接', { exact: true }).waitFor({ timeout: 30_000 })
+  assert.equal(openedUrls.at(-1), claudeAuthUrl)
+  let title = ''
+  for (let attempt = 0; attempt < 40; attempt++) {
+    title = fixture.exec(vm, "import subprocess; print(subprocess.check_output(['wmctrl', '-l'], text=True))")
+    if (title.includes('claude.com')) break
+    await delay(250)
+  }
+  assert.match(title, /claude\.com/)
+  await page.screenshot({ path: path.join(output, 'claude-slot-browser.png') })
+  await remote.getByRole('button', { name: '关闭画面', exact: true }).click()
+  await page.getByLabel('授权码', { exact: false }).fill(claudeCode)
+  await page.getByRole('button', { name: '提交授权码', exact: true }).click()
+  await page.getByText('凭证已保存到面板', { exact: true }).waitFor({ timeout: 10_000 })
+  assert.ok(terminalInput.includes(claudeCode))
+  assert.deepEqual(errors, [])
+  console.log(
+    'PASS: Claude login opens the nested slot browser and returns its synthetic code to the original terminal',
+  )
 } catch (error) {
   if (browser) {
     const page = browser.contexts()[0]?.pages()[0]
@@ -208,6 +287,7 @@ try {
   throw error
 } finally {
   await browser?.close()
+  terminal.close()
   await service.close()
   await vite?.close()
   if (server) {

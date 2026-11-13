@@ -6,6 +6,7 @@ export type BrowserStatus = {
   screen: string
   proxy_id: string
   egress: 'local' | 'socks5'
+  identity?: string
   environment_warning?: string
 }
 

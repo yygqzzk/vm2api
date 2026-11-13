@@ -4,8 +4,8 @@ import { isLocalEgressProxy, portsForProxy, slotNetworkForVm } from '../../vm/eg
 import { isKvmRuntime } from '../../vm/runtime-kind.mjs'
 import { browserSeccomp } from './seccomp.mjs'
 
-export const DEFAULT_BROWSER_IMAGE = 'local/vm2api-slot-browser:2'
-export const BROWSER_FINGERPRINT_SCHEMA = 'chromix-1'
+export const DEFAULT_BROWSER_IMAGE = 'local/vm2api-slot-browser:3'
+export const BROWSER_FINGERPRINT_SCHEMA = 'chromix-2'
 export const BROWSER_LIMIT = 2
 export const TICKET_TTL_MS = 30_000
 export const IDLE_MS = 300_000

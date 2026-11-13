@@ -38,7 +38,6 @@ import {
   probeSourceLabel,
   type ProbeCheck,
 } from '@/features/vm/probe-status'
-import { SlotBrowserButton } from '@/features/vm/slot-browser-panel'
 import { VmPackageButton } from '@/features/vm/vm-package-dialog'
 import { useVmPerms } from '@/features/vm/vm-perms'
 
@@ -108,7 +107,6 @@ export function VmAccountTab(props: VmAccountTabProps) {
           <Card>
             <CardHeader className='flex flex-wrap items-center justify-between gap-2 pb-2'>
               <CardTitle className='text-sm'>导入凭证</CardTitle>
-              <SlotBrowserButton vm={vm} disabled={blocked} />
             </CardHeader>
             <CardContent className='pt-0'>
               {blocked ? (

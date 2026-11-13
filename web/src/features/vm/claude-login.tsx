@@ -25,6 +25,7 @@ import {
 import { Textarea } from '@/components/ui/textarea'
 import { type LoginTerminalHandle, WsTerminal } from '@/components/ws-terminal'
 import { prepareLoginTerminal } from './login-terminal-start'
+import { SlotBrowserButton } from './slot-browser-panel'
 
 /** Native CC obtains the grant; the existing panel importer remains its owner. */
 export function ClaudeLogin({
@@ -226,15 +227,18 @@ export function ClaudeLogin({
                   </Button>
                 </div>
                 {url ? (
-                  <a
-                    className='inline-flex min-h-8 items-center gap-1.5 text-sm text-primary underline underline-offset-4'
-                    href={url}
-                    target='_blank'
-                    rel='noreferrer'
-                  >
-                    打开授权页
-                    <ExternalLink className='size-3.5' aria-hidden='true' />
-                  </a>
+                  <div className='flex flex-wrap items-center gap-3'>
+                    <SlotBrowserButton vm={vm} authUrl={url} />
+                    <a
+                      className='inline-flex min-h-8 items-center gap-1.5 text-sm text-primary underline underline-offset-4'
+                      href={url}
+                      target='_blank'
+                      rel='noreferrer'
+                    >
+                      打开授权页
+                      <ExternalLink className='size-3.5' aria-hidden='true' />
+                    </a>
+                  </div>
                 ) : (
                   <p className='text-sm text-muted-foreground'>
                     浏览器须使用本槽绑定的出口。
