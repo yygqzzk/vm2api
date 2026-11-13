@@ -1,13 +1,13 @@
 # 槽位浏览器（fork）
 
-Linux Docker 槽的按需登录浏览器。使用基于 Chromium 的 Chromix、有头桌面、TigerVNC、noVNC，不改变 vm2api 推理内核。每节点共享一份镜像，每槽独立容器、持久化 profile 和固定浏览器指纹种子。控制面同时最多 2 个浏览器，每节点也检查 2 个上限。
+Linux Docker 槽的按需浏览器，可日常浏览和登录授权。使用基于 Chromium 的 Chromix、有头桌面、TigerVNC、noVNC，不改变 vm2api 推理内核。每节点共享一份镜像，每槽独立容器、持久化 profile 和固定浏览器指纹种子。控制面同时最多 2 个浏览器，每节点也检查 2 个上限。
 
 ## 使用前
 
 在**每个承载槽位的 Linux Docker 节点**构建一次：
 
 ```bash
-docker build -t local/vm2api-slot-browser:2 docker/fork/slot-browser
+docker build -t local/vm2api-slot-browser:3 docker/fork/slot-browser
 ```
 
 控制面默认只使用节点上已经存在的这个镜像，不自动下载、构建或更新。可以通过 `VM2API_BROWSER_IMAGE` 指定自己已构建的固定镜像 ID/digest；所有节点必须有对应镜像。发布时记录镜像身份和 Chromium 版本，定期重建安全更新，不长期冻结旧浏览器。
@@ -16,7 +16,7 @@ docker build -t local/vm2api-slot-browser:2 docker/fork/slot-browser
 
 镜像 CPU 架构必须与 Docker Engine 一致。启动时拒绝跨架构模拟：模拟环境可能让 Chrome 运行却无法安装其内部 seccomp 过滤器，不能拿“页面可打开”当作沙箱正常。Mac 上的 Docker 应构建和使用原生 arm64 镜像；amd64 的完整容器验收须在原生 amd64 Linux 节点/CI 执行。
 
-控制面要求镜像带有 `io.vm2api.browser.fingerprint=chromix-1` 标记，拒绝原版 `:1` 镜像；检查后使用实际 image ID 启动，避免 tag 切换造成版本错配。升级前停止浏览器并备份 profile 卷，再构建新镜像和更新控制面。旧 profile 首次启动只新增种子文件，保留已有网站数据；恢复旧程序/浏览器前使用升级前备份，不能假设新版 Chrome profile 可向后兼容。
+控制面要求镜像带有 `io.vm2api.browser.fingerprint=chromix-2` 标记，拒绝旧 `:1` / `:2` 镜像；新标记包含标签页恢复和持久身份校验契约。检查后使用实际 image ID 启动，避免 tag 切换造成版本错配。升级前停止浏览器并备份 profile 卷，再构建新镜像和更新控制面。旧 profile 首次启动保留种子和网站数据，只补身份校验标记；恢复旧程序/浏览器前使用升级前备份，不能假设新版 Chrome profile 可向后兼容。
 
 需要 Docker Engine、可用的 unprivileged user namespaces 和允许其运行的宿主 AppArmor 配置。运行时使用固定 Moby 默认 seccomp 加 Chromium sandbox 所需的命名空间调用，不授予 `SYS_ADMIN`，不使用 `--privileged`、`seccomp=unconfined` 或 `--no-sandbox`。宿主禁止 user namespaces 时启动失败，不静默降低隔离。
 
@@ -24,15 +24,17 @@ docker build -t local/vm2api-slot-browser:2 docker/fork/slot-browser
 
 更新控制面源码及前端构建；原槽不需要安装 Chrome、重编 payload 或改变推理内核。已有槽必须先启动且出口网络已经与绑定代理一致。远程 Linux Docker 节点复用 `slotHost().dockerApi()` 的 SSH 通道，不开放远程 Docker TCP。
 
-## 在面板登录
+## 日常浏览与授权
 
-槽位详情 → 账号 →「打开槽位浏览器」。有授权链接时，选「在槽位浏览器中授权」：
+槽位详情顶部 →「打开槽位浏览器」，无需凭证或授权链接；槽位及绑定出口须已运行。普通打开重连现有窗口，不再额外打开供应商首页。浏览器停止后重新打开，通过 Chromium 原生会话恢复上次标签页；新环境显示浏览器新标签页。日常浏览与授权共用本槽 profile。
+
+有授权链接时，选「在槽位浏览器中授权」，在同一浏览器中新开标签，不清空已有页面。Claude 原生 CC 登录终端也提供这个入口。
 
 - Claude：继续使用现有官方 CLI/授权链接流程。在远端浏览器登录并授权，复制授权码，通过「复制远端剪贴板到本机」取回，关闭画面后回填原来的终端或授权码输入框。浏览器不提取 Cookie、不另建刷新器。
 - Codex：继续由现有 PKCE 逻辑生成链接；旁车只在自身 `127.0.0.1:1455` 接回调，校验 Host、路径、state、有效期和重复回调。控制面经受保护的通道读取并提交现有 `/oauth/exchange-code`。自动提交失败不会循环重放；可以明确点击重新检查或使用原手动回调入口。
 - 普通「打开授权页」仍打开操作员本机浏览器，需自行配置其代理；它不是槽位浏览器。
 - 中文可以通过面板剪贴板输入：发送后在远端按 Ctrl+V。远端复制不会自动写入本机剪贴板，须明确点击复制按钮。浏览器内 Ctrl+L 可输入地址。
-- 关闭面板画面不立即删除浏览器，最多保留 5 分钟用于重连；「停止浏览器」正常关闭 Chromium 并保存持久状态。退出 Chrome 最后一个窗口也会结束桌面。
+- 顶部「关闭画面」只断开画面，闲置最多保留 5 分钟用于重连；「停止浏览器并保存」立即正常关闭 Chromium，保留身份、网站资料和可恢复的标签页，画面无法连接时也可以操作。退出 Chrome 最后一个窗口也会结束桌面。会话恢复不能恢复尚未提交的表单、内存状态，或保证网站登录仍然有效。
 - 控制面/SSH 失联导致心跳超过 45 秒时，容器内独立 lease 结束桌面。关闭时优先发正常窗口关闭请求，保留 X server 到 Chromium 退出，避免 Cookie 写入丢失。崩溃/断电仍不保证最后几秒数据落盘。
 
 一个槽同一时间只有一个画面控制者。仅 admin 可使用；user 与 super 不可查看画面或操作，与上游 1.4.051 的租户凭据只读限制一致。权限、会话撤销和属主变化会重新检查。ticket 30 秒内有效、单次使用、绑定槽/浏览器会话/Origin。VNC 和控制协议只监听容器 Unix socket，借 Docker exec 二进制流转发，不发布 5900、6080 或 CDP 端口。
@@ -53,7 +55,9 @@ docker build -t local/vm2api-slot-browser:2 docker/fork/slot-browser
 
 代理断开时不回落直连。换代理、变更属主、重建/停止槽位等控制面操作先停浏览器；操作结束前阻止重新启动。用户编辑自己的代理不会停止其他租户的浏览器。直接在宿主修改 Docker/iptables 不在控制面事务保护范围，运维必须保持出口网络规则。
 
-环境来自槽的 `timezone` / UTF-8 `locale`；`navigator.language/languages`、Intl、Accept-Language 对齐配置。显示及暴露的 screen 固定 1280×800，控制面只缩放画面。UA/Client Hints 使用 Chromium/Linux，不伪造 Windows/macOS。每槽首次启动生成随机种子，以 Chromix 原生参数启用 `fingerprint-pixel-noise=seeded` 和 `fingerprint-audio-render=isolated`，让同槽 Canvas/Audio 输出稳定、不同槽产生不同输出；没有注入网页 JavaScript。仅设置 seed 并不足以得到上述效果。
+环境来自槽的 `timezone` / UTF-8 `locale`；`navigator.language/languages`、Intl、Accept-Language 对齐配置。槽位的语言或时区变化时停止旧浏览器，重新打开继承新值，不重抽种子或清理资料。显示及暴露的 screen 固定 1280×800，控制面只缩放画面。网页可见 CPU/内存固定呈现为 8 核 / 8 GiB；这不增加容器实际资源限额。UA/Client Hints 使用 Chromium/Linux，不伪造 Windows/macOS。每槽首次启动生成随机种子，以 Chromix 原生参数启用 `fingerprint-pixel-noise=seeded` 和 `fingerprint-audio-render=isolated`，让同槽 Canvas/Audio 输出稳定、不同槽产生不同输出；没有注入网页 JavaScript。仅设置 seed 并不足以得到上述效果。
+
+画面显示由种子摘要得到的「环境标识」，方便核对同槽重开、资料清理和环境联动时是否仍使用同一身份。它不代表全部可见特征的摘要：语言、时区、出口 IP 会按槽配置变化；升级内核、字体、驱动或跨架构迁移还可能改变原生特征，须另做兼容验收。
 
 WebGL 沿用默认可用性，不开启不安全的软件渲染开关；无 GPU 容器可能返回 null。硬件、字体、GPU、屏幕等特征仍可能相同，这不是整套商业指纹浏览器或防关联保证，也不承诺绕过网站风控。同代理 IP 不会因 profile/seed 隔离变成不同 IP。升级 Chromix 也可能改变输出，需重新验收。
 
@@ -70,15 +74,15 @@ WebGL 沿用默认可用性，不开启不安全的软件渲染开关；无 GPU 
 - 打开前检测失败不使用旧缓存冒充验证成功；运行中仅地理服务失败不等于出口改变，保留现有浏览器并显示“出口复核失败”，等待下一轮或管理员「测地理」。不把瞬时地理 API 故障当成账号/代理失效。
 - 检测过程中发生换绑、手动固定时区或新一轮检测时，迟到结果不能覆盖新配置。
 
-这套逻辑作用于通用代理池，包括固定 SOCKS5、相同入口后面的动态节点和远程节点本地出口，不依赖 Clash。语言仍使用槽位手动选择的 locale，不因国家变化自动猜测语言。
+这套逻辑作用于通用代理池，包括固定 SOCKS5、相同入口后面的动态节点和远程节点本地出口，不依赖 Clash。浏览器语言始终继承槽位当前 locale，不额外按国家猜测或单独冻结。
 
 ## 数据、重建与删除
 
-浏览器 profile 放在**槽位节点的 Docker 命名卷** `kin-browser-profile-<slot-id-sha256前24位>`，不是放进现有 CLI home。这样不会暴露 API 凭证目录，也不受原槽的 home 重建影响。只读镜像没有账号或代理凭证。卷内 `/profile/browser-identity.json` 保存版本与固定种子，网站数据位于 `/profile/chromium/`；身份文件损坏时拒绝启动，不静默生成新身份。
+浏览器 profile 放在**槽位节点的 Docker 命名卷** `kin-browser-profile-<slot-id-sha256前24位>`，不是放进现有 CLI home。这样不会暴露 API 凭证目录，也不受原槽的 home 重建影响。只读镜像没有账号或代理凭证。卷内 `/profile/browser-identity.json` 保存版本与固定种子，`browser-identity.sha256` 保存身份校验标记，网站数据位于 `/profile/chromium/`。已有校验标记时，种子文件丢失、损坏或被替换均拒绝启动，不静默生成新身份。旧版只存在种子文件时原样复用并补标记。整个卷或两份身份文件都被直接删除后无法判断旧身份，必须通过备份恢复。
 
 - 正常停止、浏览器容器重建、槽位「保留数据」重建：保留 profile 与浏览器种子。
 - 槽位删除、明确「重建新特征」：在原操作通过门禁后清理整个 profile 卷及种子，下次启动获得新浏览器身份。删除槽位被拒绝时不清空 profile。
-- 管理员可以在浏览器窗口点「重置浏览器登录态」，二次确认后清空 Cookie、网站存储与下载文件，**保留浏览器种子、不改 API 凭证**。清理由固定的临时容器完成，仅挂载该 profile，无网络、无 capabilities，以 UID 1000 运行；失败会报错。
+- 管理员可以在浏览器窗口点「重置浏览器登录态」，二次确认后清空 Cookie、网站存储、书签、历史、标签页与下载文件，**保留浏览器种子和校验标记、不改 API 凭证**。清理由固定的临时容器完成，仅挂载该 profile，无网络、无 capabilities，以 UID 1000 运行；失败会报错。
 - profile 卷标记创建时属主和 guest machine ID。身份改变后拒绝复用旧登录态，需管理员明确重置；此时清理整个旧卷及种子，新属主不会继承前任用户的会话或指纹。
 - 不自动跨节点同步 profile。移动槽位前关闭浏览器；旧节点命名卷不会自动复制或删除，需在批准的数据迁移/清理中处理。不要让两个节点同时写同一 profile。
 
@@ -158,3 +162,28 @@ UI 验收加载真实 React 组件、service 与 Docker/RFB 链路，模拟 Pane
 | linux/amd64 | `local/vm2api-slot-browser:2-amd64` | `sha256:03604344a0595b0be5c83dc90319b91934d05d1cc6ee1a79fe3e3b49d3a5d2c9` |
 
 日志、合成迁移/沙箱诊断脚本及 UI 截图保存在本 worktree 的 `.local/slot-browser-test/`，不进入产品镜像或源码提交。它们不替代目标节点、真实远程 SSH 或生产 TLS/WSS 验收；固定种子也不构成网站无法关联账号的保证。
+
+### 日常浏览扩展初轮验证（2026-11-13，权限受限）
+
+基线 `25d562050fd148e6fc732897a165cc64ad686e61`，独立 worktree `/private/tmp/vm2api-persistent-slot-browser`，分支 `fork/persistent-slot-browser`。原工作区未修改；以下均为本地结果，没有本次 CI 或线上部署结果。
+
+- 不监听端口的 Node 专项 19 项通过，包含真实 service handler 的普通重连不导航、显式授权链接及手动停止保留资料检查；Python 浏览器契约 11 项、切换脚本契约 10 项、前端相关 10 项通过。
+- TypeScript、前端生产构建、修改文件的 Biome/Prettier 与 Python 语法检查通过。复用了本机已有依赖，包括另一个工作区已安装的同版本 noVNC 1.7.0，未修改依赖清单或下载新包。
+- 修改的前端文件 ESLint 只有 `claude-login.tsx` 原有的 `no-control-regex` 报错；在未改的基线内容上复现，未将它算作通过，也未改认证路径校验规则。
+- HTTP/WebSocket 与 Docker 模拟服务测试因本会话禁止监听 `127.0.0.1` 而报 `EPERM`；未修改的基线测试同样失败。新增普通打开场景通过直接调用真实 handler 验证，不能替代网络链路验收。
+- Docker socket 同样被本会话权限拒绝。本次未构建 `:3` 镜像，未运行真实容器、noVNC 画面、供应商登录、推理或部署。容器 smoke 已补上标签恢复、重启设备特征、语言/时区变化保持种子及手动停止检查，须在有权限的原生架构节点执行后再验收上线。
+
+### 开放权限后的容器与 UI 验收（2026-11-13）
+
+同一 worktree 和基线的未提交验证快照，没有提交、推送或线上切换。权限开放后，本机 Docker Desktop 一度显示运行但引擎超时返回 500；恢复引擎后确认无运行容器，再执行隔离测试。
+
+- Node 槽位浏览器专项 **38/38** 通过，无跳过，包含真实 HTTP/WebSocket。移除了初轮为免监听验证添加的临时 handler 直调模式；普通重连不导航的新增场景现已通过真实 HTTP 验证。
+- 从当前 Dockerfile 构建并验收 **原生 linux/arm64** 镜像，实际版本 `Chromium 156.0.8078.79`、标记 `chromix-2`。临时 tag 为 `local/vm2api-slot-browser:3-acceptance-20261113`，Docker inspect ID 为 `sha256:ad58224704a8dbbe0a12b7f43bdfda29f7f85384f73d7285a8a021feafcabe9c`。这是未提交源码的本地验证工件，不是正式发布身份。
+- 真实双容器验收通过：独立网站数据、Canvas/Audio 差异及同槽稳定性、Worker 一致性、停止后恢复标签页、设备呈现与种子不变；槽位语言/时区更新后继承新环境且不重抽身份；清理登录态保留身份、完整删除生成新身份。
+- UID/capabilities、Chromium 附加 sandbox seccomp、RFB、DNS 经代理、WebRTC、宿主/其他容器/元数据/IPv6/非 DNS UDP 阻断、代理失效无 TCP/DNS 直连回退，以及断心跳后独立 lease 停止均通过。
+- HTTP fixture 的 `deviceMemory` 按安全上下文可见性检查。另用产品实际运行的有头浏览器访问容器内 localhost，实测 `isSecureContext=true`、CPU 8、内存 8。最初额外 headless `--dump-dom` 探针超时，不算通过；最终验证使用产品有头进程，没有改变产品 sandbox 或公开控制端口。
+- 真实 React/noVNC UI 通过：日常入口重连不新增供应商标签、环境标识不变、键鼠、中文剪贴板、390px 窄屏布局、顶部手动停止后重开、环境失效提示，以及 Codex 模拟回调仅提交一次。Claude 原生 CC 弹窗内打开槽位浏览器、确认远端窗口切到 Claude 域名、关闭画面后回填合成授权码到原终端的衔接也通过。页面与 GUI 控制台 error 检查通过。
+- 修正了 UI 测试服务器首次依赖预构建触发自动刷新、504 的测试干扰：固定扫描入口、noVNC 解析和独立缓存后重跑通过。没有改产品依赖或放宽错误断言。
+- 测试容器、profile 卷和网桥全部清理；测试前后网络均为 **34**，原有容器保留，测试后运行容器为 0。镜像、日志、截图和逐文件源码摘要保留在 `.local/slot-browser-test/`：`validation-20261113.json`、`unit-20261113.log`、`container-20261113.log`、`ui-20261113.log`、`secure-device-20261113.log`。
+
+未运行原生 amd64、真实供应商账号登录/推理、远程 SSH 节点、生产 HTTPS/WSS 或线上部署。模拟授权不等于真实供应商登录通过；生产 amd64 仍须在目标节点或 CI 完成同样验收。

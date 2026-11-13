@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Toaster } from 'sonner'
 import { SlotBrowserButton } from '@/features/vm/slot-browser-panel'
+import { ClaudeLogin } from '@/features/vm/claude-login'
 import { setSession } from '@/lib/session'
 import '@/styles/index.css'
 
@@ -15,8 +16,9 @@ function Preview() {
   return <QueryClientProvider client={client}>
     <main style={{ padding: 24 }}>
       <h1>Offline slot browser acceptance</h1>
-      <SlotBrowserButton vm={fixture.vm} authUrl={fixture.authUrl}
-        codexSessionId={fixture.codexSessionId} onAuthorized={() => setComplete(true)} />
+      {fixture.claude ? <ClaudeLogin vm={fixture.vm} onLogin={() => setComplete(true)} /> :
+        <SlotBrowserButton vm={fixture.vm} authUrl={fixture.authUrl}
+          codexSessionId={fixture.codexSessionId} onAuthorized={() => setComplete(true)} />}
       {complete ? <p role='status'>Acceptance OAuth imported</p> : null}
     </main>
     <Toaster />

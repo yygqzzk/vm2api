@@ -1,5 +1,6 @@
 """One headed Chromium and one private VNC display. Never log URLs or input."""
 import hmac
+import hashlib
 import http.server
 import json
 import os
@@ -22,32 +23,46 @@ MAX_MESSAGE = 32768
 LEASE_SECONDS = 45
 IDLE_SECONDS = 300
 IDENTITY_FILE = "browser-identity.json"
+IDENTITY_MARKER = "browser-identity.sha256"
 
 
 def identity_seed(root=Path("/profile")):
-    file = root / IDENTITY_FILE
-    if file.is_symlink():
-        raise RuntimeError("browser_identity_unreadable; identity must be a regular file")
-    if file.exists():
-        try:
+    file, marker = root / IDENTITY_FILE, root / IDENTITY_MARKER
+    try:
+        if file.is_symlink() or marker.is_symlink():
+            raise ValueError("identity must be a regular file")
+        if file.exists():
             data = json.loads(file.read_text())
             seed = data["seed"]
             if (data["version"] != 1 or not isinstance(seed, str) or not seed.isascii()
                     or not seed.isdecimal() or not 0 < int(seed) < 2**63):
                 raise ValueError("invalid browser identity")
-            return seed
-        except (ValueError, KeyError, TypeError, OSError) as error:
-            raise RuntimeError("browser_identity_unreadable; preserve identity before repair") from error
-    seed = str(secrets.randbits(63) or 1)
+        else:
+            if marker.exists():
+                raise ValueError("saved identity is missing")
+            seed = str(secrets.randbits(63) or 1)
+        digest = hashlib.sha256(seed.encode()).hexdigest()
+        if marker.exists() and not hmac.compare_digest(marker.read_text().strip(), digest):
+            raise ValueError("saved identity does not match")
+        if not file.exists():
+            write_profile_file(file, json.dumps({"version": 1, "seed": seed}))
+        if not marker.exists():
+            write_profile_file(marker, digest)
+        return seed
+    except (ValueError, KeyError, TypeError, OSError) as error:
+        raise RuntimeError("browser_identity_unreadable; preserve identity before repair") from error
+
+
+def write_profile_file(file, value):
     name = None
     try:
-        with tempfile.NamedTemporaryFile(mode="w", dir=root, prefix=".browser-identity-", delete=False) as temp:
+        with tempfile.NamedTemporaryFile(mode="w", dir=file.parent, prefix=".browser-identity-", delete=False) as temp:
             name = Path(temp.name)
-            json.dump({"version": 1, "seed": seed}, temp)
+            temp.write(value)
             temp.flush()
             os.fsync(temp.fileno())
         name.replace(file)
-        directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        directory = os.open(file.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
             os.fsync(directory)
         finally:
@@ -55,12 +70,11 @@ def identity_seed(root=Path("/profile")):
     finally:
         if name is not None:
             name.unlink(missing_ok=True)
-    return seed
 
 
 def reset_profile(root=Path("/profile")):
     for entry in root.iterdir():
-        if entry.name == IDENTITY_FILE:
+        if entry.name in (IDENTITY_FILE, IDENTITY_MARKER):
             continue
         if entry.is_symlink() or not entry.is_dir():
             entry.unlink()
@@ -74,6 +88,7 @@ def browser_args(seed):
             "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
             f"--lang={os.environ['BROWSER_LANGUAGE']}", "--window-size=1280,800",
             f"--fingerprint={seed}", "--fingerprint-platform=linux",
+            "--fingerprint-hardware-concurrency=8", "--fingerprint-device-memory=8",
             "--fingerprint-pixel-noise=seeded", "--fingerprint-audio-render=isolated",
             f"--fingerprint-timezone={os.environ['TZ']}",
             f"--fingerprint-locale={os.environ['BROWSER_LANGUAGE']}",
@@ -121,7 +136,8 @@ class Desktop:
                 return {"ok": True, "callback_url": None}
             elif op != "status":
                 raise ValueError("invalid operation")
-            return {"ok": True, "ready": self.ready, "timezone": os.environ["TZ"],
+            return {"ok": True, "ready": self.ready, "identity": hashlib.sha256(self.seed.encode()).hexdigest()[:16],
+                    "timezone": os.environ["TZ"],
                     "language": os.environ["BROWSER_LANGUAGE"], "screen": "1280x800"}
 
     def accept_callback(self, host, path):
@@ -181,8 +197,7 @@ class CallbackServer(http.server.ThreadingHTTPServer):
     desktop: Desktop
 
 
-def preferences():
-    root = Path("/profile/chromium/Default")
+def preferences(root=Path("/profile/chromium/Default")):
     root.mkdir(parents=True, exist_ok=True)
     file = root / "Preferences"
     try:
@@ -190,6 +205,7 @@ def preferences():
     except (ValueError, OSError) as error:
         raise RuntimeError("browser_profile_unreadable; preserve the profile before repair") from error
     data.setdefault("intl", {})["accept_languages"] = os.environ["BROWSER_LANGUAGES"]
+    data.setdefault("session", {})["restore_on_startup"] = 1
     temp = root / "Preferences.new"
     temp.write_text(json.dumps(data))
     temp.replace(file)
@@ -197,8 +213,9 @@ def preferences():
 
 def main():
     os.umask(0o077)
+    seed = identity_seed()
     preferences()
-    desktop = Desktop(identity_seed())
+    desktop = Desktop(seed)
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_args: stop.set())
     signal.signal(signal.SIGINT, lambda *_args: stop.set())
@@ -221,7 +238,7 @@ def main():
                 raise RuntimeError("display_start_failed")
             time.sleep(0.1)
         desktop.children.append(subprocess.Popen(["openbox"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
-        browser = subprocess.Popen([*browser_args(desktop.seed), "about:blank"],
+        browser = subprocess.Popen([*browser_args(desktop.seed), "--restore-last-session"],
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         desktop.children.append(browser)
         # A failed Chromium sandbox normally exits during startup. Never retry

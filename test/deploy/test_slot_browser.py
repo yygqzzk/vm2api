@@ -1,6 +1,7 @@
 """Offline contracts for the browser's network plan and OAuth callback."""
 import importlib.util
 import hashlib
+import json
 import os
 import tempfile
 import time
@@ -76,7 +77,10 @@ class BrowserContracts(unittest.TestCase):
             legacy.mkdir(parents=True)
             (legacy / "Cookies").write_bytes(b"synthetic existing login")
             first = desktop.identity_seed(root)
+            before = (root / desktop.IDENTITY_FILE).read_bytes()
+            (root / desktop.IDENTITY_MARKER).unlink()
             self.assertEqual(desktop.identity_seed(root), first)
+            self.assertEqual((root / desktop.IDENTITY_FILE).read_bytes(), before)
             self.assertEqual((legacy / "Cookies").read_bytes(), b"synthetic existing login")
             with tempfile.TemporaryDirectory() as other:
                 self.assertNotEqual(desktop.identity_seed(Path(other)), first)
@@ -92,12 +96,58 @@ class BrowserContracts(unittest.TestCase):
             target.write_text("outside profile")
             (root / "external").symlink_to(outside, target_is_directory=True)
             desktop.reset_profile(root)
-            self.assertEqual([p.name for p in root.iterdir()], [desktop.IDENTITY_FILE])
+            self.assertEqual({p.name for p in root.iterdir()}, {desktop.IDENTITY_FILE, desktop.IDENTITY_MARKER})
             self.assertEqual((root / desktop.IDENTITY_FILE).read_bytes(), identity)
             self.assertEqual(desktop.identity_seed(root), first)
             self.assertEqual(target.read_text(), "outside profile")
             (root / desktop.IDENTITY_FILE).unlink()
+            with self.assertRaises(RuntimeError):
+                desktop.identity_seed(root)
+            self.assertFalse((root / desktop.IDENTITY_FILE).exists())
+            (root / desktop.IDENTITY_MARKER).unlink()
             self.assertNotEqual(desktop.identity_seed(root), first)
+
+    def test_identity_replacement_or_corrupt_marker_is_rejected_without_repair(self):
+        for replace in ["seed", "marker", "symlink"]:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                desktop.identity_seed(root)
+                file, marker = root / desktop.IDENTITY_FILE, root / desktop.IDENTITY_MARKER
+                if replace == "seed":
+                    data = json.loads(file.read_text())
+                    data["seed"] = "1" if data["seed"] != "1" else "2"
+                    file.write_text(json.dumps(data))
+                elif replace == "marker":
+                    marker.write_text("corrupt")
+                else:
+                    marker.unlink()
+                    marker.symlink_to(root / "missing")
+                before = file.read_bytes()
+                with self.assertRaises(RuntimeError):
+                    desktop.identity_seed(root)
+                self.assertEqual(file.read_bytes(), before)
+
+    def test_session_restore_preserves_preferences_and_environment_follows_slot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            file = root / "Preferences"
+            file.write_text(json.dumps({"custom": "keep", "session": {"restore_on_startup": 5}}))
+            with patch.dict(os.environ, {"BROWSER_LANGUAGES": "ja-JP,ja"}):
+                desktop.preferences(root)
+            data = json.loads(file.read_text())
+            self.assertEqual(data["custom"], "keep")
+            self.assertEqual(data["session"]["restore_on_startup"], 1)
+            self.assertEqual(data["intl"]["accept_languages"], "ja-JP,ja")
+            with patch.dict(os.environ, {"BROWSER_LANGUAGES": "fr-FR,fr"}):
+                desktop.preferences(root)
+            self.assertEqual(json.loads(file.read_text())["intl"]["accept_languages"], "fr-FR,fr")
+            with patch.dict(os.environ, {"TZ": "Asia/Tokyo", "BROWSER_LANGUAGE": "ja-JP"}):
+                japanese = desktop.Desktop("123456").command({"op": "status"})
+            with patch.dict(os.environ, {"TZ": "Europe/Paris", "BROWSER_LANGUAGE": "fr-FR"}):
+                french = desktop.Desktop("123456").command({"op": "status"})
+            self.assertEqual(japanese["identity"], french["identity"])
+            self.assertEqual(french["language"], "fr-FR")
+            self.assertEqual(french["timezone"], "Europe/Paris")
 
     def test_invalid_identity_is_not_silently_replaced(self):
         for value in ["broken", '{"version":2,"seed":"12"}', '{"version":1,"seed":"0"}',
@@ -120,6 +170,7 @@ class BrowserContracts(unittest.TestCase):
         with patch.dict(os.environ, {"TZ": "Asia/Tokyo", "BROWSER_LANGUAGE": "ja-JP"}):
             args = desktop.browser_args("123456")
         for flag in ["--fingerprint=123456", "--fingerprint-platform=linux", "--fingerprint-pixel-noise=seeded",
+                     "--fingerprint-hardware-concurrency=8", "--fingerprint-device-memory=8",
                      "--fingerprint-audio-render=isolated", "--fingerprint-timezone=Asia/Tokyo",
                      "--fingerprint-locale=ja-JP", "--lang=ja-JP", "--fingerprint-screen-width=1280",
                      "--fingerprint-screen-height=800", "--fingerprint-taskbar-height=0"]:

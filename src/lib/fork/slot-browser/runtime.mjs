@@ -207,10 +207,11 @@ export function createBrowserRuntime({
         if (!info?.State?.Running)
           throw new BrowserError(
             'browser_start_failed',
-            '浏览器启动失败，请检查节点 sandbox 与镜像运行条件；不会自动关闭 sandbox',
+            '浏览器启动失败，请检查节点 sandbox、镜像及持久身份数据；不会自动重置身份或关闭 sandbox',
           )
         const state = await browserRpc(connect, spec.name, { op: 'status' }).catch(() => null)
-        if (state?.ready) return { vm, connect, container: spec.name, environment: spec.environment }
+        if (state?.ready)
+          return { vm, connect, container: spec.name, environment: { ...spec.environment, identity: state.identity } }
         await delay(300)
       }
       throw new BrowserError('browser_start_timeout', '浏览器未能在 30 秒内就绪', 504)

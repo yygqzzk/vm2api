@@ -38,6 +38,9 @@ const slot=new URL(location.href).searchParams.get('slot');
 const oldCookie=document.cookie;const oldStorage=localStorage.getItem('slot');
 if(slot){document.cookie='slot='+encodeURIComponent(slot)+';path=/;SameSite=Lax;Max-Age=600';localStorage.setItem('slot',slot)}
 const report={slot,oldCookie,oldStorage,cookie:document.cookie,storage:localStorage.getItem('slot'),timezone:Intl.DateTimeFormat().resolvedOptions().timeZone,language:navigator.language,languages:navigator.languages,screen:[screen.width,screen.height],candidates:[]};
+report.device={userAgent:navigator.userAgent,platform:navigator.platform,cpu:navigator.hardwareConcurrency,memory:navigator.deviceMemory};
+report.secureContext=isSecureContext;
+report.tab=new URL(location.href).searchParams.get('tab');
 try{
   report.fingerprint={canvas:canvasFingerprint(),audio:await audioFingerprint(),audioRepeated:await audioFingerprint()};
   report.fingerprint.worker=await new Promise((resolve,reject)=>{

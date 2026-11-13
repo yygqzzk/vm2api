@@ -156,6 +156,30 @@ test('ownership, credential role, origin, two-browser limit and operator exclusi
   assert.equal(f.stopped[0][1].deleteProfile, false)
 })
 
+test('ordinary opening resumes the same browser without navigating; authorization opens only its explicit URL', async (t) => {
+  const f = await fixture(t)
+  const first = await f.call('vm-a', '/start')
+  assert.equal(first.status, 200)
+  const resumed = await f.call('vm-a', '/start')
+  assert.equal(resumed.data.session_id, first.data.session_id)
+  assert.equal(f.opened.filter((message) => message.op === 'open').length, 0)
+  const url = 'https://claude.com/cai/oauth/authorize?state=synthetic'
+  const authorized = await f.call('vm-a', '/start', { auth_url: url })
+  assert.equal(authorized.data.session_id, first.data.session_id)
+  assert.deepEqual(
+    f.opened.filter((message) => message.op === 'open'),
+    [{ op: 'open', url }],
+  )
+  await f.call('vm-a', '/start')
+  assert.equal(f.opened.filter((message) => message.op === 'open').length, 1)
+  assert.equal((await f.call('vm-a', '/start', { auth_url: 'http://example.com/' })).status, 400)
+  assert.equal((await f.call('vm-a', '/stop')).status, 200)
+  assert.equal(f.stopped.at(-1)[1].deleteProfile, false)
+  const restarted = await f.call('vm-a', '/start')
+  assert.notEqual(restarted.data.session_id, first.data.session_id)
+  assert.equal(f.opened.filter((message) => message.op === 'open').length, 1)
+})
+
 async function rejected(ws, status) {
   const result = once(ws, 'unexpected-response')
   const [, response] = await result
