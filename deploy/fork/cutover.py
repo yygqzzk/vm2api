@@ -372,6 +372,7 @@ for (const id of IDS) {
             return
         deadline = time.monotonic() + timeout
         warmed = []
+        skipped = {}
         for vid in ids:
             remaining = deadline - time.monotonic()
             require(remaining > 0, "Kernel warm-up timed out")
@@ -379,8 +380,23 @@ for (const id of IDS) {
             report = self.api("/api/panel/vms/fleet-update",
                               body={"action": "warm", "ids": [vid], "concurrency": 1}, timeout=min(120, remaining))
             require(report.get("action") == "warm" and report.get("ok_count") == 1
-                    and report.get("failed_count") == 0 and report.get("skipped_count", 0) == 0,
+                    and report.get("failed_count") == 0,
                     "Controller kernel warm-up failed")
+            if report.get("skipped_count", 0):
+                items = report.get("items", [])
+                old = before["slots"][vid]
+                # A healthy slot already out of rotation may intentionally have no credential.
+                require(report["skipped_count"] == 1 and len(items) == 1 and items[0].get("id") == vid
+                        and items[0].get("skip_reason") == "no_credential"
+                        and old.get("schedulable") is False and old.get("healthy") is True,
+                        "Controller kernel warm-up failed")
+                detail = self.api("/api/panel/vms/" + urllib.parse.quote(vid, safe=""))
+                health = (detail.get("kernel") or {}).get("rust_health") or {}
+                require(health.get("status") == 200 and health.get("healthy") is True
+                        and health.get("process_up") is True, "Controller kernel warm-up failed")
+                skipped[vid] = "no_credential"
+                save(folder / "warm-skipped.json", skipped)
+                continue
             warmed.append(vid)
             save(folder / "warm.json", {"started": warmed})
 
