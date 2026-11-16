@@ -14,7 +14,12 @@ import {
   persistVmMaxSessions,
   markUnschedulable,
 } from '../vm/vm-registry.mjs'
-import { normalizeInferenceConfig, normalizeSessionSlots, resolveInferenceEngine } from '../vm/slot-engine.mjs'
+import {
+  normalizeInferenceConfig,
+  normalizeSessionSlots,
+  resolveInferenceEngine,
+  resolveKernelDataplane,
+} from '../vm/slot-engine.mjs'
 import { slotExec } from '../vm/slot-runtime.mjs'
 import { maxRequestBytes, streamIdleTimeoutMs } from '../core/config.mjs'
 
@@ -46,7 +51,11 @@ import {
   normalizeOpenAIQuotaPolicy,
 } from '../pool/openai-quota-policy.mjs'
 import { gatewayPolicyReady, rustKernelHealth } from '../transport/rust-kernel-client.mjs'
-import { requestKernelReloadWhenIdle, syncClaudeKernelConfigs } from '../transport/rust-kernel-supervisor.mjs'
+import {
+  requestKernelReloadWhenIdle,
+  syncClaudeKernelConfigs,
+  syncCragSessionPolicy,
+} from '../transport/rust-kernel-supervisor.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
 import { wakeOpenAIWaiter } from '../pool/openai-account-runtime.mjs'
@@ -105,8 +114,11 @@ export function createRoutingRuntime(ctx) {
     return vm
   }
 
-  function applyVmSessionSlots(id, n, { override = true } = {}) {
-    return persistVmSessionSlots(ctx.cfg.paths.project, id, normalizeSessionSlots(n), { override })
+  function applyVmSessionSlots(id, n, { override = true, publish = true } = {}) {
+    const project = ctx.cfg.paths.project
+    const vm = persistVmSessionSlots(project, id, normalizeSessionSlots(n), { override })
+    if (publish && vm && syncCragSessionPolicy(project, vm, getRouting())) reloadCragSessionPolicy(vm)
+    return vm
   }
 
   function applyVmMaxSessions(id, n, { override = true } = {}) {
@@ -131,7 +143,7 @@ export function createRoutingRuntime(ctx) {
         continue
       }
       if (Number(vm.session_slots) === value) continue
-      applyVmSessionSlots(vm.id, value, { override: false })
+      applyVmSessionSlots(vm.id, value, { override: false, publish: false })
       applied.updated += 1
     }
     return applied
@@ -168,7 +180,7 @@ export function createRoutingRuntime(ctx) {
     return vm.claude?.has_access || vm.has_token ? 'pro' : accountTier
   }
 
-  function applyRoutingTierConcurrency(tiers) {
+  function applyRoutingTierConcurrency(tiers, { preserveExisting = false } = {}) {
     const routingConfig = getRouting()
     const policies = normalizeTiers(tiers, routingConfig.quota, routingConfig.concurrency)
     const skip = []
@@ -188,10 +200,17 @@ export function createRoutingRuntime(ctx) {
         applied.skipped += 1
         continue
       }
+      // Boot keeps persisted slot settings; explicit routing saves update inherited
+      // values. Account DB synchronization and live tier admission still run below.
+      if (preserveExisting && Object.prototype.hasOwnProperty.call(storedVm?.policy || {}, 'maxConcurrency')) {
+        continue
+      }
       const key = vmTierKey(vm)
       const next = Number(policies[key]?.max_concurrency ?? 2)
       const cur = Number(storedVm?.policy?.maxConcurrency)
-      if (cur === next) continue
+      // An explicit save also releases a legacy unflagged pin when its value
+      // already matches the tier; a materialized inherited value needs no write.
+      if (cur === next && storedVm?.policy?.concurrencyOverride === false) continue
       applyVmConcurrency(vm.id, next, { override: false })
       applied[key] += 1
     }
@@ -387,11 +406,16 @@ export function createRoutingRuntime(ctx) {
 
   function inferenceTouchesKernel(inference) {
     if (!inference || typeof inference !== 'object') return false
-    return Object.prototype.hasOwnProperty.call(inference, 'session_idle_ttl_seconds')
+    return ['session_idle_ttl_seconds', 'session_slots', 'prewarm_enabled'].some((key) => Object.hasOwn(inference, key))
+  }
+
+  function reloadCragSessionPolicy(vm) {
+    if (vm.status !== 'running' || resolveInferenceEngine(vm, getRouting()) !== 'rust') return
+    requestKernelReloadWhenIdle(slotExec(ctx.cfg.paths.project, vm), { requireLiveKernel: true })
   }
 
   function syncKernelPanelConfig(routingConfig) {
-    return syncClaudeKernelConfigs(ctx.cfg.paths.project, routingConfig)
+    return syncClaudeKernelConfigs(ctx.cfg.paths.project, routingConfig, reloadCragSessionPolicy)
   }
 
   // Legacy watchdogs read idle limits at startup. Native policy-capable
@@ -424,6 +448,10 @@ export function createRoutingRuntime(ctx) {
     for (const { id } of listVms(project)) {
       const vm = getVm(project, id)
       if (!vm || isCodexVm(vm)) continue
+      if (resolveKernelDataplane(vm, routingConfig) === 'crag') {
+        applied.skipped += 1
+        continue
+      }
       try {
         const result = await applyNativeTelemetry({ projectRoot: project, vm, routing: routingConfig })
         if (result.supported === false) {
@@ -450,7 +478,7 @@ export function createRoutingRuntime(ctx) {
     if (body.redaction !== undefined) {
       nextRedaction = normalizeRedaction(body.redaction)
       if (nextRedaction.enabled) {
-        await ensureRedaction({ redaction: nextRedaction }, { projectRoot: ctx.cfg.paths.project })
+        await ensureRedaction({ ...getRouting(), redaction: nextRedaction }, { projectRoot: ctx.cfg.paths.project })
       }
     }
     let routingConfig = getRouting()
@@ -541,6 +569,10 @@ export function createRoutingRuntime(ctx) {
     ctx.stickyRouter.reloadConfig(routingConfig)
     ctx.accountQuota.reloadConfig(routingConfig)
     getPool()?.reloadConfig?.(poolSchedulerConfig())
+    const sessionSlotsApplied =
+      body.inference && Object.hasOwn(body.inference, 'session_slots')
+        ? applyRoutingSessionSlots(nextSessionSlots)
+        : { updated: 0, skipped: 0 }
     const idleChanged = streamIdleTimeoutMs(routingConfig) !== prevIdleMs
     const requestBytesChanged = maxRequestBytes(routingConfig) !== prevRequestBytes
     // Body limit is applied once, when axum builds DefaultBodyLimit.
@@ -569,10 +601,7 @@ export function createRoutingRuntime(ctx) {
       return {
         concurrency: applyRoutingTierConcurrency(routingConfig.tiers),
         rpm: applyRoutingTierRpm(routingConfig.tiers),
-        session_slots:
-          body.inference && Object.prototype.hasOwnProperty.call(body.inference, 'session_slots')
-            ? applyRoutingSessionSlots(nextSessionSlots)
-            : { updated: 0, skipped: 0 },
+        session_slots: sessionSlotsApplied,
         openai_quota: hasCodexQuota
           ? applyRoutingOpenAIQuota(routingConfig.codex.quota)
           : { concurrency: 0, rpm: 0, sessions: 0, skipped: 0 },

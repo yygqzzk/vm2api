@@ -42,6 +42,30 @@ describe('redaction runtime', () => {
     assert.deepEqual(await maskJson(body, { principal: 'key-a' }), body)
   })
 
+  it('rejects an older helper that cannot enforce the requested limit', async () => {
+    const oldBin = path.join(root, 'old-helper.mjs')
+    fs.writeFileSync(
+      oldBin,
+      `#!${process.execPath}
+import fs from 'node:fs'
+import http from 'node:http'
+const arg = (name) => process.argv[process.argv.indexOf(name) + 1]
+http.createServer((req, res) => {
+  req.resume()
+  res.end(JSON.stringify({ protocol: 1 }))
+}).listen(arg('-sock'), () => fs.writeFileSync(arg('-capability'), 'synthetic-capability'))
+`,
+      { mode: 0o700 },
+    )
+    await assert.rejects(
+      ensureRedaction(
+        { redaction: { enabled: true, secrets: true, personal: false } },
+        { projectRoot: root, binPath: oldBin },
+      ),
+      { code: 'redaction_unavailable', status: 503, message: /must be rebuilt/ },
+    )
+  })
+
   it('masks and restores through the real helper and API hop when enabled', { timeout: 60_000 }, async (t) => {
     if (!fs.existsSync(bin)) {
       execFileSync('go', ['build', '-o', bin, './cmd/kin-redact'], {
@@ -50,10 +74,11 @@ describe('redaction runtime', () => {
       })
     }
     const policy = { enabled: true, secrets: true, personal: false, words: [], rules: [] }
-    const routing = { redaction: policy }
+    const routing = { redaction: policy, failover: { max_request_mib: 64 } }
     const state = await ensureRedaction(routing, { projectRoot: root, binPath: bin })
     assert.equal(state.ready, true)
     helper = state.child
+    assert.equal(state.maxBodyBytes, 64 * 1024 * 1024)
     const secret = 'sk-' + 'proj-' + 'Aa1Bb2Cc3Dd4Ee5Ff6Gg'
     const body = { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: `token ${secret}` }] }
     const context = { principal: 'key-a', session: 's1' }
@@ -67,7 +92,7 @@ describe('redaction runtime', () => {
       false,
     )
 
-    fs.mkdirSync(path.join(root, 'run'))
+    fs.mkdirSync(path.join(root, 'run'), { recursive: true })
     let posted
     const kernel = http.createServer(async (req, res) => {
       const chunks = []
@@ -114,5 +139,65 @@ describe('redaction runtime', () => {
     assert.equal(JSON.stringify(posted).includes(secret), false)
     assert.ok(JSON.stringify(posted).includes('{{R_API_KEY_'))
     assert.ok(JSON.stringify(result.body).includes(secret))
+  })
+
+  it('processes a body above 32 MiB when the panel allows 64 MiB', { timeout: 60_000 }, async () => {
+    if (!fs.existsSync(bin)) {
+      execFileSync('go', ['build', '-o', bin, './cmd/kin-redact'], {
+        cwd: path.join(process.cwd(), 'redact'),
+        stdio: 'inherit',
+      })
+    }
+    const policy = { enabled: true, secrets: false, personal: false, words: ['synthetic-secret'] }
+    const state = await ensureRedaction(
+      { redaction: policy, failover: { max_request_mib: 64 } },
+      { projectRoot: root, binPath: bin },
+    )
+    helper = state.child
+    const raw = { principal: 'synthetic-repro', session: 'raw', policy, maxBodyBytes: 63 }
+    assert.equal((await state.client.mask({ ...raw, body: '界'.repeat(21) })).body, '界'.repeat(21))
+    for (const body of ['界'.repeat(21) + 'x', '界'.repeat(128 * 1024)]) {
+      await assert.rejects(state.client.mask({ ...raw, body }), { status: 413, code: 'redaction_body_too_large' })
+    }
+    const ctx = { principal: 'synthetic-repro', session: 'large-body', maxBodyBytes: state.maxBodyBytes }
+    const original = { probe: 'synthetic-secret' }
+    const saved = await maskJson(original, ctx)
+    assert.ok(!saved.probe.includes('synthetic-secret'))
+    const overhead = Buffer.byteLength(JSON.stringify({ data: '', probe: '__END__' }))
+    for (const bytes of [32 * 1024 * 1024 + 1, 33761894, 64 * 1024 * 1024]) {
+      const body = { data: 'x'.repeat(bytes - overhead), probe: '__END__' }
+      const masked = await maskJson(body, ctx)
+      assert.equal(masked.data.length, body.data.length)
+      assert.equal(masked.probe, '__END__')
+      const restored = await restoreJsonValue(masked, ctx)
+      assert.equal(restored.data, body.data)
+      assert.equal(restored.probe, '__END__')
+    }
+
+    const resized = await ensureRedaction(
+      { redaction: policy, failover: { max_request_mib: 8 } },
+      { projectRoot: root, binPath: bin },
+    )
+    assert.equal(resized.maxBodyBytes, 8 * 1024 * 1024)
+    assert.equal(resized.child, helper)
+    const oversized = { data: 'x'.repeat(8 * 1024 * 1024 + 1 - Buffer.byteLength('{"data":""}')) }
+    const current = { principal: ctx.principal, session: ctx.session }
+    for (const transform of [maskJson, restoreJsonValue]) {
+      await assert.rejects(transform(oversized, current), (error) => {
+        assert.equal(error.status, 413)
+        assert.equal(error.code, 'redaction_body_too_large')
+        assert.equal(error.details.retryable, false)
+        return true
+      })
+    }
+    // A request that already captured the previous limit keeps that limit.
+    assert.equal((await maskJson(oversized, ctx)).data.length, oversized.data.length)
+    assert.deepEqual(await restoreJsonValue(saved, current), original)
+    const raised = await ensureRedaction(
+      { redaction: policy, failover: { max_request_mib: 128 } },
+      { projectRoot: root, binPath: bin },
+    )
+    assert.equal(raised.maxBodyBytes, 128 * 1024 * 1024)
+    assert.equal(raised.child, helper)
   })
 })

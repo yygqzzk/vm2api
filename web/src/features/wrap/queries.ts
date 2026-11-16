@@ -10,7 +10,10 @@ export type KernelProduct = {
   paid: boolean
   ready: boolean
   version: string | null
+  release_tag?: string
   updated_at: string | null
+  release_options?: { tag: string; label: string }[]
+  payload_tag?: string
   code?: string
   error?: string
 }
@@ -19,15 +22,23 @@ export type KernelInstallation = {
   kernel: KernelId
   version: string | null
   installed_at: string
+  payload_tag?: string
 }
 
 export type KernelCatalog = {
   kernels: KernelProduct[]
   licenses: Record<string, CragLicenseStatus>
+  install_licenses?: Record<string, CragLicenseStatus>
   installations?: Record<string, KernelInstallation>
 }
 
-export type KernelTarget = { id: string; kernel: KernelId }
+export type KernelTarget = {
+  id: string
+  kernel: KernelId
+  expected_tag?: string
+  payload_tag?: string
+  reissue?: true
+}
 
 export type KernelInstallItem = KernelTarget & {
   ok: boolean
@@ -55,10 +66,25 @@ export function kernelCatalogQueryOptions() {
   })
 }
 
+export function kernelVersionsQueryOptions() {
+  return queryOptions({
+    queryKey: ['panel', 'kernel-releases'] as const,
+    queryFn: () =>
+      api<Record<KernelId, string[]>>('/api/panel/kernels/releases'),
+    staleTime: 5 * 60_000,
+    retry: false,
+  })
+}
+
 export function pullKernelRelease(body: { kernel: KernelId; tag?: string }) {
   return api<{
     kernel: KernelProduct
-    release?: { tag: string; version: string; asset: string }
+    release?: {
+      tag: string
+      version: string
+      asset: string
+      payload_tag?: string
+    }
   }>('/api/panel/kernels/pull', {
     method: 'POST',
     body: JSON.stringify(body),

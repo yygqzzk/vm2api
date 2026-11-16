@@ -1,13 +1,14 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { slotHost } from '../vm/slot-host.mjs'
+import { hostProxyUrlForVm, slotHost } from '../vm/slot-host.mjs'
 import { slotExecArgv } from '../vm/slot-exec.mjs'
+import { resolveSlotClaude } from '../vm/slot-engine.mjs'
 import { slotExec, startSlotReady } from '../vm/slot-runtime.mjs'
 import { getVm, patchVmRecord } from '../vm/vm-registry.mjs'
 import { hasBoundExit } from '../vm/egress.mjs'
 import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
-import { postRustKernelTelemetryEvent, rustKernelPaths } from '../transport/rust-kernel-client.mjs'
+import { postRustKernelTelemetryEvent, rustKernelHealth, rustKernelPaths } from '../transport/rust-kernel-client.mjs'
 import { runSlotProcess } from '../transport/slot-oauth.mjs'
 
 const pendingAttempt = Symbol('guestOAuthAttempt')
@@ -24,6 +25,7 @@ export async function prepareSlotOAuth({
   routing = {},
   timeoutMs,
   startReady = startSlotReady,
+  readHealth = rustKernelHealth,
 } = {}) {
   if (!projectRoot || !exec?.vmId || (exec.vm?.id && exec.vm.id !== exec.vmId)) {
     throw fail('oauth_vm_required', 'OAuth requires a target VM execution context')
@@ -36,19 +38,17 @@ export async function prepareSlotOAuth({
   if (blocked || !hasBoundExit(vm.proxy)) {
     throw fail(blocked || 'proxy_required', 'OAuth requires the target VM bound egress')
   }
+  Object.assign(exec, slotExec(projectRoot, vm))
+  const health = await readHealth(exec, { timeoutMs: 1000 })
+  // Legacy kernels cannot gain telemetry by restarting. Exchange through the
+  // same bound exit on the controller before entering the slot startup path.
+  if (health?.vm_telemetry !== true || health?.telemetry_ready !== true) {
+    const proxyUrl = hostProxyUrlForVm(vm)
+    if (proxyUrl == null) throw fail('proxy_required', 'OAuth requires the target VM bound egress')
+    return { exec, host, controlPlane: true, proxyUrl }
+  }
   const boot = await startReady(vm, projectRoot, { routing, allowMissingCredential: true, timeoutMs })
-  // startSlotReady nests the kernel result: boot.rust = { ok, engine, rust: { ok, reason, health } }.
-  // startReady is injectable, so accept a flat boot.rust.health as well.
-  const kernel = boot?.rust?.rust || boot?.rust
-  const health = kernel?.health || boot?.rust?.health
-  if (
-    !boot?.ok ||
-    boot.rust_ok === false ||
-    !boot.rust?.ok ||
-    boot.rust.skipped ||
-    health?.vm_telemetry !== true ||
-    health?.telemetry_ready !== true
-  ) {
+  if (!boot?.ok || boot.rust_ok === false || !boot.rust?.ok || boot.rust.skipped) {
     throw fail(boot?.rust?.code || boot?.code || 'oauth_runtime_not_ready', 'Target VM native CLI is not ready')
   }
   const patch = { ...(boot.runtime ? { runtime: boot.runtime } : {}), status: 'running' }
@@ -99,9 +99,8 @@ export async function runGuestOAuthAuthService(
   const context = await prepare({ exec, projectRoot, routing, timeoutMs })
   const { host, configDir, home } = context
   exec = context.exec
-  // The approved Linux cutover must not change macOS non-telemetry behavior.
-  // This is an explicit native-host path, never a Linux execution fallback.
   if (host.native) return runNative(payload)
+  if (context.controlPlane) return runNative({ ...payload, proxy_url: context.proxyUrl })
   const bin = host.bins.oauthAuth
   if (!bin) throw fail('oauth_auth_bin_missing', 'Target VM OAuth helper is not installed')
   const argv = slotExecArgv(exec.vm, [bin], {
@@ -145,6 +144,23 @@ export async function runGuestOAuthAuthService(
   }
   await record('start')
   try {
+    const selected = resolveSlotClaude(exec.vm, routing, host)
+    let claudeVersion = payload.claude_version
+    if (selected.native) {
+      const version = await runDocker(
+        slotExecArgv(exec.vm, [selected.bin, '--version'], { user: host.execUser(exec.vm) }),
+        {
+          env: host.dockerEnv(),
+          timeoutMs: Math.min(timeoutMs, 5000),
+        },
+      )
+      claudeVersion =
+        version?.code === 0 && !version.timed_out && !version.output_limit
+          ? /^([0-9]+\.[0-9]+\.[0-9]+)(?:\s|$)/.exec(String(version.stdout || '').trim())?.[1]
+          : undefined
+      if (!claudeVersion)
+        throw fail('oauth_cli_version_unavailable', 'Cannot read the selected native Claude CLI version')
+    }
     // Linux slots join a kin-eg-* transparent network. A proxy URL may be a
     // controller-local forwarder and is not reachable from inside the guest.
     const result = await runDocker(argv, {
@@ -154,6 +170,7 @@ export async function runGuestOAuthAuthService(
         JSON.stringify({
           ...payload,
           proxy_url: '',
+          claude_version: claudeVersion,
         }) + '\n',
     })
     if (result?.timed_out) throw fail('oauth_auth_timeout', 'Target VM OAuth helper timed out')

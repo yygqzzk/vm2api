@@ -2,7 +2,12 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import vmContext from 'node:vm'
 import test from 'node:test'
-import { clusterCragContainerReady, clusterDockerCommandReady } from '../../src/lib/cluster/remote-slot.mjs'
+import {
+  clusterCragContainerReady,
+  clusterDockerCommandReady,
+  slotContainerBody,
+} from '../../src/lib/cluster/remote-slot.mjs'
+import { hasClusterSubscriptionBinds } from '../../src/lib/cluster/crag-subscription-files.mjs'
 import { createKernelWatchdog } from '../../src/lib/transport/kernel-watchdog.mjs'
 import { kernelFaults } from '../../src/lib/transport/rust-kernel-client.mjs'
 import { dockerEnvMap, ensureKvmMachineRecord, kvmEnvMapIncomplete } from '../../src/lib/vm/kvm-machine.mjs'
@@ -16,6 +21,38 @@ const start = source.slice(
   source.indexOf('export async function startRemoteSlot('),
   source.indexOf('/** Remote twin of reloadSlotWorker'),
 )
+
+test('remote CRAG KVM preparation resolves guest and egress images instead of rejecting placement', async () => {
+  const prepare = source.slice(source.indexOf('async function prepare('), source.indexOf('function runtimeLabelOf('))
+  const images = []
+  const session = { host: {}, docker: {} }
+  const target = { id: 'vm-kvm', node_id: 'node-a', dataplane: 'crag', runtime: { type: 'kvm' } }
+  const run = vmContext.runInNewContext(`${prepare}; prepare`, {
+    isKvmRuntime: () => true,
+    resolveKernelDataplane: () => 'crag',
+    OS_CATALOG: { 'ubuntu-24.04': {} },
+    normalizeTimezone: (value) => value || 'UTC',
+    STANDARD_LOCALE: 'en_US.UTF-8',
+    vmNodeId: (vm) => vm.node_id,
+    nodeSession: async () => session,
+    runtimeKind: () => 'kvm',
+    ensureNodeSlotImage: async (_session, _node, _root, kernel, kind) => {
+      images.push([kernel, kind])
+      return { ref: `image-${kind}` }
+    },
+    remoteSlotOwner: () => ({ uid: 1000, gid: 1000 }),
+    remoteSlotDir: () => '/remote/vms/vm-kvm',
+    path: { join: (...parts) => parts.join('/') },
+  })
+  const result = await run(target, '/fixture', {})
+  assert.equal(result.fail, undefined)
+  assert.equal(result.image, 'image-kvm')
+  assert.equal(result.egressImage, 'image-docker')
+  assert.deepEqual(images, [
+    ['ubuntu-24.04', 'kvm'],
+    ['ubuntu-24.04', 'docker'],
+  ])
+})
 
 function cragReadyContainer(base) {
   return {
@@ -50,6 +87,7 @@ function fixture({
   kind = 'docker',
   removeFails = false,
   cragReady = false,
+  subscription = false,
   cpuWrapped = false,
 } = {}) {
   const calls = []
@@ -131,10 +169,32 @@ function fixture({
     clusterDockerClaude: (vm) => kind === 'docker' && Boolean(vm?.node_id),
     resolveKernelDataplane: (vm) => vm?.dataplane || 'kernel',
     projectCragUniversalVm: async () => {},
+    readCragClusterSubscription: () => subscription,
+    hasClusterSubscriptionBinds,
+    publishClusterSubscription: async () => calls.push('publish-subscription'),
   }
   const boot = vmContext.runInNewContext(`${start.replace('export ', '')}; startRemoteSlot`, io)
   return { calls, target, boot: () => boot(target, '/fixture'), state: () => info?.State }
 }
+
+test('a subscribed cluster Docker slot replaces the old container before starting with read-only license mounts', async () => {
+  const f = fixture({ cragReady: true, subscription: true })
+  f.target.dataplane = 'crag'
+  f.target.crag_kernel_version = 'v2'
+  assert.equal((await f.boot()).action, 'created')
+  assert.deepEqual(f.calls, ['remove', 'files', 'publish-subscription', 'create', 'start', 'runtime'])
+  const body = slotContainerBody(f.target, {
+    image: 'fixture',
+    network: 'fixture',
+    remoteDir: '/fixture',
+    user: '1000:1000',
+    routing: {},
+    subscription: true,
+  })
+  assert.equal(hasClusterSubscriptionBinds(body, '/fixture'), true)
+  assert.ok(body.HostConfig.Binds.includes('/fixture/subscription-host:/run/kin/crag-host:ro'))
+  assert.ok(body.HostConfig.Binds.includes('/fixture/subscription-license:/run/kin/crag-license:ro'))
+})
 
 for (const kind of ['docker', 'kvm']) {
   for (const running of [true, false]) {
