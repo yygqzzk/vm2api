@@ -162,7 +162,11 @@ for (const kind of ['Codex default', 'shared Claude']) {
     })
     const lines = []
     const client = kind === 'Codex default' ? streamCodexKernel : streamGoWorker
-    const pending = client({ exec: fx.exec, envelope, onEvent: (line) => lines.push(line) })
+    const request =
+      kind === 'Codex default'
+        ? envelope
+        : { ...envelope, body: { model: 'claude-test', messages: [{ role: 'user', content: 'ping' }], stream: true } }
+    const pending = client({ exec: fx.exec, envelope: request, onEvent: (line) => lines.push(line) })
     await sent.promise
     await delay(30)
     assert.deepEqual(lines, [])

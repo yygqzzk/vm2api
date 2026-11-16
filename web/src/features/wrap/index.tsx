@@ -33,10 +33,16 @@ import { PageHeader } from '@/components/page-header'
 import { QueryGate } from '@/components/query-gate'
 import { meQueryOptions } from '@/features/auth/queries'
 import { dashboardQueryOptions } from '@/features/overview/queries'
+import {
+  CragRuntimeCounts,
+  CragRuntimeDetail,
+} from '@/features/vm/crag-runtime-counts'
+import { cragHostStatusQueryOptions } from '@/features/vm/queries'
 import { KernelLicenseDialog } from './license-dialog'
 import {
   installKernelTargets,
   kernelCatalogQueryOptions,
+  kernelVersionsQueryOptions,
   pullKernelRelease,
   type KernelId,
   type KernelInstallItem,
@@ -52,6 +58,18 @@ const LICENSE_LABELS: Record<CragLicenseStatus['status'], string> = {
   invalid: '授权无效',
   unconfigured: '未配置',
 }
+
+function supportsSubscription(vm?: Vm) {
+  return (
+    !!vm &&
+    !vm.node_id &&
+    !['darwin', 'macos'].includes(vm.node_platform || '') &&
+    String(vm.runtime?.type || vm.runtime_type || 'docker')
+      .trim()
+      .toLowerCase() === 'docker'
+  )
+}
+
 const VM_STATUS: Record<string, string> = {
   running: '运行中',
   stopped: '已停用',
@@ -73,6 +91,21 @@ export function WrapSamplePage() {
   const dashboard = useQuery(dashboardQueryOptions())
   const me = useQuery(meQueryOptions())
   const canEdit = me.data?.role === 'admin'
+  const cragHost = useQuery({
+    ...cragHostStatusQueryOptions(),
+    enabled: canEdit,
+    refetchInterval: canEdit ? 10_000 : false,
+  })
+  const cragStatus = canEdit && !cragHost.isError ? cragHost.data : undefined
+  const [versionMenuOpened, setVersionMenuOpened] = useState(false)
+  const versions = useQuery({
+    ...kernelVersionsQueryOptions(),
+    enabled: canEdit && versionMenuOpened,
+  })
+  const [selectedTags, setSelectedTags] = useState<Record<KernelId, string>>({
+    'cli-node': 'latest',
+    crag: 'latest',
+  })
   const [drafts, setDrafts] = useState<Record<string, KernelId>>({})
   const [confirm, setConfirm] = useState<KernelTarget[] | null>(null)
   const [licenseVm, setLicenseVm] = useState<Vm | null>(null)
@@ -98,16 +131,27 @@ export function WrapSamplePage() {
     () => new Map(rows.map(({ vm }) => [vm.id, vm])),
     [rows]
   )
+  const cragProduct = catalog.data?.kernels.find(
+    (product) => product.id === 'crag'
+  )
+  const cragOptions = cragProduct?.release_options
+
+  function cragReleaseLabel(tag?: string) {
+    return cragOptions?.find((option) => option.tag === tag)?.label || tag
+  }
+
   const pull = useMutation({
-    mutationFn: (kernel: KernelId) => pullKernelRelease({ kernel }),
+    mutationFn: pullKernelRelease,
     onMutate: () => setPullError(null),
-    onSuccess: async (_data, kernel) => {
+    onSuccess: async (data, { kernel }) => {
       await qc.invalidateQueries({
         queryKey: kernelCatalogQueryOptions().queryKey,
       })
-      toast.success(`${KERNEL_NAMES[kernel]} 安装包已更新`)
+      toast.success(
+        `${KERNEL_NAMES[kernel]} ${data.release?.tag || ''} 安装包已下载`
+      )
     },
-    onError: (error: Error, kernel) => {
+    onError: (error: Error, { kernel }) => {
       const message =
         isApiError(error) && error.code === 'crag_v2_asset_missing'
           ? '发布源尚无 CRAG 授权包，现有版本未改动。'
@@ -127,10 +171,18 @@ export function WrapSamplePage() {
   const succeededCount = job
     ? Object.values(job.results).filter((item) => item.ok).length
     : 0
-  const missingLicenses = (confirm || []).filter(
-    (target) =>
-      target.kernel === 'crag' && !catalog.data?.licenses[target.id]?.valid
-  )
+  const confirmedCrag = confirm?.find((target) => target.kernel === 'crag')
+  const confirmedCragTag = confirmedCrag?.payload_tag
+  const confirmedCragLabel = cragReleaseLabel(confirmedCragTag)
+  const installLicenses =
+    catalog.data?.install_licenses ?? catalog.data?.licenses
+  const canRequestSubscription = (id: string) => {
+    const code = installLicenses?.[id]?.code
+    return (
+      supportsSubscription(vmById.get(id)) &&
+      (code === 'license_required' || code === 'license_payload_key_mismatch')
+    )
+  }
 
   function requestInstall(targets: KernelTarget[]) {
     if (!canEdit || busy || !targets.length) return
@@ -142,6 +194,21 @@ export function WrapSamplePage() {
       toast.error(`请先下载 ${KERNEL_NAMES[missingPackage.kernel]} 安装包`)
       return
     }
+    const products = new Map(
+      catalog.data?.kernels.map((product) => [product.id, product])
+    )
+    const pending = targets.find(
+      ({ kernel }) =>
+        selectedTags[kernel] !== 'latest' &&
+        (products.get(kernel)?.payload_tag ||
+          products.get(kernel)?.release_tag) !== selectedTags[kernel]
+    )
+    if (pending) {
+      toast.error(
+        `请先拉取 ${KERNEL_NAMES[pending.kernel]} ${selectedTags[pending.kernel]}`
+      )
+      return
+    }
     const mac = targets.find(
       (target) => vmById.get(target.id)?.node_platform === 'darwin'
     )
@@ -151,17 +218,19 @@ export function WrapSamplePage() {
       )
       return
     }
-    const unlicensed = targets.find(
-      (target) =>
-        target.kernel === 'crag' && !catalog.data?.licenses[target.id]?.valid
-    )
-    if (unlicensed && targets.length === 1) {
-      const vm = vmById.get(unlicensed.id)
-      toast.error(`${vm?.name || unlicensed.id} 需要 CRAG 授权`)
-      if (vm) setLicenseVm(vm)
-      return
-    }
-    setConfirm(targets)
+    const pinned = targets.map((target): KernelTarget => {
+      const product = products.get(target.kernel)
+      return {
+        ...target,
+        ...(product?.payload_tag
+          ? { payload_tag: product.payload_tag }
+          : { expected_tag: product?.release_tag }),
+        ...(target.kernel === 'crag' &&
+          (product?.payload_tag || product?.release_tag) &&
+          canRequestSubscription(target.id) && { reissue: true }),
+      }
+    })
+    setConfirm(pinned)
   }
 
   async function runInstall(targets: KernelTarget[]) {
@@ -237,6 +306,9 @@ export function WrapSamplePage() {
         }),
         qc.invalidateQueries({ queryKey: dashboardQueryOptions().queryKey }),
         qc.invalidateQueries({ queryKey: ['panel', 'vms'] }),
+        qc.invalidateQueries({
+          queryKey: cragHostStatusQueryOptions().queryKey,
+        }),
       ])
       setInstalling(false)
     }
@@ -245,7 +317,7 @@ export function WrapSamplePage() {
   return (
     <PageHeader
       title='内核'
-      description='cli-node 默认免费，CRAG 使用注册码授权。'
+      description='可拉取最新或指定版本。拉取只更新缓存；确认重装后才应用到 VM。'
       extra={
         <Button
           variant='ghost'
@@ -254,6 +326,7 @@ export function WrapSamplePage() {
           onClick={() => {
             void catalog.refetch()
             void dashboard.refetch()
+            if (canEdit) void cragHost.refetch()
           }}
         >
           <RefreshCw aria-hidden='true' />
@@ -279,7 +352,12 @@ export function WrapSamplePage() {
             {catalog.data?.kernels.map((product) => (
               <div
                 key={product.id}
-                className='grid gap-3 p-4 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:px-5'
+                className={cn(
+                  'grid gap-3 p-4 sm:items-center sm:px-5',
+                  product.id === 'crag'
+                    ? 'lg:grid-cols-[minmax(0,1fr)_auto]'
+                    : 'sm:grid-cols-[minmax(0,1fr)_auto]'
+                )}
               >
                 <div className='min-w-0'>
                   <div className='flex flex-wrap items-center gap-2.5'>
@@ -315,10 +393,25 @@ export function WrapSamplePage() {
                       )}
                       {product.ready ? '已下载' : '未就绪'}
                     </span>
-                    <span className='text-muted-foreground'>
-                      {product.version || '版本未记录'}
+                    <span className='min-w-0 wrap-anywhere text-muted-foreground'>
+                      {product.ready ? '缓存：' : ''}
+                      {cragReleaseLabel(product.payload_tag) ||
+                        product.release_tag ||
+                        product.version ||
+                        '版本未记录'}
                     </span>
                   </div>
+                  {product.id === 'crag' && canEdit ? (
+                    <>
+                      <CragRuntimeCounts status={cragStatus} />
+                      <Link
+                        to='/crag-subscription'
+                        className='mt-2 inline-flex text-sm text-primary underline underline-offset-4'
+                      >
+                        兑换槽位
+                      </Link>
+                    </>
+                  ) : null}
                   {product.error && !product.ready ? (
                     <p className='mt-2 text-base break-words text-destructive sm:text-sm'>
                       {product.error}
@@ -340,16 +433,91 @@ export function WrapSamplePage() {
                   ) : null}
                 </div>
                 <div className='flex flex-wrap gap-2'>
+                  <Select
+                    value={selectedTags[product.id]}
+                    disabled={!canEdit || busy}
+                    onOpenChange={(open) => {
+                      if (open) {
+                        if (versions.isError) void versions.refetch()
+                        setVersionMenuOpened(true)
+                      }
+                    }}
+                    onValueChange={(tag) =>
+                      setSelectedTags((previous) => ({
+                        ...previous,
+                        [product.id]: tag,
+                      }))
+                    }
+                  >
+                    <SelectTrigger
+                      aria-label={`${KERNEL_NAMES[product.id]} 下载版本`}
+                      className='min-h-11 min-w-32'
+                    >
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value='latest'>最新版本</SelectItem>
+                      {Array.from(
+                        new Set([
+                          ...(versions.data?.[product.id] || []),
+                          ...(product.release_options?.map(({ tag }) => tag) ||
+                            []),
+                          ...(selectedTags[product.id] !== 'latest'
+                            ? [selectedTags[product.id]]
+                            : []),
+                        ])
+                      ).map((tag) => (
+                        <SelectItem key={tag} value={tag}>
+                          {cragReleaseLabel(tag)}
+                        </SelectItem>
+                      ))}
+                      {versions.isFetching ? (
+                        <div
+                          role='status'
+                          className='px-2 py-1.5 text-sm text-muted-foreground'
+                        >
+                          正在读取历史版本…
+                        </div>
+                      ) : null}
+                      {versions.isError ? (
+                        <div
+                          role='status'
+                          className='px-2 py-1.5 text-sm text-muted-foreground'
+                        >
+                          历史版本暂不可用，重开菜单可重试
+                        </div>
+                      ) : null}
+                      {versions.isSuccess &&
+                      !versions.data[product.id].length &&
+                      !product.release_options?.length ? (
+                        <div className='px-2 py-1.5 text-sm text-muted-foreground'>
+                          暂无可选版本
+                        </div>
+                      ) : null}
+                    </SelectContent>
+                  </Select>
                   <Button
                     variant='outline'
                     className='h-11'
-                    aria-label={`拉取 ${KERNEL_NAMES[product.id]} 最新二进制`}
+                    aria-label={`拉取 ${KERNEL_NAMES[product.id]} ${selectedTags[product.id] === 'latest' ? '最新版本' : selectedTags[product.id]}`}
                     disabled={!canEdit || busy}
-                    loading={pull.isPending && pull.variables === product.id}
-                    onClick={() => pull.mutate(product.id)}
+                    loading={
+                      pull.isPending && pull.variables?.kernel === product.id
+                    }
+                    onClick={() =>
+                      pull.mutate({
+                        kernel: product.id,
+                        tag:
+                          selectedTags[product.id] === 'latest'
+                            ? undefined
+                            : selectedTags[product.id],
+                      })
+                    }
                   >
                     <Download aria-hidden='true' />
-                    拉取最新
+                    {selectedTags[product.id] === 'latest'
+                      ? '拉取最新'
+                      : '拉取版本'}
                   </Button>
                   <Button
                     variant='outline'
@@ -360,7 +528,7 @@ export function WrapSamplePage() {
                     }
                     onClick={() => requestInstall(slotTargets(product.id))}
                   >
-                    更新全部槽位
+                    应用缓存到全部槽位
                   </Button>
                 </div>
               </div>
@@ -464,10 +632,26 @@ export function WrapSamplePage() {
                 <div role='rowgroup' className='divide-y'>
                   {rows.map(({ vm, kernel }) => {
                     const license = catalog.data?.licenses[vm.id]
+                    const mismatch =
+                      installLicenses?.[vm.id]?.code ===
+                      'license_payload_key_mismatch'
                     const installed = catalog.data?.installations?.[vm.id]
                     const result = job?.results[vm.id]
+                    const runtime = cragStatus?.runtime?.vms[vm.id]
                     const active = installing && job?.activeId === vm.id
                     const macNative = vm.node_platform === 'darwin'
+                    const kvm = ['kvm', 'qemu', 'libvirt'].includes(
+                      String(vm.runtime?.type || vm.runtime_type || '')
+                        .trim()
+                        .toLowerCase()
+                    )
+                    const repairCrag =
+                      kvm &&
+                      !macNative &&
+                      !(
+                        installed?.kernel === 'crag' &&
+                        installed.version?.trim()
+                      )
                     const currentKernel =
                       vm.resolved_dataplane === 'crag' &&
                       vm.resolved_crag_kernel_version === 'v2'
@@ -507,11 +691,32 @@ export function WrapSamplePage() {
                                 : VM_STATUS[vm.status || 'unknown'] ||
                                   vm.status ||
                                   '未知'}
-                            {installed?.version &&
-                            installed.kernel === currentKernel ? (
-                              <span>{installed.version}</span>
+                            {installed && installed.kernel === currentKernel ? (
+                              installed.kernel === 'crag' ? (
+                                <span className='min-w-0 wrap-anywhere'>
+                                  已安装：
+                                  {cragReleaseLabel(installed.payload_tag) ||
+                                    installed.version ||
+                                    '版本未记录'}
+                                </span>
+                              ) : installed.version ? (
+                                <span>{installed.version}</span>
+                              ) : null
                             ) : null}
+                            {kvm ? <Badge variant='outline'>KVM</Badge> : null}
                           </div>
+                          {runtime ? (
+                            <CragRuntimeDetail detail={runtime} />
+                          ) : canEdit && currentKernel === 'crag' ? (
+                            <p className='mt-2 text-sm text-muted-foreground'>
+                              CRAG：运行状态未知
+                            </p>
+                          ) : null}
+                          {repairCrag ? (
+                            <p className='mt-2 text-sm text-muted-foreground'>
+                              未记录 CRAG 版本，可重装补齐内核和配置。
+                            </p>
+                          ) : null}
                           {result ? (
                             <p
                               className={cn(
@@ -602,6 +807,13 @@ export function WrapSamplePage() {
                                     UTC
                                   </div>
                                 ) : null}
+                                {canEdit && !macNative && mismatch ? (
+                                  <p className='text-sm text-muted-foreground'>
+                                    {supportsSubscription(vm)
+                                      ? '确认重装时会尝试使用本机已激活的宿主订阅。若未取得新许可，原内核不会停用。'
+                                      : '当前下载包需要匹配的离线许可。现有许可可继续用于原内核。'}
+                                  </p>
+                                ) : null}
                               </div>
                               <Button
                                 variant='ghost'
@@ -622,8 +834,23 @@ export function WrapSamplePage() {
                         </div>
                         <div
                           role='cell'
-                          className='flex items-center justify-end'
+                          className='flex flex-wrap items-center justify-end gap-2'
                         >
+                          {repairCrag ? (
+                            <Button
+                              variant='outline'
+                              className='h-11 w-full sm:w-auto'
+                              disabled={!canEdit || busy}
+                              loading={active}
+                              aria-label={`重装 ${vm.name || vm.id} 的 CRAG 并重启`}
+                              onClick={() =>
+                                requestInstall([{ id: vm.id, kernel: 'crag' }])
+                              }
+                            >
+                              <RefreshCw aria-hidden='true' />
+                              重装 CRAG
+                            </Button>
+                          ) : null}
                           <Button
                             variant='outline'
                             className='h-11 w-full sm:w-auto'
@@ -662,14 +889,33 @@ export function WrapSamplePage() {
             ? `重装 ${vmById.get(confirm[0].id)?.name || confirm[0].id} 并重启？`
             : `重装全部 ${confirm?.length || 0} 台 VM 并重启？`
         }
-        desc='按所选内核安装并重启，健康检查完成后恢复调度；手动关闭和凭证限制保留。凭据、授权和工作数据不变。'
+        desc={
+          <>
+            按所选内核安装并重启，健康检查完成后恢复调度；手动关闭和凭证限制保留。凭据和工作数据不变。
+            {confirm?.some((target) => target.reissue) ? (
+              <p className='mt-2'>
+                标记为「订阅授权」的 VM
+                会在停机前申请许可。有本槽订阅许可则同槽重签，否则使用一个剩余订阅名额。未取得有效许可的
+                VM 不会停机。
+              </p>
+            ) : null}
+            {confirmedCrag ? (
+              <p className='mt-2 wrap-anywhere'>
+                CRAG 当前缓存标签：{confirmedCragTag || '未记录'}
+                {confirmedCragLabel && confirmedCragLabel !== confirmedCragTag
+                  ? `（${confirmedCragLabel}）`
+                  : null}
+              </p>
+            ) : null}
+          </>
+        }
         confirmText='重装并重启'
         cancelBtnText='取消'
-        disabled={missingLicenses.length > 0}
+        disabled={!canEdit || busy}
         destructive
         className='motion-reduce:animate-none [&_button]:min-h-11'
         handleConfirm={() => {
-          if (confirm) void runInstall(confirm)
+          if (confirm && canEdit && !busy) void runInstall(confirm)
         }}
       >
         <ul className='max-h-56 space-y-2 overflow-y-auto rounded-lg bg-muted/50 p-3 text-sm'>
@@ -683,20 +929,12 @@ export function WrapSamplePage() {
               </span>
               <span className='shrink-0 font-medium'>
                 {KERNEL_NAMES[target.kernel]}
-                {target.kernel === 'crag' &&
-                !catalog.data?.licenses[target.id]?.valid
-                  ? ' · 待授权'
-                  : ''}
+                {target.expected_tag ? ` ${target.expected_tag}` : ''}
+                {target.reissue ? ' · 订阅授权' : ''}
               </span>
             </li>
           ))}
         </ul>
-        {missingLicenses.length ? (
-          <p role='alert' className='text-sm text-destructive'>
-            {missingLicenses.length} 台 CRAG 尚未授权，请先在对应 VM
-            行激活。未执行任何重装或停用。
-          </p>
-        ) : null}
       </ConfirmDialog>
       {licenseVm ? (
         <KernelLicenseDialog

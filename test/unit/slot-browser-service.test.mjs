@@ -315,6 +315,18 @@ test('mutating slot/exit blocks startup; only a validated delete purges the prof
   f.service.afterMutation(deleted)
 })
 
+test('kernel-switch maintenance stops the browser and blocks reopening until the operation finishes', async (t) => {
+  const f = await fixture(t)
+  await f.call('vm-a', '/start')
+  const operation = { method: 'POST' }
+  await f.service.beforeMutation(operation, '/api/panel/vms/vm-a/kernel-switch')
+  assert.equal(f.stopped.at(-1)[0], 'vm-a')
+  assert.equal(f.stopped.at(-1)[1].deleteProfile, false)
+  assert.equal((await f.call('vm-a', '/start')).status, 409)
+  f.service.afterMutation(operation)
+  assert.equal((await f.call('vm-a', '/start')).status, 200)
+})
+
 test('proxy edits stop only affected slots; probes and label-only route guards leave all views alone', async (t) => {
   const f = await fixture(t)
   f.vms.get('vm-b').owner_user_id = 'u-2'

@@ -481,7 +481,7 @@ export function createSlotBrowser({
   async function beforeMutation(req, path) {
     if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return
     const slot =
-      /^\/api\/panel\/vms\/([^/]+)(?:\/(stop|reset|reset-fingerprint|reload|recover|owner|allocate-proxy|collect-identity|seed-settings|wrap-cli\/repair))?$/.exec(
+      /^\/api\/panel\/vms\/([^/]+)(?:\/(stop|reset|reset-fingerprint|reload|recover|owner|allocate-proxy|collect-identity|seed-settings|kernel-switch|wrap-cli\/repair))?$/.exec(
         path,
       )
     const all =
