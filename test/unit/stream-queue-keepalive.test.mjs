@@ -6,6 +6,7 @@ import path from 'node:path'
 import http from 'node:http'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { activateFixture, seedEncryptedPackage } from '../fixtures/crag-license.mjs'
 
 const MESSAGE = {
   model: 'claude-haiku-4-5',
@@ -466,9 +467,13 @@ test('an incomplete native handoff never becomes a successful output-limit termi
     homeDir: path.join(root, 'cli-home'),
     vm: {
       id: 'native-test',
+      dataplane: 'crag',
+      crag_kernel_version: 'v2',
       runtime: { kernel_socket: socketPath, worker_run_dir: root, worker_token_file: tokenPath },
     },
   }
+  seedEncryptedPackage(root)
+  activateFixture(root, exec.vm)
   const res = createResponse()
   const handler = createHandler({
     root,
@@ -489,7 +494,7 @@ test('an incomplete native handoff never becomes a successful output-limit termi
   try {
     await invoke(handler, res)
     const body = res.chunks.join('')
-    assert.equal(upstreamRequests, 1)
+    assert.equal(upstreamRequests, 1, JSON.stringify(res.body || body))
     assert.doesNotMatch(body, /"stop_reason":"max_tokens"|event: message_stop/)
     if (res.statusCode === 200) assert.match(body, /event: error/)
     else assert.equal(res.statusCode, 502)
