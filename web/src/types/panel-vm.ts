@@ -1,3 +1,4 @@
+import type { GeminiEnvironment } from '@/features/import/gemini-environments'
 import type { WindowEstimate } from './panel-pricing'
 
 /**
@@ -116,6 +117,13 @@ export type VmTelemetryState = {
   last_error: string | null
 }
 
+export type CragTelemetryState = {
+  state: 'launch_policy'
+  enabled: boolean | null
+  error: string | null
+  upload_confirmed: false
+}
+
 export type VmKernelHealth = {
   reachable?: boolean
   process_up?: boolean
@@ -138,7 +146,7 @@ export type VmKernelSnapshot = {
   credential_owner?: string | null
   credential_state?: string | null
   proxy_state?: string | null
-  telemetry?: VmTelemetryState | null
+  telemetry?: VmTelemetryState | CragTelemetryState | null
   process_topology?: {
     rust_pid1?: boolean
     go_worker_pid1?: boolean
@@ -247,6 +255,7 @@ export type ScheduleState = 'on' | 'off' | 'unschedulable' | 'restricted'
 
 export type Vm = {
   id: string
+  gemini?: GeminiEnvironment
   name?: string
   owner_user_id?: string | null
   /** 所在集群节点；null / 缺省 = 本机。 */
@@ -540,6 +549,8 @@ export type Vm = {
   window_7d_success?: number
   window_7d_errors?: number
   window_7d_tokens?: number
+  /** 近 24h 每 30 分钟 [成功, 失败]，最后一格是当前；无请求为 null。 */
+  health_24h?: Array<[number, number]> | null
   window_fable_cost?: number
   estimate_5h?: WindowEstimate
   estimate_7d?: WindowEstimate

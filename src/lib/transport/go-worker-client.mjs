@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { resolveStreamIdleTimeoutMs } from '../core/config.mjs'
 import { prepareOutboundHeaders } from '../protocol/outbound-attempt.mjs'
-import { sanitizeAnthropicBodyForBetaTokens } from '../protocol/anthropic-policy.mjs'
+import { alignSamplingWithThinking, sanitizeAnthropicBodyForBetaTokens } from '../protocol/anthropic-policy.mjs'
 import { prepareCliNodeRequest, prepareCragRequest } from '../protocol/kernel-request.mjs'
 import { withRequestProtocolBetas } from '../protocol/claude-code-betas.mjs'
 import { pinThreadBetas, rememberThreadTurn } from '../protocol/thread-betas.mjs'
@@ -52,6 +52,7 @@ import { mergeUsage } from '../protocol/openai-usage.mjs'
 import { ensureRedaction, maskJson, restoreJsonValue, createSseRestorer } from '../redaction/runtime.mjs'
 import { inferenceCodec } from './inference-codec.mjs'
 import { parseWorkerJson as parseJson } from './inference-codec-json.mjs'
+import { vmNodeId } from '../cluster/placement.mjs'
 import {
   createNativeHandoffState,
   consumeNativeHandoffStream,
@@ -556,9 +557,13 @@ function dumpSessionEnvelope(envelope) {
 
 function gateCragBody(body, print, health, isolated = false) {
   if (!body || typeof body !== 'object') return body
+  if (print) alignSamplingWithThinking(body)
   const caps = print && Array.isArray(health?.capabilities) ? health.capabilities : []
   const prompt = body.crag_prompt
-  const model = print && !isolated && cragConsumesModelDirective(health) ? modelDirectiveForCrag(body.model) : null
+  const model =
+    print && !isolated && body.thread == null && cragConsumesModelDirective(health)
+      ? modelDirectiveForCrag(body.model)
+      : null
   const hasAlias = body.crag_options != null && Object.hasOwn(body.crag_options, 'prompt')
   if (!model && !Object.hasOwn(body, 'crag_prompt') && !Object.hasOwn(body, 'crag_model') && !hasAlias) {
     return body
@@ -597,7 +602,7 @@ export function prepareWorkerPayload({
 } = {}) {
   const health = exec?.workerStatus
   const print = nativeCragRequest(exec, cragPrint)
-  const canonicalBody = print ? prepareCragRequest(body) : prepareCliNodeRequest(body)
+  const canonicalBody = print ? prepareCragRequest(body, health) : prepareCliNodeRequest(body)
   const model = canonicalBody?.model || ''
   const credMode = credentialModeFromOauth(exec?.vm?.claude || {})
   const headers = prepareOutboundHeaders(reqHeaders, exec?.homeDir, identity, model, {
@@ -724,7 +729,7 @@ async function preparePrebuiltEnvelope(envelope, redaction, messages, exec, crag
     delete out.gateway_policy
     const print = nativeCragRequest(exec, cragPrint)
     out.body = gateCragBody(
-      print ? prepareCragRequest(out.body) : prepareCliNodeRequest(out.body),
+      print ? prepareCragRequest(out.body, exec?.workerStatus) : prepareCliNodeRequest(out.body),
       print,
       exec?.workerStatus,
       out.request_context?.purpose === 'auto_mode_classifier',
@@ -800,7 +805,39 @@ function mockScenario(exec) {
   }
 }
 
-export async function callGoWorker({
+function restoreCragPolicyBlock(result) {
+  if (!result || result.ok || result.committed || isClientCancelledResult(result)) return result
+  const facts = result.providerResult
+  if (
+    facts?.schema_version !== 2 ||
+    facts.source !== 'crag' ||
+    facts.provider_complete !== false ||
+    facts.observation?.policy_blocked !== true ||
+    facts.observation?.exception?.code !== 'CRAG_CACHE_CONTROL'
+  )
+    return result
+  return {
+    ...result,
+    status: 502,
+    terminalState: 'rejected',
+    cragPolicyBlock: true,
+    body: {
+      type: 'error',
+      error: {
+        type: 'api_error',
+        code: 'crag_policy_blocked',
+        message: 'Gateway kernel rejected the request cache controls before dispatch (CRAG_CACHE_CONTROL)',
+        details: { retryable: false },
+      },
+    },
+  }
+}
+
+export async function callGoWorker(options) {
+  return restoreCragPolicyBlock(await callGoWorkerRaw(options))
+}
+
+async function callGoWorkerRaw({
   requestContext = null,
   exec,
   body,
@@ -857,6 +894,8 @@ export async function callGoWorker({
   }
   const requestId = randomUUID()
   let stopCancel = () => {}
+  const clusterSlot = requestPath === '/internal/v1/messages' && !!vmNodeId(exec?.vm)
+  let requestStarted = false
   let nativeHandoff = false
   let handoff = null
   let observedHeaders = {}
@@ -918,6 +957,7 @@ export async function callGoWorker({
       inference: true,
       beforeInferencePost,
       onRequestStarted: () => {
+        requestStarted = true
         nativeHandoff = useNativeHandoff
         stopCancel = cancelOnAbort(exec, signal, requestId)
       },
@@ -949,6 +989,7 @@ export async function callGoWorker({
         nativeHandoff && parsed?.type === 'error' && response.statusCode < 400
           ? nativeErrorStatus(handoff, parsed)
           : response.statusCode || 0,
+      upstreamStatus: response.statusCode ?? null,
       via: 'go-worker',
       body: parsed,
       headers,
@@ -956,6 +997,7 @@ export async function callGoWorker({
       model: parsed?.model || null,
       stopReason: parsed?.stop_reason || null,
       terminalState: headers['x-terminal-state'] || null,
+      clusterDeliveryUnconfirmed: clusterSlot && !handoff && ok && !isCompleteAssistantMessage({ body: parsed }),
       transportError: false,
       threadBetas: prepared.thread,
       ...nativeMetadata(),
@@ -988,6 +1030,7 @@ export async function callGoWorker({
         },
       },
       headers: observedHeaders,
+      clusterDeliveryUnconfirmed: clusterSlot && requestStarted,
       ...nativeMetadata(),
       terminalState:
         nativeHandoff && String(error.code).startsWith('native_handoff_')
@@ -1002,7 +1045,11 @@ export async function callGoWorker({
   }
 }
 
-export async function streamGoWorker({
+export async function streamGoWorker(options) {
+  return restoreCragPolicyBlock(await streamGoWorkerRaw(options))
+}
+
+async function streamGoWorkerRaw({
   requestContext = null,
   exec,
   body,
@@ -1122,6 +1169,8 @@ export async function streamGoWorker({
   const timing = createStreamTiming()
   const requestId = randomUUID()
   let stopCancel = () => {}
+  const clusterSlot = requestPath === '/internal/v1/messages' && !!vmNodeId(exec?.vm)
+  let requestStarted = false
   let nativeHandoff = false
   let handoff = null
   let observedHeaders = {}
@@ -1185,6 +1234,7 @@ export async function streamGoWorker({
       inference: true,
       beforeInferencePost,
       onRequestStarted: () => {
+        requestStarted = true
         nativeHandoff = useNativeHandoff
         stopCancel = cancelOnAbort(exec, signal, requestId)
       },
@@ -1205,6 +1255,7 @@ export async function streamGoWorker({
       const result = restoreKernelErrorStatus({
         ok: false,
         status: response.statusCode || 0,
+        upstreamStatus: response.statusCode ?? null,
         via: 'go-worker-stream',
         body: decoded,
         headers,
@@ -1263,6 +1314,7 @@ export async function streamGoWorker({
       return {
         ok: !failed,
         status: failed ? nativeErrorStatus(handoff, body) : response.statusCode,
+        upstreamStatus: response.statusCode ?? null,
         via: 'go-worker-stream',
         body,
         headers: mergeRateLimitHeaders(publicHeaders({ ...received.headers, ...headers, ...trailers })),
@@ -1454,6 +1506,7 @@ export async function streamGoWorker({
             : nativeTimeout && !committed
               ? 504
               : response.statusCode || 0,
+        upstreamStatus: response.statusCode ?? null,
         via: 'go-worker-stream',
 
         body: handoff
@@ -1469,6 +1522,7 @@ export async function streamGoWorker({
         ...timing.snapshot(),
         committed,
         terminalState: nativeTimeout && !committed ? 'rejected' : terminalState,
+        clusterDeliveryUnconfirmed: clusterSlot && !complete && !sawMessageStop && !lastError,
         transportError: false,
         threadBetas: prepared.thread,
         ...nativeMetadata(),
@@ -1511,6 +1565,7 @@ export async function streamGoWorker({
         },
       },
       headers: observedHeaders,
+      clusterDeliveryUnconfirmed: clusterSlot && requestStarted,
       ...nativeMetadata(),
       ...timing.snapshot(),
       committed,
@@ -1832,7 +1887,12 @@ export function prepareClaudeClientCredentials(exec, { refreshInSlot = runSlotOa
   return reconcileClaudeClientCredentials(exec, { ...options, refreshInSlot })
 }
 
-export async function callWorkerPost(exec, requestPath, body, { timeoutMs = 20000, signal } = {}) {
+export async function callWorkerPost(
+  exec,
+  requestPath,
+  body,
+  { timeoutMs = 20000, signal, requireInternalToken = false } = {},
+) {
   try {
     const response = await workerRequest(exec, {
       method: 'POST',
@@ -1840,6 +1900,7 @@ export async function callWorkerPost(exec, requestPath, body, { timeoutMs = 2000
       body,
       timeoutMs,
       signal,
+      requireInternalToken,
       maxRequestBytes: 8192,
     })
     const parsed = parseJson(await readAll(response, 16384), response.statusCode)

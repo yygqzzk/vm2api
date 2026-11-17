@@ -103,6 +103,8 @@ test('1.4.076 migrations preserve accounts and correlated usage across lifetime-
     '056_crag_shop_orders.sql',
     '057_crag_shop_commerce.sql',
     '058_crag_shop_activation.sql',
+    '059_risk_audit_bans.sql',
+    '060_crag_shop_order_dispatch.sql',
   ])
   assert.deepEqual(db.prepare('SELECT * FROM accounts').all(), accounts)
   const usage = db.prepare('SELECT id, request_id, correlation_id, usage_account_id FROM usage_logs').get()
@@ -111,4 +113,50 @@ test('1.4.076 migrations preserve accounts and correlated usage across lifetime-
   const reopened = f.open({ migrationsDir: legacy })
   assert.deepEqual(reopened.prepare('SELECT * FROM accounts').all(), accounts)
   assert.equal(reopened.prepare('SELECT request_id FROM usage_logs').get().request_id, 'outer-r1')
+})
+
+test('1.4.115 upgrades preserve correlated history and keep the previous schema readable', (t) => {
+  const f = fixture(t)
+  const legacy = path.join(f.root, '1.4.115-migrations')
+  fs.cpSync(source, legacy, {
+    recursive: true,
+    filter: (file) =>
+      fs.statSync(file).isDirectory() ||
+      (Number.parseInt(path.basename(file), 10) < 59 && !path.basename(file).startsWith('049_')),
+  })
+  const db = f.open({ migrationsDir: legacy })
+  db.prepare('INSERT INTO accounts (id, email, name, platform) VALUES (?, ?, ?, ?)').run(
+    'account',
+    'fixture@example.invalid',
+    'Existing account',
+    'openai',
+  )
+  db.prepare('INSERT INTO usage_logs (id, request_id, correlation_id, created_at) VALUES (?, ?, ?, ?)').run(
+    'log',
+    'outer-r1',
+    'outer',
+    '2026-11-18T00:00:00.000Z',
+  )
+  const accounts = db.prepare('SELECT * FROM accounts').all()
+  assert.deepEqual(applyMigrations(db), [
+    '049_api_key_endpoint.sql',
+    '059_risk_audit_bans.sql',
+    '060_crag_shop_order_dispatch.sql',
+  ])
+  assert.deepEqual(db.prepare('SELECT * FROM accounts').all(), accounts)
+  const reopened = f.open({ migrationsDir: legacy })
+  assert.deepEqual(reopened.prepare('SELECT * FROM accounts').all(), accounts)
+  assert.equal(reopened.prepare('SELECT correlation_id FROM usage_logs').get().correlation_id, 'outer')
+  assert.ok(
+    reopened
+      .prepare('PRAGMA table_info(api_keys)')
+      .all()
+      .some((c) => c.name === 'api_endpoint_id'),
+  )
+  assert.ok(
+    reopened
+      .prepare('PRAGMA table_info(crag_shop_orders)')
+      .all()
+      .some((c) => c.name === 'dispatch_state'),
+  )
 })

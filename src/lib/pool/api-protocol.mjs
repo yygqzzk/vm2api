@@ -35,6 +35,11 @@ export function resolveInferenceBackend(req) {
     : 'oauth'
 }
 
+export function apiScheduleScope(req, groupType) {
+  const endpointId = req.apiKeyRecord?.api_endpoint_id || null
+  return { endpointId, groupType: endpointId ? 'all' : groupType }
+}
+
 export { messagesUrl, responsesUrl } from './api-presets.mjs'
 
 const STATELESS_RESPONSES_FIELDS = new Set([
@@ -263,6 +268,7 @@ function mappedOpenAIResponsesFailure(resultBase, event, committed, extras = {})
   return {
     ...resultBase,
     ...mapped,
+    upstreamError: event.error,
     ok: false,
     terminalState: committed ? 'incomplete' : 'rejected',
     committed,
@@ -421,6 +427,7 @@ export async function runApiInference({
   const resultBase = {
     ok: status >= 200 && status < 300,
     status,
+    upstreamStatus: status,
     via: 'api-kernel',
     vmId: null,
     accountId: picked.key.id,
@@ -447,6 +454,7 @@ export async function runApiInference({
           message: String(message).slice(0, 300),
         },
       },
+      upstreamError: { code: upstreamCode || null, type: payload?.error?.type || null, message: String(message) },
       terminalState: 'rejected',
     }
   }
@@ -470,6 +478,8 @@ export async function runApiInference({
   const classifierSseState = { dataBuf: '' }
   let classifierError = null
   let classifierStopped = false
+  let streamError = null
+  let streamStopReason = null
   let streamedUsage = null
   const readUpstreamLines = async (onLine) => {
     try {
@@ -478,6 +488,8 @@ export async function runApiInference({
         const event = consumeClaudeSSEData(line, classifierSseState)
         timing.observe(event, receivedAt)
         streamedUsage = mergeUsage(streamedUsage, event?.message?.usage || event?.usage)
+        if (event?.type === 'error') streamError = event
+        if (event?.type === 'message_delta') streamStopReason = event.delta?.stop_reason || streamStopReason
         if (requestContext) {
           // The same decoded event drives classifier validation and performance timing.
           if (event?.type === 'error')
@@ -631,10 +643,24 @@ export async function runApiInference({
   const failure = classifierFailure()
   if (failure) return { ...failure, ...timing.snapshot(), committed }
 
+  if (streamError) {
+    return {
+      ...resultBase,
+      ...timing.snapshot(),
+      body: streamError,
+      status: mapUpstreamError(200, streamError).status,
+      ok: false,
+      committed,
+      usage: streamedUsage,
+      terminalState: 'rejected',
+    }
+  }
+
   return {
     ...resultBase,
     ...timing.snapshot(),
     usage: streamedUsage,
+    stopReason: streamStopReason,
     ok: resultBase.ok && (deliveryMode !== 'verified' || sawStop),
     terminalState: sawStop ? 'verified' : committed ? 'incomplete' : 'rejected',
     committed,

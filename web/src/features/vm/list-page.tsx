@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { Link } from '@tanstack/react-router'
 import { VIEW_TITLES } from '@/config/nav'
 import type { Vm } from '@/types/panel-vm'
 import {
@@ -22,6 +23,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Separator } from '@/components/ui/separator'
+import { Slider } from '@/components/ui/slider'
 import { ChoiceTiles } from '@/components/choice-tiles'
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import { EmptyState } from '@/components/empty-state'
@@ -30,11 +32,17 @@ import { SlotIdentity } from '@/components/platform-chip'
 import { QueryGate } from '@/components/query-gate'
 import { meQueryOptions } from '@/features/auth/queries'
 import { VmTestResultsDialog } from '@/features/fork/test-reports/panel'
+import { geminiInventoryOptions } from '@/features/import/gemini-environments'
 import { usageQueryOptions } from '@/features/overview/queries'
 import { planDeleteActiveVm } from '@/features/vm/active-vm'
 import { CreateVmDialog } from '@/features/vm/create-vm-dialog'
 import { DeleteActiveVmHint } from '@/features/vm/delete-active-hint'
+import {
+  completeVmDeletion,
+  type VmDeleteResult,
+} from '@/features/vm/delete-vm'
 import { FleetPulse } from '@/features/vm/fleet-pulse'
+import { geminiSlot } from '@/features/vm/gemini-slot'
 import { VmListSkeleton } from '@/features/vm/list-skeleton'
 import { vmsListQueryOptions } from '@/features/vm/queries'
 import { usePoolSeatStream } from '@/features/vm/use-pool-seat-stream'
@@ -70,6 +78,19 @@ const SIZES: [RackSize, string, string][] = [
 
 const LS_VIEW = 'vm-list-view'
 const LS_SIZE = 'vm-rack-size'
+const LS_ZOOM = 'vm-list-zoom'
+const ZOOM_MIN = 100
+const ZOOM_MAX = 200
+
+function readZoom(): number {
+  try {
+    const n = Number(localStorage.getItem(LS_ZOOM))
+    if (Number.isInteger(n) && n >= ZOOM_MIN && n <= ZOOM_MAX) return n
+  } catch {
+    // 隐私模式读不到时用 100%。
+  }
+  return ZOOM_MIN
+}
 
 function readPref<T extends string>(
   key: string,
@@ -95,6 +116,8 @@ function writePref(key: string, value: string) {
 export function VmListPage() {
   const me = useQuery(meQueryOptions())
   const vmsQ = useQuery(vmsListQueryOptions(5000))
+  const isAdmin = me.data?.role === 'admin'
+  const gemini = useQuery({ ...geminiInventoryOptions(), enabled: isAdmin })
   usePoolSeatStream()
   const usage = useQuery({
     ...usageQueryOptions(5000),
@@ -110,6 +133,7 @@ export function VmListPage() {
   const [size, setSizeState] = useState(() =>
     readPref(LS_SIZE, ['s', 'm', 'l'] as const, 'l')
   )
+  const [zoom, setZoomState] = useState(readZoom)
   const setView = (next: 'grid' | 'list') => {
     setViewState(next)
     writePref(LS_VIEW, next)
@@ -117,6 +141,15 @@ export function VmListPage() {
   const setSize = (next: RackSize) => {
     setSizeState(next)
     writePref(LS_SIZE, next)
+  }
+  const setZoom = (next: number) => {
+    const value = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.round(next)))
+    setZoomState(value)
+    try {
+      localStorage.setItem(LS_ZOOM, String(value))
+    } catch {
+      // 写不进去只影响下次打开。
+    }
   }
   const [sort, setSort] = useState<VmSortKey>('status')
   const [dir, setDir] = useState<'asc' | 'desc'>('asc')
@@ -148,29 +181,34 @@ export function VmListPage() {
           method: 'POST',
         })
       }
-      return api(`/api/panel/vms/${encodeURIComponent(id)}`, {
+      return api<VmDeleteResult>(`/api/panel/vms/${encodeURIComponent(id)}`, {
         method: 'DELETE',
       })
     },
-    onSuccess: async (_data, { id, switchTo }) => {
-      toast.success(
-        switchTo ? `已切换活跃到 ${switchTo} 并删除 ${id}` : '已删除'
-      )
+    onSuccess: async (data, { id, switchTo }) => {
       setDeleteTarget(null)
       setDeleteInput('')
-      await qc.invalidateQueries({ queryKey: vmsListQueryOptions().queryKey })
+      await completeVmDeletion(
+        qc,
+        data,
+        switchTo ? `已切换活跃到 ${switchTo} 并删除 ${id}` : '已删除'
+      )
     },
     onError: (error: Error) => toast.error(error.message),
   })
   const vms: Vm[] = vmsQ.data?.items || []
+  const slots =
+    isAdmin && gemini.data?.available
+      ? [...vms, ...gemini.data.environments.map(geminiSlot)]
+      : vms
   const poolQueue = vmsQ.data?.pool_queue
   const accounts = usage.data?.accounts
   const canCreate =
     me.data?.role === 'admin' ||
     (me.data?.role === 'user' && (me.data.vm_create_quota || 0) > 0)
   const perms = vmPermsFor(me.data?.role)
-  const scoped = filterVms(vms, '', 'all', kind)
-  const list = sortVms(filterVms(vms, q, filter, kind), sort, dir, accounts)
+  const scoped = filterVms(slots, '', 'all', kind)
+  const list = sortVms(filterVms(slots, q, filter, kind), sort, dir, accounts)
   const deletePlan = deleteTarget
     ? planDeleteActiveVm(deleteTarget, vms)
     : { kind: 'normal' as const }
@@ -199,6 +237,13 @@ export function VmListPage() {
             >
               全局排队 {poolQueue.global_queue_depth}/{poolQueue.queue_max}
             </span>
+          ) : null}
+          {isAdmin ? (
+            <Button asChild variant='outline'>
+              <Link to='/import' search={{ tab: 'gemini' }}>
+                导入 Gemini
+              </Link>
+            </Button>
           ) : null}
           {canCreate ? (
             <Button onClick={() => setCreateOpen(true)}>创建</Button>
@@ -230,7 +275,12 @@ export function VmListPage() {
           onFilter={setFilter}
         />
         <div className='mb-4 flex flex-wrap items-center gap-2'>
-          <KindFilterChips vms={vms} kind={kind} onChange={setKind} />
+          <KindFilterChips
+            vms={slots}
+            kind={kind}
+            onChange={setKind}
+            showGemini={isAdmin}
+          />
           <Separator orientation='vertical' className='mx-1 h-5' />
           <Input
             className='h-8 w-64'
@@ -300,6 +350,23 @@ export function VmListPage() {
                 ))}
               </div>
             ) : null}
+            {view === 'list' ? (
+              <div className='flex items-center gap-2'>
+                <span className='text-xs text-muted-foreground'>放大</span>
+                <Slider
+                  className='w-28'
+                  min={ZOOM_MIN}
+                  max={ZOOM_MAX}
+                  step={10}
+                  value={[zoom]}
+                  aria-label='列表放大'
+                  onValueChange={(next) => setZoom(next[0] ?? ZOOM_MIN)}
+                />
+                <span className='w-10 text-right font-mono text-xs text-muted-foreground tabular-nums'>
+                  {zoom}%
+                </span>
+              </div>
+            ) : null}
             <Button
               size='sm'
               variant={view === 'list' ? 'default' : 'outline'}
@@ -351,7 +418,7 @@ export function VmListPage() {
                 onCreate={canCreate ? () => setCreateOpen(true) : undefined}
               />
             ) : (
-              <VmTable vms={list} accounts={accounts} />
+              <VmTable vms={list} accounts={accounts} zoom={zoom} />
             )
           ) : (
             <EmptyState
