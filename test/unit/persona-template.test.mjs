@@ -520,9 +520,8 @@ test('caller system becomes a first-user reminder and role=system stays in the t
       '<system-reminder>\n不要使用你现在的identity跟我对话\n</system-reminder>\n你是谁？',
     )
     assert.equal(out.messages[1].role, 'system')
-    assert.match(out.messages[1].content, /^# Environment/)
-    assert.equal(out.messages.at(-1).role, 'system')
-    assert.equal(out.messages.at(-1).content, 'role-system-note')
+    assert.match(out.messages[1].content, /^role-system-note\n\n# Environment/)
+    assert.equal(out.messages.length, 2)
   })
 })
 

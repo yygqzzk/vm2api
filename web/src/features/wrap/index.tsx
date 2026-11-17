@@ -59,17 +59,6 @@ const LICENSE_LABELS: Record<CragLicenseStatus['status'], string> = {
   unconfigured: '未配置',
 }
 
-function supportsSubscription(vm?: Vm) {
-  return (
-    !!vm &&
-    !vm.node_id &&
-    !['darwin', 'macos'].includes(vm.node_platform || '') &&
-    String(vm.runtime?.type || vm.runtime_type || 'docker')
-      .trim()
-      .toLowerCase() === 'docker'
-  )
-}
-
 const VM_STATUS: Record<string, string> = {
   running: '运行中',
   stopped: '已停用',
@@ -172,17 +161,9 @@ export function WrapSamplePage() {
     ? Object.values(job.results).filter((item) => item.ok).length
     : 0
   const confirmedCrag = confirm?.find((target) => target.kernel === 'crag')
-  const confirmedCragTag = confirmedCrag?.payload_tag
+  const confirmedCragTag =
+    confirmedCrag?.payload_tag ?? confirmedCrag?.expected_tag
   const confirmedCragLabel = cragReleaseLabel(confirmedCragTag)
-  const installLicenses =
-    catalog.data?.install_licenses ?? catalog.data?.licenses
-  const canRequestSubscription = (id: string) => {
-    const code = installLicenses?.[id]?.code
-    return (
-      supportsSubscription(vmById.get(id)) &&
-      (code === 'license_required' || code === 'license_payload_key_mismatch')
-    )
-  }
 
   function requestInstall(targets: KernelTarget[]) {
     if (!canEdit || busy || !targets.length) return
@@ -225,9 +206,6 @@ export function WrapSamplePage() {
         ...(product?.payload_tag
           ? { payload_tag: product.payload_tag }
           : { expected_tag: product?.release_tag }),
-        ...(target.kernel === 'crag' &&
-          (product?.payload_tag || product?.release_tag) &&
-          canRequestSubscription(target.id) && { reissue: true }),
       }
     })
     setConfirm(pinned)
@@ -243,6 +221,7 @@ export function WrapSamplePage() {
       results: {},
     })
     let failures = 0
+    let reclaimPending = 0
     try {
       for (let index = 0; index < targets.length; index++) {
         const target = targets[index]
@@ -281,6 +260,7 @@ export function WrapSamplePage() {
           }
         }
         if (!result.ok) failures++
+        else if (result.reclaim_pending) reclaimPending++
         setJob((previous) =>
           previous
             ? {
@@ -294,6 +274,14 @@ export function WrapSamplePage() {
       if (failures)
         toast.error(
           `${targets.length - failures}/${targets.length} 台安装成功，请检查失败项`
+        )
+      else if (reclaimPending)
+        toast.warning(
+          `${targets.length} 台内核已安装并重启，${reclaimPending} 个 CRAG 绑定待回收`,
+          {
+            description:
+              '启用槽位回收后，请重装 cli-node 完成回收，额度以服务端确认为准。',
+          }
         )
       else toast.success(`${targets.length} 台内核已安装并重启，调度状态已更新`)
     } finally {
@@ -632,9 +620,6 @@ export function WrapSamplePage() {
                 <div role='rowgroup' className='divide-y'>
                   {rows.map(({ vm, kernel }) => {
                     const license = catalog.data?.licenses[vm.id]
-                    const mismatch =
-                      installLicenses?.[vm.id]?.code ===
-                      'license_payload_key_mismatch'
                     const installed = catalog.data?.installations?.[vm.id]
                     const result = job?.results[vm.id]
                     const runtime = cragStatus?.runtime?.vms[vm.id]
@@ -737,7 +722,7 @@ export function WrapSamplePage() {
                               )}
                               <span>
                                 {result.ok
-                                  ? `重启完成${result.schedulable ? '，已恢复调度' : '，原调度限制保留'}`
+                                  ? `重启完成${result.schedulable ? '，已恢复调度' : '，原调度限制保留'}${result.reclaim_pending ? '；CRAG 绑定待回收' : ''}`
                                   : `${result.error || '安装失败'}${result.stopped ? '；服务已停用' : ''}`}
                               </span>
                             </p>
@@ -806,13 +791,6 @@ export function WrapSamplePage() {
                                       .slice(0, 10)}{' '}
                                     UTC
                                   </div>
-                                ) : null}
-                                {canEdit && !macNative && mismatch ? (
-                                  <p className='text-sm text-muted-foreground'>
-                                    {supportsSubscription(vm)
-                                      ? '确认重装时会尝试使用本机已激活的宿主订阅。若未取得新许可，原内核不会停用。'
-                                      : '当前下载包需要匹配的离线许可。现有许可可继续用于原内核。'}
-                                  </p>
                                 ) : null}
                               </div>
                               <Button
@@ -892,20 +870,18 @@ export function WrapSamplePage() {
         desc={
           <>
             按所选内核安装并重启，健康检查完成后恢复调度；手动关闭和凭证限制保留。凭据和工作数据不变。
-            {confirm?.some((target) => target.reissue) ? (
-              <p className='mt-2'>
-                标记为「订阅授权」的 VM
-                会在停机前申请许可。有本槽订阅许可则同槽重签，否则使用一个剩余订阅名额。未取得有效许可的
-                VM 不会停机。
-              </p>
-            ) : null}
             {confirmedCrag ? (
-              <p className='mt-2 wrap-anywhere'>
-                CRAG 当前缓存标签：{confirmedCragTag || '未记录'}
-                {confirmedCragLabel && confirmedCragLabel !== confirmedCragTag
-                  ? `（${confirmedCragLabel}）`
-                  : null}
-              </p>
+              <>
+                <p className='mt-2'>
+                  CRAG 会在停机前校验授权和运行名额。校验未通过的 VM 不会停机。
+                </p>
+                <p className='mt-2 wrap-anywhere'>
+                  CRAG 安装版本：{confirmedCragTag || '未记录'}
+                  {confirmedCragLabel && confirmedCragLabel !== confirmedCragTag
+                    ? `（${confirmedCragLabel}）`
+                    : null}
+                </p>
+              </>
             ) : null}
           </>
         }
@@ -930,7 +906,6 @@ export function WrapSamplePage() {
               <span className='shrink-0 font-medium'>
                 {KERNEL_NAMES[target.kernel]}
                 {target.expected_tag ? ` ${target.expected_tag}` : ''}
-                {target.reissue ? ' · 订阅授权' : ''}
               </span>
             </li>
           ))}

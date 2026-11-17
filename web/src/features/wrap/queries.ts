@@ -28,7 +28,6 @@ export type KernelInstallation = {
 export type KernelCatalog = {
   kernels: KernelProduct[]
   licenses: Record<string, CragLicenseStatus>
-  install_licenses?: Record<string, CragLicenseStatus>
   installations?: Record<string, KernelInstallation>
 }
 
@@ -37,13 +36,14 @@ export type KernelTarget = {
   kernel: KernelId
   expected_tag?: string
   payload_tag?: string
-  reissue?: true
 }
 
 export type KernelInstallItem = KernelTarget & {
   ok: boolean
   stopped: boolean
   restarted?: boolean
+  rolled_back?: boolean
+  reclaim_pending?: boolean
   schedulable?: boolean
   status?: string
   version?: string | null
