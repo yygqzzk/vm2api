@@ -36,7 +36,7 @@ test('saved Codex factory identity is upgraded in kernel config and per-request 
   const routing = { codex: { user_agent: 'codex_cli_rs/0.160.0 (linux x86_64)' } }
   const written = writeCodexKernelConfig(root, LOCAL_CODEX, { routing })
   const config = JSON.parse(fs.readFileSync(written.configPath, 'utf8'))
-  assert.equal(config.user_agent, 'codex_cli_rs/0.167.1 (linux x86_64)')
+  assert.equal(config.user_agent, 'codex_cli_rs/0.170.0 (linux x86_64)')
   assert.equal(codexKernelRequestOptions(routing).user_agent, config.user_agent)
   assert.equal(routing.codex.user_agent, 'codex_cli_rs/0.160.0 (linux x86_64)')
   assert.equal(codexKernelRequestOptions({ codex: { user_agent: 'custom-codex/1.0' } }).user_agent, 'custom-codex/1.0')

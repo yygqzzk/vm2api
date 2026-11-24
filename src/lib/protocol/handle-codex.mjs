@@ -834,7 +834,7 @@ export async function handleCodexProtocol({
         }
         // Real upstream failures already happened: report the last one, not the pool.
         if (last) break
-        return rejectCodexAdmission({ req, res, json, stats, logBag, picked, model: converted.body?.model })
+        return rejectCodexAdmission({ req, res, json, stats, logBag, picked, model: converted.body?.model, pinVmId })
       }
       const vm = getVm(projectRoot, admitted.vmId)
       const lease = admitted.lease
@@ -1171,22 +1171,24 @@ export async function handleCodexProtocol({
   logBag.error_code = last?.body?.error?.code || 'codex_upstream'
   logBag.error_message ||= last?.body?.error?.message || null
   logBag.upstream_status = last?.status || 0
+  const resolvedPin = pinVmId === undefined ? pinnedVmIdFromRequest(req) : pinVmId
   res._kinGatewayRetry = gatewayRetryDecision(
     { ...last, gatewayOutcomeUnknown },
     {
       stateBound:
-        !!inboundSession.previous_response_id || !!pinnedVmId(req) || !!headerString(req.headers, 'x-codex-turn-state'),
+        !!inboundSession.previous_response_id || !!resolvedPin || !!headerString(req.headers, 'x-codex-turn-state'),
     },
   )
   return json(res, last?.status || 502, last?.body || { error: { type: 'api_error', code: 'codex_upstream' } })
 }
 
 /** No seat was admitted and nothing ran: say which gate stopped the request. */
-function rejectCodexAdmission({ req, res, json, stats, logBag, picked, model }) {
+function rejectCodexAdmission({ req, res, json, stats, logBag, picked, model, pinVmId = undefined }) {
   stats.errors++
   logBag.error_code = picked.error || 'no_codex_vm'
+  const resolvedPin = pinVmId === undefined ? pinnedVmIdFromRequest(req) : pinVmId
   res._kinGatewayRetry =
-    headerString(req.headers, 'x-codex-turn-state') || pinnedVmId(req) ? 'never' : poolAdmissionRetry(logBag.error_code)
+    headerString(req.headers, 'x-codex-turn-state') || resolvedPin ? 'never' : poolAdmissionRetry(logBag.error_code)
   if (picked.error === 'platform_mismatch') {
     return json(res, 400, {
       error: {
