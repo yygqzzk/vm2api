@@ -858,9 +858,10 @@ for (const stream of [false, true]) {
       }
       const { envelope } = await fixture.send(continuation)
       const history = envelope.body.messages.flatMap((m) => m.content)
+      const { extension: _ignoredExtension, ...whitelistedTool } = tool
       assert.deepEqual(
         history.find((b) => b.type === 'tool_use'),
-        tool,
+        whitelistedTool,
       )
       assert.deepEqual(
         history.find((b) => b.type === 'tool_result'),

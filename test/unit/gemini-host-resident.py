@@ -75,7 +75,7 @@ def make_fake_session(proxy_digest=PROXY_DIGEST, concurrency=1, alive=True):
     return sess
 
 
-with tempfile.TemporaryDirectory(prefix="gemini-resident-") as temporary:
+with tempfile.TemporaryDirectory(prefix="gemini-resident-", ignore_cleanup_errors=True) as temporary:
     directory = Path(temporary)
     args = SimpleNamespace(
         state=directory,
