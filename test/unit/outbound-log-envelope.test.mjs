@@ -461,8 +461,9 @@ unixTest('native CRAG receives caller tool names and structured system cache blo
   assert.equal(Object.hasOwn(envelope, 'headers'), false)
   assert.equal(extra.worker_envelope_headers, null)
   assert.deepEqual(envelope.body.tools, tools)
-  // The structured caller blocks keep their cache markers at the head of the first user turn.
-  assert.deepEqual(envelope.body.system, [{ type: 'text', text: CRS_OFFICIAL_CLI_SYSTEM }])
+  // The structured caller blocks keep their cache markers at the head of the first user turn;
+  // #1731 omits the relocated official identity placeholder from CRAG system.
+  assert.equal(envelope.body.system, undefined)
   assert.equal(envelope.body.crag_prompt, undefined)
   assert.deepEqual(envelope.body.messages, [
     { ...messages[0], content: [...system, ...messages[0].content] },
@@ -632,14 +633,14 @@ for (const stream of [false, true]) {
           }),
         )
         assert.equal(envelope.caller_cwd, trustedCwd)
-        assert.deepEqual(envelope.body.crag_prompt, identityPrompt(mode))
+        assert.equal(envelope.body.crag_prompt, undefined)
         assert.deepEqual(envelope.body.messages[0].content[0], { type: 'text', text: 'caller guidance' })
         assert.equal(envelope.body.crag_model.id, 'claude-haiku-4-5-20251001')
         assert.equal(Object.hasOwn(envelope.body, 'system'), false)
         assert.equal(JSON.stringify(envelope.body).includes(trustedCwd), false)
         assert.equal(JSON.stringify(extra.outbound_body).includes(trustedCwd), false)
         assert.equal(extra.official_cc_inference, 'crag-print')
-        assert.equal(extra.crag_print.prompt_mode, mode)
+        assert.equal(extra.crag_print.prompt_mode, 'default')
       },
     )
 
@@ -658,7 +659,7 @@ for (const stream of [false, true]) {
           }),
         )
         assert.equal(envelope.caller_cwd, trustedCwd)
-        assert.deepEqual(envelope.body.crag_prompt, identityPrompt(mode))
+        assert.equal(envelope.body.crag_prompt, undefined)
         // The declaration leaves with caller_cwd; the lifted history keeps its own copy.
         assert.deepEqual(
           envelope.body.messages[0].content.slice(0, 2).map((block) => block.text),
@@ -770,7 +771,7 @@ for (const stream of [false, true]) {
         assert.equal(extra.official_cc_inference, 'crag-print')
         assert.equal(Object.hasOwn(envelope, 'caller_cwd'), false)
         if (preserved) {
-          assert.deepEqual(envelope.body.crag_prompt, identityPrompt('append'))
+          assert.equal(envelope.body.crag_prompt, undefined)
           assert.ok(envelope.body.messages[0].content.some((block) => block.text?.includes(preserved)))
         } else {
           assert.equal(Object.hasOwn(envelope.body, 'crag_prompt'), false)
@@ -796,7 +797,7 @@ for (const phase of ['before_convert', 'before_upstream']) {
     ]) {
       const { envelope } = await fixture.send(body)
       assert.equal(envelope.caller_cwd, expectedCwd)
-      assert.deepEqual(envelope.body.crag_prompt, identityPrompt('append'))
+      assert.equal(envelope.body.crag_prompt, undefined)
       assert.equal(envelope.body.messages[0].content[0].text, replacementText)
     }
   })
@@ -844,7 +845,8 @@ for (const stream of [false, true]) {
       assert.match(first.publicBody, /call-issued/)
       assert.match(first.publicBody, /"caller":\{"type":"direct"\}/)
       assert.equal(first.extra.official_cc_inference, 'crag-print')
-      assert.notEqual(JSON.parse(first.envelope.body.metadata.user_id).session_id, session)
+      assert.equal(Object.hasOwn(first.envelope.body, 'metadata'), false)
+      assert.equal(JSON.stringify(first.envelope.body).includes(session), false)
       const echo = stream
         ? { type: 'tool_use', id: 'client-id', name: 'lookup', input: { term: 'item' } }
         : { type: 'tool_use', id: tool.id, name: 'changed', input: { term: 'wrong' } }
