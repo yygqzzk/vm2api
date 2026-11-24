@@ -466,10 +466,12 @@ test('only the CRAG seat outside the signed quota leaves the pool, including a l
   const hostId = 'a'.repeat(64)
   const publicDir = cragSubscriptionPublicDirectory(root)
   fs.mkdirSync(publicDir, { recursive: true, mode: 0o755 })
-  fs.writeFileSync(path.join(publicDir, 'host_id'), hostId)
+  // Explicit modes: crag-license rejects group-writable public files, and a
+  // developer umask of 0002 would otherwise create them that way.
+  fs.writeFileSync(path.join(publicDir, 'host_id'), hostId, { mode: 0o644 })
   const publish = (revision, slotLimit) => {
     const { code } = issueHostEntitlement(root, hostId, { revision, slot_limit: slotLimit })
-    fs.writeFileSync(path.join(publicDir, 'entitlement.code'), code)
+    fs.writeFileSync(path.join(publicDir, 'entitlement.code'), code, { mode: 0o644 })
   }
   publish(1, 2)
   for (const [index, id] of ['vm-01', 'vm-02'].entries()) {
@@ -783,6 +785,67 @@ test('fable family cooldown still allows sonnet on the same account', async (t) 
   assert.equal(sonnet.ok, true)
   assert.equal(sonnet.accountId, 'account-1')
   sonnet.release()
+})
+
+for (const source of ['usage', 'model-cooldown']) {
+  test(`Fable quota from ${source} returns 429 without dispatch and leaves Opus available`, async (t) => {
+    const root = project()
+    const repo = new RuntimeRepo()
+    const resetAt = Date.now() + 109005_000
+    const pool = scheduler(root, {
+      runtimeRepo: repo,
+      accountQuota: {
+        canAccept: () => ({ ok: true }),
+        fableWindowLimited: () => source === 'usage',
+        fableWindowResetAt: () => resetAt,
+      },
+    })
+    t.after(() => cleanupProject(root, pool))
+    if (source === 'model-cooldown') {
+      pool.markCooldown(
+        { accountId: 'account-1', vmId: 'vm-01' },
+        { model: 'fable', until: resetAt, reason: 'fable_rate_limited' },
+      )
+    }
+    const result = await new FailoverRunner({ scheduler: pool }).run({
+      requestId: `fable-quota-${source}`,
+      model: 'claude-fable-5-2',
+      pinVmId: 'vm-01',
+      callAttempt: () => assert.fail('known exhausted Fable quota must not reach the upstream'),
+    })
+    assert.equal(result.status, 429)
+    assert.equal(result.body.error.code, 'pool_fable_rate_limited')
+    assert.match(result.body.error.message, /Fable/)
+    assert.ok(result.retryAfterSec > 109000)
+    const opus = await pool.selectAndReserve({
+      model: 'claude-opus-5-5',
+      pinVmId: 'vm-01',
+      allowWait: false,
+    })
+    assert.equal(opus.ok, true)
+    assert.equal(opus.accountId, 'account-1')
+    opus.release()
+  })
+}
+
+test('a pool split between Fable and shared quota exhaustion still returns 429', async (t) => {
+  const root = project()
+  const repo = new RuntimeRepo()
+  const resetAt = Date.now() + 60_000
+  const pool = scheduler(root, { runtimeRepo: repo })
+  t.after(() => cleanupProject(root, pool))
+  pool.markCooldown(
+    { accountId: 'account-1', vmId: 'vm-01' },
+    { model: 'fable', until: resetAt, reason: 'fable_rate_limited' },
+  )
+  repo.markCooldown('account-2', { vmId: 'vm-02', until: resetAt, reason: 'quota_5h_header' })
+  const result = await new FailoverRunner({ scheduler: pool }).run({
+    requestId: 'mixed-quota',
+    model: 'claude-fable-5-2',
+    callAttempt: () => assert.fail('all candidates have known quota exhaustion'),
+  })
+  assert.equal(result.status, 429)
+  assert.equal(result.body.error.code, 'pool_rate_limited')
 })
 
 test('fable concurrency cap leaves room for other models', async (t) => {
@@ -1568,6 +1631,41 @@ test('fable lands on a pro slot', async (t) => {
   assert.equal(selected.ok, true)
   assert.ok(selected.vmId === 'vm-01' || selected.vmId === 'vm-02')
   selected.release()
+})
+
+test('with pool.fable_requires_max, fable skips an unlabeled slot and lands on max', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  writeTier(root, 'vm-01', null)
+  writeTier(root, 'vm-02', 'max')
+  const pool = scheduler(root, { config: { fable_requires_max: true } })
+  const selected = await pool.selectAndReserve({ model: 'claude-fable-5', allowWait: false })
+  assert.equal(selected.ok, true)
+  assert.equal(selected.vmId, 'vm-02')
+  selected.release()
+  const sonnet = await pool.selectAndReserve({ model: 'claude-sonnet-5', allowWait: false })
+  assert.equal(sonnet.ok, true)
+  sonnet.release()
+})
+
+test('with pool.fable_requires_max and only pro slots, fable returns fable_requires_max', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  writeTier(root, 'vm-01', 'pro')
+  writeTier(root, 'vm-02', 'pro')
+  const accountQuota = {
+    canAccept: () => ({ ok: true }),
+    repo: { get: () => ({ unified: { model_denied_until: { 'claude-fable-5': Date.now() + 60_000 } } }) },
+  }
+  const selected = await scheduler(root, {
+    accountQuota,
+    config: { fable_requires_max: true },
+  }).selectAndReserve({
+    model: 'claude-fable-5',
+    allowWait: false,
+  })
+  assert.equal(selected.ok, false)
+  assert.equal(selected.reason, 'fable_requires_max')
 })
 
 test('sonnet still lands on a pro slot', async (t) => {
@@ -3520,4 +3618,303 @@ test('pool routing normalizes session_affinity_first to a strict boolean', () =>
   assert.equal(normalizePoolRouting({}).session_affinity_first, false)
   assert.equal(normalizePoolRouting({ session_affinity_first: 'yes' }).session_affinity_first, false)
   assert.equal(normalizePoolRouting({ session_affinity_first: true }).session_affinity_first, true)
+})
+
+test('seatHomes: machine first by default, family first when family_affinity_first is on', async () => {
+  const { seatHomes, normalizePoolRouting: normalize } = await import('../../src/lib/pool/pool-scheduler.mjs')
+  assert.deepEqual(
+    seatHomes({ deviceVm: 'vm-dev', familyVm: 'vm-fam' }).map((home) => home.reason),
+    ['device-affinity', 'family-affinity'],
+  )
+  assert.deepEqual(
+    seatHomes({ deviceVm: 'vm-dev', familyVm: 'vm-fam', familyFirst: true }).map((home) => home.vmId),
+    ['vm-fam', 'vm-dev'],
+  )
+  assert.equal(seatHomes({ deviceVm: 'vm-1', familyVm: 'vm-1', familyFirst: true }).length, 1)
+  assert.equal(normalize({}).family_affinity_first, false)
+  assert.equal(normalize({ family_affinity_first: true }).family_affinity_first, true)
+})
+
+function pinRouter(bound) {
+  const unbound = []
+  return {
+    unbound,
+    resolve: (key) => (key === 'sess:a' ? bound : null),
+    unbind: (key) => unbound.push(key),
+  }
+}
+
+test('keep_pin_on_model_gate: a model-gated home is borrowed around, its pin stays', () => {
+  const bound = { accountId: 'acc-1', vmId: 'vm-1' }
+  for (const keep of [true, false]) {
+    const router = pinRouter(bound)
+    const pool = new PoolScheduler({ stickyRouter: router, config: { keep_pin_on_model_gate: keep } })
+    const eligible = Object.assign([{ vmId: 'vm-2', accountId: 'acc-2' }], {
+      modelGated: new Set(['acc-1', 'vm-1']),
+    })
+    const result = pool.reconcileSticky({ stickyKey: 'sess:a', stickyKeys: ['sess:a'], eligible })
+    if (keep) {
+      assert.deepEqual(result, { cleared: false, match: null, borrowed: true })
+      assert.deepEqual(router.unbound, [])
+      assert.equal(pool.modelOnlyGated(eligible, 'vm-1'), true)
+    } else {
+      assert.equal(result.cleared, true)
+      assert.deepEqual(router.unbound, ['sess:a'])
+      assert.equal(pool.modelOnlyGated(eligible, 'vm-1'), false)
+    }
+  }
+})
+
+test('keep_pin_on_model_gate: a model cooldown keeps the pin, an account cooldown still releases it', () => {
+  const bound = { accountId: 'acc-1', vmId: 'vm-1' }
+  const home = (waitReason) => [{ vmId: 'vm-1', accountId: 'acc-1', busy: true, waitReason }]
+  const router = pinRouter(bound)
+  const pool = new PoolScheduler({ stickyRouter: router, config: { keep_pin_on_model_gate: true } })
+  for (const reason of ['model_cooldown', 'fable_cooldown', 'fable_quota', 'fable_split']) {
+    const result = pool.reconcileSticky({ stickyKey: 'sess:a', stickyKeys: ['sess:a'], eligible: home(reason) })
+    assert.equal(result.borrowed, true, reason)
+  }
+  assert.deepEqual(router.unbound, [])
+  const moved = pool.reconcileSticky({
+    stickyKey: 'sess:a',
+    stickyKeys: ['sess:a'],
+    eligible: home('account_cooldown'),
+  })
+  assert.equal(moved.cleared, true)
+  assert.deepEqual(router.unbound, ['sess:a'])
+  const gone = pinRouter(bound)
+  const pool2 = new PoolScheduler({ stickyRouter: gone, config: { keep_pin_on_model_gate: true } })
+  const left = pool2.reconcileSticky({ stickyKey: 'sess:a', stickyKeys: ['sess:a'], eligible: [] })
+  assert.equal(left.cleared, true)
+})
+
+test('keep_pin_on_model_gate: a model the pinned slot does not allow borrows another slot and the pin stays', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  writeTier(root, 'vm-01', 'pro', { allowed_models: ['claude-sonnet-5'] })
+  writeTier(root, 'vm-02', 'max')
+  for (const keep of [true, false]) {
+    const sticky = new StickyRouter({ dataDir: path.join(root, `data-${keep}`), config: { sticky: { enabled: true } } })
+    sticky.bind('sess:conv', { vmId: 'vm-01', accountId: 'account-1' })
+    const pool = scheduler(root, { stickyRouter: sticky, config: { keep_pin_on_model_gate: keep } })
+    const fable = await pool.selectAndReserve({
+      model: 'claude-fable-5',
+      stickyKey: 'sess:conv',
+      stickyKeys: ['sess:conv'],
+      allowWait: false,
+    })
+    assert.equal(fable.ok, true)
+    assert.equal(fable.vmId, 'vm-02')
+    assert.equal(fable.stickyBorrowed, keep)
+    fable.release()
+    assert.equal(sticky.resolve('sess:conv')?.accountId || null, keep ? 'account-1' : null)
+    if (keep) {
+      const sonnet = await pool.selectAndReserve({
+        model: 'claude-sonnet-5',
+        stickyKey: 'sess:conv',
+        stickyKeys: ['sess:conv'],
+        allowWait: false,
+      })
+      assert.equal(sonnet.vmId, 'vm-01')
+      assert.equal(sonnet.selectionReason, 'sticky')
+      sonnet.release()
+    }
+  }
+})
+
+test('shared scheduler reserves host-managed Gemini accounts under the same concurrency cap', (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const pool = scheduler(root)
+  const candidates = ['acc-1', 'acc-2'].map((id, index) => ({
+    accountId: `gemini:${id}`,
+    vmId: `gemini:${id}`,
+    model: 'gemini-3.8-flash-low',
+    maxConcurrency: 1,
+    priority: 0,
+    weight: 1,
+    lastUsedAt: index,
+  }))
+  const first = pool.reserveExternalCandidates(candidates)
+  const second = pool.reserveExternalCandidates(candidates)
+  assert.ok(first)
+  assert.ok(second)
+  assert.notEqual(second.selected.accountId, first.selected.accountId)
+  assert.equal(pool.inflight.get(first.selected.accountId), 1)
+  assert.equal(pool.inflight.get(second.selected.accountId), 1)
+  assert.equal(pool.reserveExternalCandidates(candidates), null)
+  first.reservation.release()
+  const next = pool.reserveExternalCandidates(candidates)
+  assert.equal(next.selected.accountId, first.selected.accountId)
+  next.reservation.release()
+  second.reservation.release()
+  pool.lastUsed.set(first.selected.accountId, 100)
+  const balanced = pool.reserveExternalCandidates(candidates)
+  assert.equal(balanced.selected.accountId, second.selected.accountId)
+  balanced.reservation.release()
+})
+
+test('fresh_account_isolation_ms: a pinned conversation never spills onto a freshly onboarded account', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
+  sticky.bind('sess:conv', { vmId: 'vm-01', accountId: 'account-1' })
+  const now = Date.now()
+  // scheduler() 会用 accountQuota.repo 覆盖 runtime.accounts，先建 pool 再注入账号行
+  const runtime = new RuntimeRepo()
+  const pool = scheduler(root, {
+    stickyRouter: sticky,
+    runtimeRepo: runtime,
+    config: { fresh_account_isolation_ms: 48 * 3600_000 },
+  })
+  runtime.accounts = new Map([
+    // 旧号：入池已久，隔离不生效
+    ['account-1', { created_at: new Date(now - 30 * 86400_000).toISOString() }],
+    // 新号：10 分钟前入池，处于保护窗口内
+    ['account-2', { created_at: new Date(now - 10 * 60_000).toISOString() }],
+  ])
+  const args = {
+    model: 'claude-test',
+    stickyKey: 'sess:conv',
+    stickyKeys: ['sess:conv'],
+    excluded: new Set(['account-1']),
+    allowWait: false,
+  }
+  // home 被排除（模拟 home 打满/故障），续跑会话只能落新号——被隔离门拦下
+  const blocked = await pool.selectAndReserve(args)
+  assert.equal(blocked.ok, false)
+  assert.equal(blocked.reason, 'no_eligible_accounts')
+
+  // 新号过了保护窗口：正常承接 spill
+  runtime.accounts.set('account-2', { created_at: new Date(now - 49 * 3600_000).toISOString() })
+  const allowed = await pool.selectAndReserve(args)
+  assert.equal(allowed.ok, true)
+  assert.equal(allowed.vmId, 'vm-02')
+  allowed.release()
+
+  // 无会话上下文（全新对话）：新号照常可选，不受隔离影响
+  const freshConv = await pool.selectAndReserve({
+    model: 'claude-test',
+    excluded: new Set(['account-1']),
+    allowWait: false,
+  })
+  assert.equal(freshConv.ok, true)
+  assert.equal(freshConv.vmId, 'vm-02')
+  freshConv.release()
+})
+
+test('fresh_account_isolation_ms: default off keeps upstream spill behaviour', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
+  sticky.bind('sess:conv', { vmId: 'vm-01', accountId: 'account-1' })
+  const now = Date.now()
+  const runtime = new RuntimeRepo()
+  const pool = scheduler(root, { stickyRouter: sticky, runtimeRepo: runtime })
+  runtime.accounts = new Map([
+    ['account-1', { created_at: new Date(now - 30 * 86400_000).toISOString() }],
+    ['account-2', { created_at: new Date(now - 60_000).toISOString() }],
+  ])
+  const spill = await pool.selectAndReserve({
+    model: 'claude-test',
+    stickyKey: 'sess:conv',
+    stickyKeys: ['sess:conv'],
+    excluded: new Set(['account-1']),
+    allowWait: false,
+  })
+  assert.equal(spill.ok, true)
+  assert.equal(spill.vmId, 'vm-02')
+  spill.release()
+})
+
+test('normalizePoolRouting clamps fresh_account_isolation_ms', () => {
+  assert.equal(normalizePoolRouting({ fresh_account_isolation_ms: 0 }).fresh_account_isolation_ms, 0)
+  assert.equal(normalizePoolRouting({}).fresh_account_isolation_ms, 0)
+  assert.equal(normalizePoolRouting({ fresh_account_isolation_ms: 7200000 }).fresh_account_isolation_ms, 7200000)
+  assert.equal(normalizePoolRouting({ fresh_account_isolation_ms: -5 }).fresh_account_isolation_ms, 0)
+  assert.equal(normalizePoolRouting({ fresh_account_isolation_ms: 'junk' }).fresh_account_isolation_ms, 0)
+})
+
+test('fresh_account_isolation_ms: a huge cold first prompt is normal traffic and lands on a fresh account', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const now = Date.now()
+  const runtime = new RuntimeRepo()
+  const pool = scheduler(root, {
+    runtimeRepo: runtime,
+    accountQuota: { canAccept: () => ({ ok: true }), config: {} },
+    config: { fresh_account_isolation_ms: 48 * 3600_000 },
+  })
+  runtime.accounts = new Map([
+    // home（vm-01）不在隔离窗口内的意义：防止 bootstrap escape 把池当全新池
+    ['account-1', { created_at: new Date(now - 30 * 86400_000).toISOString() }],
+    ['account-2', { created_at: new Date(now - 10 * 60_000).toISOString() }],
+  ])
+  // 用户离开对话数小时后回来，缓存早已过期，整段历史冷提交 —— 正常流量，
+  // 不是跨号关联信号：新开长会话（无 sticky 行）不受隔离门影响
+  const bigText = 'x'.repeat(900_000)
+  const served = await pool.selectAndReserve({
+    model: 'claude-test',
+    quotaRequest: { body: { model: 'claude-test', messages: [{ role: 'user', content: bigText }] } },
+    excluded: new Set(['account-1']),
+    allowWait: false,
+  })
+  assert.equal(served.ok, true, 'a huge new conversation is legitimate and must be served')
+  assert.equal(served.vmId, 'vm-02')
+  served.release()
+})
+
+test('fresh_account_isolation_ms: bootstrap escape releases a continuing conversation when the whole pool is fresh', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const now = Date.now()
+  const runtime = new RuntimeRepo()
+  // 全池都是窗口内新号（全新部署）：续入会话的 home 已不存在（槽已删），
+  // 没有可等待的老号 —— 逃生门必须放行，否则全新池不可用
+  const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
+  sticky.bind('sess:conv', { vmId: 'vm-gone', accountId: 'account-gone' })
+  const pool = scheduler(root, {
+    stickyRouter: sticky,
+    runtimeRepo: runtime,
+    accountQuota: { canAccept: () => ({ ok: true }), config: {} },
+    config: { fresh_account_isolation_ms: 48 * 3600_000 },
+  })
+  runtime.accounts = new Map([
+    ['account-1', { created_at: new Date(now - 5 * 60_000).toISOString() }],
+    ['account-2', { created_at: new Date(now - 10 * 60_000).toISOString() }],
+  ])
+  const served = await pool.selectAndReserve({
+    model: 'claude-test',
+    stickyKey: 'sess:conv',
+    stickyKeys: ['sess:conv'],
+    allowWait: false,
+  })
+  assert.equal(served.ok, true, 'a brand-new pool must stay schedulable even for continuing conversations')
+  assert.ok(served.vmId === 'vm-01' || served.vmId === 'vm-02')
+  served.release()
+})
+
+test('a cold health cache is probed for every slot at once, not one slot after another', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  let inflight = 0
+  let peak = 0
+  const calls = []
+  const pool = scheduler(root, {
+    workerHealth: async ({ vmId }) => {
+      calls.push(vmId)
+      inflight++
+      peak = Math.max(peak, inflight)
+      await new Promise((resolve) => setTimeout(resolve, 30))
+      inflight--
+      return { ok: true, credential: { generation: 1, has_access: true } }
+    },
+  })
+  const candidates = await pool.eligibleCandidates({ model: 'claude-test' })
+  assert.ok(candidates.length >= 2)
+  assert.ok(peak >= 2, `health hops overlapped (peak ${peak})`)
+  assert.equal(new Set(calls).size, calls.length, 'each slot is probed once per scan')
+  // Warm cache: no further hops.
+  await pool.eligibleCandidates({ model: 'claude-test' })
+  assert.equal(calls.length, candidates.length)
 })

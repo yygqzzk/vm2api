@@ -2,7 +2,7 @@
  * api_keys repository — persistence for managed client API keys.
  * Pure SQL layer; business rules stay in lib/api-keys.mjs (ApiKeyStore).
  *
- * sub2api-shaped: user_id/group_id ownership, USD quota (quota/quota_used)
+ * Keys have user_id/group_id ownership and a USD quota (quota/quota_used)
  * plus 5h/1d/7d USD rate-limit windows. The legacy request-count quota pair
  * is quota_requests / quota_requests_used. Soft delete via deleted_at.
  */
@@ -36,6 +36,10 @@ const COLUMNS = [
   'allowed_vms',
   'vm_pool_id',
   'allowed_models',
+  'permission_tier',
+  'owner_id',
+  'allowed_endpoints',
+  'allowed_gemini_envs',
   'key_secret',
   'user_id',
   'group_id',
@@ -87,7 +91,10 @@ function toValue(rec, c) {
   if (v == null) {
     if (c === 'category') return 'oauth'
     if (c === 'group_type') return 'all'
-    if (c === 'allowed_vms' || c === 'allowed_models') return '[]'
+    if (c === 'permission_tier') return 'platform'
+    if (c === 'allowed_vms' || c === 'allowed_models' || c === 'allowed_endpoints' || c === 'allowed_gemini_envs') {
+      return '[]'
+    }
     return NUMERIC_DEFAULT_0.has(c) ? 0 : null
   }
   return v
@@ -158,7 +165,7 @@ export class ApiKeysRepo {
   }
 
   /**
-   * Sub2api APIKey window semantics: a window opens at first spend; once
+   * An API key's spending window opens at first spend; once
    * now - start >= size the window resets (usage=cost, start=now).
    */
   _rollWindow(rec, key, cost, nowMs) {

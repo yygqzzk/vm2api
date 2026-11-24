@@ -7,6 +7,8 @@ export const BUILTIN_SOURCE = 'builtin-2026-10-14'
 
 const WEB_SEARCH = 0.01
 const OPENAI_LONG = 272_000
+// OpenAI uses Pacific time for the GPT-6.2 Ultrafast introductory rate.
+export const ULTRAFAST_PROMOTION_END = Date.parse('2027-03-01T00:00:00-08:00')
 
 function claude(input, output, cache_read, cache_5m, cache_1h, extra = {}) {
   return {
@@ -66,6 +68,7 @@ const ANTHROPIC = {
   'claude-fable-5-2': claude(8, 40, 0.2, 10, 16),
   'claude-mythos-5': claude(10, 50, 1, 12.5, 20),
   'claude-mythos-5-1': claude(10, 50, 0.25, 12.5, 20),
+  'claude-mythos-5-2': claude(8, 40, 0.2, 10, 16),
   'claude-opus-5-5': claude(4, 20, 0.2, 5, 8, {
     modes: { fast: tokenPrice(8, 40, 0.4, 10, 16) },
   }),
@@ -102,7 +105,25 @@ function gptImage() {
   return { ...tokenPrice(5, 0, 1.25, 0, 0), image: { input: 8, output: 30, cache_read: 2 } }
 }
 
+// No `flex` band: the GPT-6.2 models have no published Flex price, and the pricing page says
+// outright that Flex is not being added to new models. Deriving one from the 0.5x ratio the
+// older models happen to show would put an invented number in a file that claims to be a list
+// price snapshot, and `selectBand` already has the right answer for a tier with no published
+// price -- it reports the row unpriced rather than billing it at a guess.
+function openai62(input, output, cacheRead) {
+  return openaiFrom(
+    { input, output, cache_read: cacheRead, cache_write: input * 1.25 },
+    {
+      fast: [input * 2, output * 2, cacheRead * 2],
+      long_standard: [input * 2, output * 1.5, cacheRead * 2],
+      long_fast: [input * 4, output * 3, cacheRead * 4],
+    },
+  )
+}
+
 const OPENAI = {
+  'gpt-6.2-astra': openai62(8, 40, 0.4),
+  'gpt-6.2-sol': openai62(2, 10, 0.1),
   'gpt-6-astra': openaiFrom(
     { input: 10, output: 50, cache_read: 1, cache_write: 12.5 },
     {
@@ -283,6 +304,47 @@ const OPENAI = {
   'gpt-image-2.5-flare': gptImage(),
   'gpt-image-2.5-sunburst': gptImage(),
   'gpt-image-2': gptImage(),
+  'gpt-oss-120b': openaiFrom({ input: 0.15, output: 0.6, cache_read: 0.075, cache_write: 0 }),
+}
+
+function gemini(input, output, cache_read, extra = {}) {
+  return {
+    input,
+    output,
+    cache_read,
+    cache_5m: 0,
+    cache_1h: 0,
+    ...extra,
+  }
+}
+
+const GEMINI_LONG = 200_000
+
+const GOOGLE = {
+  'gemini-2.5-pro': gemini(1.25, 10, 0.125, {
+    tiers: [{ above: GEMINI_LONG, input: 2.5, output: 15, cache_read: 0.25, cache_5m: 0, cache_1h: 0 }],
+  }),
+  'gemini-2.5-flash': gemini(0.3, 2.5, 0.03),
+  'gemini-2.5-flash-lite': gemini(0.1, 0.4, 0.01),
+  'gemini-2.0-flash': gemini(0.1, 0.4, 0.025),
+  'gemini-2.0-flash-lite': gemini(0.075, 0.3, 0.01875),
+  'gemini-3-pro': gemini(2, 12, 0.2, {
+    tiers: [{ above: GEMINI_LONG, input: 4, output: 18, cache_read: 0.4, cache_5m: 0, cache_1h: 0 }],
+  }),
+  'gemini-3.1-pro': gemini(2, 12, 0.2, {
+    tiers: [{ above: GEMINI_LONG, input: 4, output: 18, cache_read: 0.4, cache_5m: 0, cache_1h: 0 }],
+  }),
+  'gemini-3-flash': gemini(0.5, 3, 0.05),
+  'gemini-3.1-flash-lite': gemini(0.25, 1.5, 0.025),
+  'gemini-3.5-flash-lite': gemini(0.25, 1.5, 0.025),
+  'gemini-3.8-flash': gemini(0.5, 3, 0.05),
+  'gemini-4-neon': gemini(2, 12, 0.2, {
+    tiers: [{ above: GEMINI_LONG, input: 4, output: 18, cache_read: 0.4, cache_5m: 0, cache_1h: 0 }],
+  }),
+  'gemini-4-argon': gemini(1.25, 10, 0.125, {
+    tiers: [{ above: GEMINI_LONG, input: 2.5, output: 15, cache_read: 0.25, cache_5m: 0, cache_1h: 0 }],
+  }),
+  'gemini-4-hydrogen': gemini(0.5, 3, 0.05),
 }
 
 /** Dated / legacy / family ids → canonical priced id. OpenAI: verified snapshot aliases only. */
@@ -295,6 +357,7 @@ export const BUILTIN_ALIASES = {
   'claude-fable-5.1': 'claude-fable-5-1',
   'claude-fable-5.2': 'claude-fable-5-2',
   'claude-mythos-5.1': 'claude-mythos-5-1',
+  'claude-mythos-5.2': 'claude-mythos-5-2',
   'claude-opus-5.5': 'claude-opus-5-5',
   'claude-sonnet-5.5': 'claude-sonnet-5-5',
   'claude-haiku-5.5': 'claude-haiku-5-5',
@@ -335,10 +398,28 @@ export const BUILTIN_ALIASES = {
   'o4-mini-2025-04-16': 'o4-mini',
 }
 
-export const BUILTIN_RATES = { anthropic: ANTHROPIC, openai: OPENAI }
+export const BUILTIN_RATES = { anthropic: ANTHROPIC, openai: OPENAI, google: GOOGLE }
 
-export function builtinOf(id) {
-  if (ANTHROPIC[id]) return { platform: 'anthropic', id, price: ANTHROPIC[id] }
-  if (OPENAI[id]) return { platform: 'openai', id, price: OPENAI[id] }
-  return null
+// https://developers.openai.com/api/docs/pricing?latest-pricing=ultrafast
+const ULTRAFAST_MODELS = new Set(['gpt-6.2-astra', 'gpt-6.2-sol', 'gpt-6-astra', 'gpt-6.1-sol'])
+
+function scaleRates(band, multiplier) {
+  return tokenPrice(
+    band.input * multiplier,
+    band.output * multiplier,
+    band.cache_read * multiplier,
+    band.cache_5m * multiplier,
+    band.cache_1h * multiplier,
+  )
+}
+
+export function builtinRate(platform, id, at) {
+  const price = BUILTIN_RATES[platform]?.[id] || null
+  if (platform !== 'openai' || !ULTRAFAST_MODELS.has(id)) return price
+  const multiplier = id.startsWith('gpt-6.2-') && at < ULTRAFAST_PROMOTION_END ? 3 : 6
+  const ultrafast = {
+    ...scaleRates(price, multiplier),
+    tiers: price.tiers.map((tier) => ({ above: tier.above, ...scaleRates(tier, multiplier) })),
+  }
+  return { ...price, modes: { ...price.modes, ultrafast } }
 }

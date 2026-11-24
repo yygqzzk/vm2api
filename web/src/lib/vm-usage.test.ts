@@ -7,6 +7,7 @@ import {
   usageAccountForVm,
   vmTotalCost,
 } from '@/lib/vm-usage'
+import { vmCostLedger } from './vm-usage'
 
 describe('billingRowSlot', () => {
   const byId = new Map<string, Vm>([
@@ -81,5 +82,36 @@ describe('GPT vm-id usage rows are live when the slot has no uuid', () => {
     }
     expect(isLeftoverUsageRow(leftover, claude)).toBe(true)
     expect(usageAccountForVm(claude, [leftover])).toBeNull()
+  })
+})
+
+describe('vm cost ledger labels', () => {
+  it('names an archived account total and a retained-log fallback separately', () => {
+    const archived = vmCostLedger({
+      id: 'vm-1',
+      total_cost: 4,
+      total_tokens: 9,
+      lifetime_usage: { cost: 12, tokens: 30 },
+    } as never)
+    expect(archived[2]).toMatchObject({
+      label: '账号总计',
+      note: '账号总计',
+      cost: 12,
+      tokens: 30,
+    })
+
+    const retained = vmCostLedger(
+      { id: 'vm-2', total_cost: 7, total_tokens: 11 } as never,
+      [{ account_id: 'vm-2', vm_id: 'vm-2', total_cost: 19, total_tokens: 41 }]
+    )
+    expect(retained[2]).toMatchObject({
+      label: '日志合计',
+      note: '保留日志合计',
+      cost: 19,
+      tokens: 41,
+    })
+    // 可见标签本身必须能区分两种口径：`note` 走 `title`，触屏无悬停、
+    // 这两处又是不可聚焦的 `<td>`/`<span>`，不能让它承载唯一的区分。
+    expect(retained[2].label).not.toBe(archived[2].label)
   })
 })

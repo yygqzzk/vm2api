@@ -1,8 +1,8 @@
 /**
- * Claude Code OAuth beta sets, aligned with sub2api claude/constants.go.
+ * Claude Code OAuth beta sets.
  *
  * KIN only overwrites VM identity (device / account / stainless).
- * Protocol betas follow sub2api:
+ * Protocol beta handling:
  *   official + client beta → passthrough (plus oauth if missing, minus 1M by matrix)
  *   official + empty       → DefaultBetaHeader / HaikuBetaHeader
  *   unofficial / mimic     → FullClaudeCodeMimicryBetas (Haiku: HAIKU_BETA_HEADER), never context-1m
@@ -37,6 +37,7 @@ const PER_TURN_MODELS = {
   'claude-opus-5-5': true,
   'claude-fable-5-1': true,
   'claude-fable-5-2': true,
+  'claude-mythos-5-2': true,
 }
 const MID_TOOL_CHANGE_MODELS = {
   'claude-haiku-5-5': true,
@@ -47,6 +48,7 @@ const MID_TOOL_CHANGE_MODELS = {
   'claude-fable-5': true,
   'claude-fable-5-1': true,
   'claude-fable-5-2': true,
+  'claude-mythos-5-2': true,
   'claude-mythos-5-1': true,
 }
 const FAST_MODE_MODELS = {
@@ -61,6 +63,7 @@ const MID_OUTPUT_CONFIG_MODELS = {
   'claude-opus-5-5': true,
   'claude-fable-5-1': true,
   'claude-fable-5-2': true,
+  'claude-mythos-5-2': true,
   'claude-mythos-5-1': true,
 }
 
@@ -239,7 +242,7 @@ export function ensureMimicryBetas(header = '', required = DEFAULT_BETA_HEADER) 
   return have.join(',')
 }
 
-/** sub2api getBetaHeader: official client list must contain oauth-2025-04-20. */
+/** Ensure the official client beta list contains oauth-2025-04-20. */
 export function ensureOauthBeta(header = '') {
   const parts = String(header || '')
     .split(',')

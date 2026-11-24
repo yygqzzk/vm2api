@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -21,12 +22,13 @@ import { publishKvmCragLicense } from './kvm-crag-license.mjs'
 import { publishClusterSubscription } from '../cluster/crag-subscription-files.mjs'
 import { blockKvmCragSubscription, holdKvmCragSubscriptionPublications } from './kvm-crag-subscription.mjs'
 
-const AUTHORITY = 'https://crag.fkcodex.com'
+const AUTHORITY = 'https://www.vm2api.org'
 const HOST_ID_MOUNT = '/run/crag-host-machine-id'
 const SHARED_HOST_ID_FILESYSTEMS = new Set([0x01021997, 0x65735546])
 const localFilesystems = new Set([0xef53, 0x794c7630, 0x58465342, 0x9123683e, 0x2fc12fc1, 0xf2f52010])
 const MAX_DEFERRED_RELEASES = 10000
 const MAX_DEFERRED_RELEASE_BYTES = 4 * 1024 * 1024
+const MAX_REDEEM_INTENT_BYTES = 1024
 const terminalRedeem = new Map([
   ['redeem_unavailable', 404],
   ['host_redeem_conflict', 409],
@@ -43,31 +45,230 @@ const authorityErrors = new Map([
   ['renewal_unavailable', 409],
   ['request_conflict', 409],
   ['payload_key_conflict', 409],
+  // Without this, a retirement refused by the cooldown degrades into
+  // `crag_subscription_authority_unavailable` (502) -- which reads as "result
+  // unconfirmed, retry" and sends the operator retrying something that is
+  // simply not due yet.
+  ['host_transfer_cooldown', 409],
+  // A rejected request shape is final, so it must not read as "result unconfirmed,
+  // retry": without this it degrades to `crag_subscription_authority_unavailable`
+  // (502) and sends the caller retrying something that can never succeed. It is
+  // also what lets a redemption tell "this Authority predates a field we sent"
+  // apart from "the Authority is unreachable".
+  ['invalid_request', 400],
 ])
 const fail = (code = 'crag_subscription_unavailable', status = 503) => Object.assign(new Error(code), { code, status })
+const authorityRequestId = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i
 const uid = () => process.getuid()
 const validVoucher = (code) =>
   typeof code === 'string' &&
   /^CRAGR1\.[A-Za-z0-9_-]{43}$/.test(code) &&
   Buffer.from(code.slice(7), 'base64url').toString('base64url') === code.slice(7)
 const safeTime = (value) => Number.isSafeInteger(value) && value >= 0
+/** Shape of a shop order id, matching the Authority's own CHECK on the column. */
+const validOrderId = (value) => typeof value === 'string' && /^[0-9a-zA-Z_-]{1,64}$/.test(value)
 const isDigest = (value) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)
+
+const HOST_DOMAIN = 'crag-host-v1:'
+const MAC_DOMAIN = 'crag-host-mac-v1:'
+const DMI_DOMAIN = 'crag-host-dmi-v1:'
+const CPU_DOMAIN = 'crag-host-cpu-v1:'
+const NET_DIRECTORY = '/sys/class/net'
+/** The hypervisor's per-instance UUID. Read when no NIC qualifies. */
+const DMI_UUID_FILE = '/sys/class/dmi/id/product_uuid'
+const CPU_INFO_FILE = '/proc/cpuinfo'
+/** Must match the Authority's own cap; unsigned detail must not grow unbounded. */
+const MAX_QUOTA_GRANTS = 256
+
+/** The 32 hex digits a host id has always been derived from are exactly a
+ * UUID's payload, so the identity this service already computes can be shown to
+ * the operator and typed back in without inventing a second identifier -- and
+ * without touching the wire format, which stays a 64 hex host id. */
+const formatDeviceUuid = (raw) =>
+  `${raw.slice(0, 8)}-${raw.slice(8, 12)}-${raw.slice(12, 16)}-${raw.slice(16, 20)}-${raw.slice(20)}`
+
+const hostIdFromRaw = (raw) => createHash('sha256').update(`${HOST_DOMAIN}${raw}`).digest('hex')
+
+/** Accepts what a person would actually paste: any case, dashes or not. */
+function normalizeDeviceUuid(input) {
+  if (typeof input !== 'string') return null
+  const raw = input.trim().toLowerCase().replaceAll('-', '')
+  if (!/^[a-f0-9]{32}$/.test(raw) || /^(0{32}|f{32})$/.test(raw)) return null
+  return formatDeviceUuid(raw)
+}
+
+/** The one path from a device UUID to the identity the protocol speaks. */
+function uuidToHostId(uuid) {
+  const normalized = normalizeDeviceUuid(uuid)
+  return normalized && hostIdFromRaw(normalized.replaceAll('-', ''))
+}
+
+/** A MAC is a worse identifier than a machine-id in one respect -- replacing a
+ * NIC changes it -- but better in the one that actually bites: it is unique.
+ * Cloud images routinely ship without resetting `/etc/machine-id`, so every
+ * instance cloned from such an image derives the same host id, and the second
+ * one to register is refused with 403 for the rest of its life. A hypervisor
+ * hands each instance its own MAC. The instability costs nothing here because
+ * hardware is only ever sampled when no identity has been stored yet.
+ */
+function macDeviceRaw(netDirectory) {
+  let names
+  try {
+    names = fs.readdirSync(netDirectory)
+  } catch {
+    return null
+  }
+  let best
+  for (const name of names) {
+    const base = path.join(netDirectory, name)
+    try {
+      // Virtual interfaces -- lo, docker0, veth*, bridges, tap* -- have no
+      // backing device. Matching on names instead would misfire the moment a
+      // container renames a physical interface.
+      if (!fs.existsSync(path.join(base, 'device'))) continue
+      // Anything other than a permanent address (randomized, locally assigned,
+      // or copied from another interface) is not an identity.
+      if (fs.readFileSync(path.join(base, 'addr_assign_type'), 'utf8').trim() !== '0') continue
+      const mac = fs.readFileSync(path.join(base, 'address'), 'utf8').trim().toLowerCase()
+      if (!/^([a-f0-9]{2}:){5}[a-f0-9]{2}$/.test(mac) || mac === '00:00:00:00:00:00') continue
+      // Only the multicast bit disqualifies an address, because a multicast
+      // address is not an interface's own. The locally administered bit must not:
+      // hypervisors set it as a matter of course (QEMU's 52:54:00 prefix has it),
+      // so rejecting it would discard the NIC on most virtual machines -- exactly
+      // the hosts this is meant to identify. Whether an address is permanent is
+      // already settled authoritatively by `addr_assign_type` above.
+      if (Number.parseInt(mac.slice(0, 2), 16) & 0b1) continue
+      // Lowest address wins. Kernel enumeration order and interface naming both
+      // shift between boots, so neither of them may decide who this machine is.
+      if (best === undefined || mac < best) best = mac
+    } catch {
+      continue
+    }
+  }
+  if (best === undefined) return null
+  // Hash rather than pad out to 32 digits: the operator copies this value into
+  // support tickets and migration forms, so the hardware address should not
+  // travel with it. The separate domain also keeps MAC-derived values from ever
+  // colliding with machine-id-derived ones.
+  return createHash('sha256').update(`${MAC_DOMAIN}${best}`).digest('hex').slice(0, 32)
+}
+/** The hypervisor's own per-instance identifier, for hosts where no NIC
+ * qualifies -- a container with only virtual interfaces, or a guest whose
+ * addresses are all locally assigned. SMBIOS carries a UUID that the platform
+ * generates per instance, which is what makes it a usable stand-in for the MAC.
+ * It is not a hash of anything the operator pastes around, so it goes through
+ * the same domain-separated digest as the MAC does.
+ */
+function dmiDeviceRaw(file = DMI_UUID_FILE) {
+  let raw
+  try {
+    raw = fs.readFileSync(file, 'utf8').trim().toLowerCase()
+  } catch {
+    return null
+  }
+  if (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(raw)) return null
+  const flat = raw.replaceAll('-', '')
+  // Some boards ship a placeholder rather than leaving the field absent.
+  if (/^(0{32}|f{32})$/.test(flat)) return null
+  return createHash('sha256').update(`${DMI_DOMAIN}${flat}`).digest('hex').slice(0, 32)
+}
+
+/** Last resort, and a weak one: CPU details are identical across every instance
+ * of the same machine type, so this cannot tell two cloned guests apart. It is
+ * here only so that a host with neither a qualifying NIC nor an SMBIOS UUID gets
+ * *an* identity instead of being refused outright -- a host that reaches this
+ * source and collides is no worse off than it was before, since without it the
+ * request fails anyway. Only the fields that survive a reboot are read: model,
+ * physical topology and count, never the live frequency.
+ */
+function cpuDeviceRaw(file = CPU_INFO_FILE) {
+  let text
+  try {
+    text = fs.readFileSync(file, 'utf8')
+  } catch {
+    return null
+  }
+  const stable = []
+  let processors = 0
+  for (const line of text.split('\n')) {
+    const [rawKey, ...rest] = line.split(':')
+    const key = rawKey.trim().toLowerCase()
+    const value = rest.join(':').trim()
+    if (key === 'processor') {
+      processors += 1
+      continue
+    }
+    if (!value) continue
+    if (key === 'model name' || key === 'vendor_id' || key === 'physical id' || key === 'cpu cores')
+      stable.push(`${key}=${value}`)
+  }
+  if (!stable.length || !processors) return null
+  const unique = [...new Set(stable)].sort()
+  return createHash('sha256')
+    .update(`${CPU_DOMAIN}${processors}\n${unique.join('\n')}`)
+    .digest('hex')
+    .slice(0, 32)
+}
+
 const validSku = (value) => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(value)
 const validMonths = (value) => Number.isSafeInteger(value) && value >= 1 && value <= 4294967295
 const invalidRights = () => fail('crag_subscription_invalid_entitlement', 502)
 const hostPackageUnready = () => fail('crag_subscription_host_package_unready', 409)
+const hostPackageChanged = () => fail('crag_subscription_host_package_changed', 409)
 const hostIdentityUnavailable = () => fail('crag_subscription_host_identity_unavailable')
 const hostIdentityChanged = () => fail('crag_subscription_host_identity_changed', 409)
-const usageUnverified = () =>
-  cragLicenseDeniedResult({
+const USAGE_UNVERIFIED_MESSAGE = '暂时无法核对宿主机 CRAG 运行额度，请刷新订阅或确认槽位状态后重试。'
+/**
+ * A denial while the host rights are being changed is transient, not a verdict on
+ * the credential: `retryable` lets a fronting gateway retry or pick another slot
+ * instead of reading it as an authorization failure.
+ */
+const usageUnverified = ({ retryable = false, retryAfterSeconds = 0 } = {}) => {
+  const denial = cragLicenseDeniedResult({
     code: 'license_crag_host_usage_unverified',
-    error: '暂时无法核对宿主机 CRAG 运行额度，请刷新订阅或确认槽位状态后重试。',
+    error: USAGE_UNVERIFIED_MESSAGE,
   })
+  if (!retryable) return denial
+  denial.body.error.details = { ...denial.body.error.details, retryable: true }
+  if (retryAfterSeconds > 0) denial.retryAfterSec = retryAfterSeconds
+  return denial
+}
 const overQuota = () =>
   cragLicenseDeniedResult({
     code: 'license_crag_host_over_quota',
     error: '宿主订阅的运行槽位已满，无法启动此 CRAG 槽位。请释放运行名额或增加订阅额度。',
   })
+
+/** `admitOnce` hit an in-flight exclusive operation; only the caller decides whether to wait. */
+const EXCLUSIVE_BUSY = Symbol('crag_exclusive_busy')
+const MAX_EXCLUSIVE_WAIT_MS = 15_000
+
+/**
+ * Cap the wait by the request's own slot budget so admission never outlives it.
+ * `hopSlotWaitDeadline` yields "now" when no slot wait is configured, which would
+ * leave those deployments with no wait at all, so an absent or spent budget still
+ * gets the ceiling rather than zero.
+ */
+function exclusiveWaitBudgetMs(slotWaitDeadlineMs) {
+  if (!Number.isFinite(slotWaitDeadlineMs)) return MAX_EXCLUSIVE_WAIT_MS
+  const remaining = slotWaitDeadlineMs - Date.now()
+  return remaining > 0 ? Math.min(MAX_EXCLUSIVE_WAIT_MS, remaining) : MAX_EXCLUSIVE_WAIT_MS
+}
+
+/** Resolves true if the operation finished in time. Never holds a lock, never polls. */
+function settledWithin(pending, budgetMs) {
+  if (!pending?.done) return Promise.resolve(true)
+  if (!(budgetMs > 0)) return Promise.resolve(false)
+  let timer
+  return Promise.race([
+    pending.done.then(() => true),
+    // Not unref'd on purpose: an unref'd timer never fires once the loop has
+    // nothing else to do, which would leave this await pending forever.
+    new Promise((resolve) => {
+      timer = setTimeout(() => resolve(false), budgetMs)
+    }),
+  ]).finally(() => clearTimeout(timer))
+}
 
 function runtimeDenial(denial) {
   const { code, message } = denial.body.error
@@ -116,7 +317,53 @@ function projection(data, claims) {
     result.available_slots = available
   }
   if (Object.hasOwn(data, 'reclaim_supported') && data.reclaim_supported !== reclaim) throw invalidRights()
+  if (Object.hasOwn(data, 'quota_grants')) result.quota_grants = quotaGrants(data.quota_grants, claims)
   return result
+}
+
+/** Per-voucher windows behind the signed aggregate, for display only.
+ *
+ * The entitlement signs `revision`, `expires_at` and `slot_limit` -- nothing
+ * else -- so this detail arrives unsigned and cannot be taken on trust: a wrong
+ * one would have the panel state a confident, false expiry date. What makes it
+ * usable is that the Authority derives it in the same transaction, from the same
+ * `now`, as the aggregate it explains, so it must reconcile exactly. Anything
+ * that does not is rejected like any other malformed rights payload.
+ *
+ * It never participates in admission; `slot_limit` is still enforced solely
+ * against the signed aggregate.
+ */
+function quotaGrants(grants, claims) {
+  if (!Array.isArray(grants) || !grants.length || grants.length > MAX_QUOTA_GRANTS) throw invalidRights()
+  let total = 0
+  let unlimited = false
+  let soonest = Infinity
+  const clean = grants.map((grant) => {
+    if (!safeTime(grant.expires_at) || grant.expires_at < 1) throw invalidRights()
+    soonest = Math.min(soonest, grant.expires_at)
+    if (Object.hasOwn(grant, 'slot_limit')) {
+      if (!safeTime(grant.slot_limit) || grant.slot_limit < 1 || grant.slot_limit > 4294967295) throw invalidRights()
+      total += grant.slot_limit
+    } else {
+      unlimited = true
+    }
+    if (Object.hasOwn(grant, 'code_id') && (typeof grant.code_id !== 'string' || grant.code_id.length > 64))
+      throw invalidRights()
+    // Rebuilt rather than passed through, so only fields that were checked here
+    // can reach the panel.
+    return {
+      ...(Object.hasOwn(grant, 'code_id') && { code_id: grant.code_id }),
+      expires_at: grant.expires_at,
+      ...(Object.hasOwn(grant, 'slot_limit') && { slot_limit: grant.slot_limit }),
+    }
+  })
+  // Seats are the sum of the active windows, and one unlimited window makes the
+  // whole subscription unlimited.
+  if (claims.slot_limit === 'unlimited' ? !unlimited : unlimited || total !== claims.slot_limit) throw invalidRights()
+  // The signed window ends at the window that lapses first: after that the total
+  // drops, so the entitlement has to be re-signed rather than outlive it.
+  if (soonest !== claims.expires_at) throw invalidRights()
+  return clean
 }
 
 function availableSeats(claims, rights, active) {
@@ -233,6 +480,44 @@ function hostEnrollmentIdentity(projectRoot, digest) {
   return standardEnrollment(projectRoot, cragTargetIds(projectRoot, undefined), true)
 }
 
+function pinnedIntentKind(intent) {
+  const invalid = () => fail('crag_subscription_recovery_unverified', 409)
+  if (!intent || typeof intent !== 'object' || Array.isArray(intent)) throw invalid()
+  if (!isDigest(intent.host_id) || !validVoucher(intent.redemption_code) || !isDigest(intent.host_package_sha256))
+    throw invalid()
+  // `shop_order_id` records which order bought this voucher so the Authority can
+  // later move it by that id. It is deliberately not named `order_id`: that key
+  // already carries control flow -- `recover()` treats an intent holding it as one
+  // that may only resume through the shop, so reusing it here made recovery return
+  // without doing anything and left the order stuck at ready_to_apply.
+  if (Object.hasOwn(intent, 'shop_order_id') && !validOrderId(intent.shop_order_id)) throw invalid()
+  const keys = Object.keys(intent)
+    .filter((key) => key !== 'shop_order_id')
+    .sort()
+    .join(',')
+  if (keys === 'host_id,host_package_sha256,redemption_code') return 'legacy'
+  if (keys !== 'enrollment,host_id,host_package_sha256,issuer_public_key_id,redemption_code') throw invalid()
+  const selectors = intent.enrollment
+  if (!selectors || typeof selectors !== 'object' || Array.isArray(selectors) || !isDigest(intent.issuer_public_key_id))
+    throw invalid()
+  const selectorKeys = Object.keys(selectors).sort().join(',')
+  if (
+    selectorKeys !== '' &&
+    (selectorKeys !== 'issuer_public_key_id,payload_key_id' ||
+      selectors.issuer_public_key_id !== intent.issuer_public_key_id ||
+      !isDigest(selectors.payload_key_id))
+  )
+    throw invalid()
+  return 'recorded'
+}
+
+function recordedEnrollment(projectRoot, intent) {
+  if (pinnedIntentKind(intent) !== 'recorded') throw fail('crag_subscription_recovery_unverified', 409)
+  if (cragTargetIds(projectRoot, undefined).issuerId !== intent.issuer_public_key_id)
+    throw fail('crag_subscription_recovery_unverified', 409)
+  return intent.enrollment
+}
+
 function sync(dir) {
   const handle = fs.openSync(dir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW)
   try {
@@ -305,6 +590,9 @@ export function createCragSubscription({
   fetchImpl = globalThis.fetch,
   origin = AUTHORITY,
   machineIdFile = process.env.KIN_CRAG_HOST_ID_FILE,
+  netDirectory = NET_DIRECTORY,
+  dmiUuidFile = DMI_UUID_FILE,
+  cpuInfoFile = CPU_INFO_FILE,
 } = {}) {
   if (origin !== AUTHORITY && !/^http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}$/.test(origin)) throw fail()
   const publicDir = cragSubscriptionPublicDirectory(projectRoot)
@@ -312,53 +600,233 @@ export function createCragSubscription({
   const dataDir = path.dirname(base)
   const privateDir = path.join(base, 'private')
   const hostFile = path.join(publicDir, 'host_id')
+  const uuidFile = path.join(publicDir, 'device_uuid')
   const keyFile = path.join(privateDir, 'credential')
   const entitlementFile = path.join(publicDir, 'entitlement.code')
   const intentFile = path.join(privateDir, 'redeem.json')
   const rosterIntentFile = path.join(privateDir, 'roster.json')
   const deferredReleaseFile = path.join(privateDir, 'deleted-slots.json')
   const marker = path.join(publicDir, 'sync-pending')
-  let busy = false
+  /** Every file that belongs to one identity, so retiring or restoring moves them
+   * as a set. The first five are load-bearing for authentication; the rest is
+   * bookkeeping. Order matters -- `retireIdentity` slices on it. */
+  const IDENTITY_FILES = [
+    hostFile,
+    keyFile,
+    uuidFile,
+    entitlementFile,
+    intentFile,
+    rosterIntentFile,
+    deferredReleaseFile,
+    marker,
+  ]
+  /** null = idle. Otherwise the in-flight exclusive operation: `done` settles once
+   * its guest re-delivery finished, so a waiter that wakes on it sees a settled host. */
+  let exclusiveState = null
+  /** Set inside an exclusive work body. A nested admission must not wait on the
+   * operation it is itself running under. */
+  const exclusiveScope = new AsyncLocalStorage()
   const runtimeReservations = new Set()
   let admissionWaiters = 0
   let admissionQueue = Promise.resolve()
   let expiryProbe
   let lastExpiryProbe
 
-  function identity() {
+  function machineIdRaw(file, native) {
+    let raw
+    try {
+      const resolved = native ? fs.realpathSync(file) : file
+      if (native) checkParents(path.dirname(resolved))
+      raw = load(resolved, null, 64, machineIdFile ? null : 0)
+        ?.trim()
+        .toLowerCase()
+    } catch {
+      return null
+    }
+    if (/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(raw || '')) raw = raw.replaceAll('-', '')
+    if (!/^[a-f0-9]{32}$/.test(raw || '') || /^(0{32}|f{32})$/.test(raw)) return null
+    return raw
+  }
+
+  /** Where this machine's identity can be sampled from, best first.
+   *
+   * Uniqueness decides the order, because a source that repeats across cloned
+   * guests hands the second one to register a permanent 403. The MAC and the
+   * SMBIOS UUID are both per-instance, so they come first; `machine-id` ships
+   * unreset in cloud images and is exactly what collided, so it ranks below
+   * them rather than above. The CPU digest is last and is not unique at all --
+   * see `cpuDeviceRaw` -- it only keeps a host that has none of the others from
+   * being refused outright. */
+  function* candidateRaws() {
+    if (machineIdFile) {
+      for (const file of [machineIdFile].flat()) yield ['override', machineIdRaw(file, false)]
+      return
+    }
+    yield ['mac', macDeviceRaw(netDirectory)]
+    yield ['dmi', dmiDeviceRaw(dmiUuidFile)]
+    if (!fs.existsSync(HOST_ID_MOUNT) && !isContainerized()) {
+      for (const file of ['/etc/machine-id', '/var/lib/dbus/machine-id']) yield ['machine-id', machineIdRaw(file, true)]
+    } else {
+      yield ['mount', machineIdRaw(HOST_ID_MOUNT, false)]
+    }
+    yield ['cpu', cpuDeviceRaw(cpuInfoFile)]
+  }
+
+  /** Undo a v1.4.186 retirement.
+   *
+   * That version treated the sampled hardware as the only truth and moved a
+   * stored identity aside the moment it stopped matching. On hosts whose sampled
+   * value had drifted this replaced a working identity with one the Authority had
+   * never seen, so `status` answered 404, no rights came back, and every slot
+   * admission failed with `license_crag_host_usage_unverified`. Four hosts were
+   * hit before it was caught.
+   *
+   * The retired files are the ones that hold the subscription, so they are moved
+   * back and the short-lived replacement is discarded. Doing it here means an
+   * affected host repairs itself on its next admission with no operator step.
+   * Restoring unconditionally is safe for exactly one reason: a replacement
+   * identity could never have redeemed anything, because the Authority had no
+   * record of it -- which is the very symptom.
+   *
+   * Only the `.legacy` suffix is reclaimed, and that is load-bearing: an explicit
+   * `rebuildDeviceIdentity` retires to `.retired` and clears any `.legacy` first,
+   * so a deliberate rebuild is never undone by this.
+   */
+  function restoreRetiredIdentity() {
+    if (!fs.existsSync(`${hostFile}.legacy`)) return
+    for (const file of IDENTITY_FILES) {
+      try {
+        if (!fs.existsSync(`${file}.legacy`)) continue
+        fs.rmSync(file, { force: true })
+        fs.renameSync(`${file}.legacy`, file)
+      } catch {
+        // `host_id` and `credential` decide whether this host can authenticate at
+        // all, so failing on those is worth reporting; the rest is bookkeeping.
+        if (file === hostFile || file === keyFile) throw fail('crag_subscription_storage_unavailable')
+      }
+    }
+  }
+
+  /** The stored readable form, if it is there and really does derive `hostId`.
+   * The host id stays the single authority: a `device_uuid` that does not
+   * derive it was tampered with or belongs to another install. */
+  function readStoredUuid(hostId) {
+    let stored
+    try {
+      stored = load(uuidFile, 0o644, 36)
+    } catch {
+      return null
+    }
+    return stored && normalizeDeviceUuid(stored) === stored && uuidToHostId(stored) === hostId ? stored : null
+  }
+
+  /** Recover the readable form for an install that predates `device_uuid`, and
+   * write it out once. Returns null when it cannot be reconstructed. */
+  function backfillUuid(hostId, sources) {
+    for (const [, raw] of sources) {
+      if (hostIdFromRaw(raw) !== hostId) continue
+      const uuid = formatDeviceUuid(raw)
+      try {
+        publish(uuidFile, uuid, 0o644)
+      } catch {
+        // Being able to display the identity is not worth failing a request over.
+      }
+      return uuid
+    }
+    // A machine whose machine-id has since changed cannot have its UUID
+    // reconstructed -- sha256 does not run backwards. Reporting null is honest.
+    return null
+  }
+
+  /** Resolves this machine's identity as `{ hostId, uuid, source }`.
+   *
+   * A stored identity wins, and is returned with no value comparison. The host
+   * has already paid against it, so a regenerated machine-id, a rebuilt container
+   * or a swapped NIC must not turn it into a stranger -- v1.4.186 let exactly
+   * that happen and knocked paid hosts offline.
+   *
+   * Collisions are still addressed, but where it costs nothing: `candidateRaws`
+   * is ordered by uniqueness, so a *first* install derives from the MAC or the
+   * SMBIOS UUID rather than the `machine-id` that cloned images share. A host
+   * that has already collided is repaired by `rebuildDeviceIdentity`, which has
+   * to say why -- not by every identity drifting on its own.
+   *
+   * Sources are still required to be sound: one that is missing or replaced by
+   * something unsafe is a different matter from one whose value changed, and only
+   * the latter is tolerated. Sampling stays lazy -- this runs on slot-start
+   * admission, so the settled path stops at the first sound source.
+   */
+  function deviceIdentity() {
     if (process.platform !== 'linux') throw hostIdentityUnavailable()
-    const native = !machineIdFile && !fs.existsSync(HOST_ID_MOUNT) && !isContainerized()
-    const files = machineIdFile
-      ? [machineIdFile].flat()
-      : native
-        ? ['/etc/machine-id', '/var/lib/dbus/machine-id']
-        : [HOST_ID_MOUNT]
     let saved
     try {
       storage()
+      restoreRetiredIdentity()
       saved = load(hostFile, 0o644, 64)
     } catch {
       throw fail('crag_subscription_storage_unavailable')
     }
-    let changed = false
-    for (const file of files) {
-      let raw
-      try {
-        const resolved = native ? fs.realpathSync(file) : file
-        if (native) checkParents(path.dirname(resolved))
-        raw = load(resolved, null, 64, machineIdFile ? null : 0)
-          ?.trim()
-          .toLowerCase()
-      } catch {
-        continue
+    if (saved) {
+      const stored = readStoredUuid(saved)
+      if (stored) {
+        for (const [, raw] of candidateRaws()) {
+          if (raw) return { hostId: saved, uuid: stored, source: 'saved' }
+        }
+        throw hostIdentityUnavailable()
       }
-      if (/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(raw || '')) raw = raw.replaceAll('-', '')
-      if (!/^[a-f0-9]{32}$/.test(raw || '') || /^(0{32}|f{32})$/.test(raw)) continue
-      const hostId = createHash('sha256').update(`crag-host-v1:${raw}`).digest('hex')
-      if (saved == null || saved === hostId) return hostId
-      changed = true
+      const sources = [...candidateRaws()].filter(([, raw]) => raw)
+      if (!sources.length) throw hostIdentityUnavailable()
+      return { hostId: saved, uuid: backfillUuid(saved, sources), source: 'saved' }
     }
-    throw changed ? hostIdentityChanged() : hostIdentityUnavailable()
+    const sources = [...candidateRaws()].filter(([, raw]) => raw)
+    if (!sources.length) throw hostIdentityUnavailable()
+    const [source, raw] = sources[0]
+    return { hostId: hostIdFromRaw(raw), uuid: formatDeviceUuid(raw), source }
+  }
+
+  function identity() {
+    return deviceIdentity().hostId
+  }
+
+  /** Discard the stored identity and re-derive it from the NIC.
+   *
+   * Reserved for the credential-recovery flow, once recovery has been refused
+   * and this host id is judged to be shared with another machine -- without
+   * this, such a machine is stuck for good: its stored host id answers 403
+   * forever, recovery must keep refusing it, and "a stored identity is
+   * permanent" would otherwise mean permanently broken. Doing it on the ordinary
+   * path instead would make every identity drift by itself, which is the exact
+   * guarantee `deviceIdentity` exists to provide. */
+  function rebuildDeviceIdentity({ reason } = {}) {
+    if (!reason) throw fail()
+    storage()
+    // Same order as the ordinary path, so a rebuild cannot land on a source the
+    // ordinary path would have rejected -- and so a host with no qualifying NIC
+    // can still be rebuilt, which a MAC-only rebuild could not do.
+    let picked
+    for (const [source, raw] of candidateRaws()) {
+      if (!raw) continue
+      picked = [source, raw]
+      break
+    }
+    if (!picked) throw hostIdentityUnavailable()
+    const [source, raw] = picked
+    const uuid = formatDeviceUuid(raw)
+    const hostId = hostIdFromRaw(raw)
+    // Retire the old identity rather than overwrite two of its files: leaving
+    // `credential`, `entitlement.code` or `redeem.json` behind would hand the
+    // rebuilt id the previous one's rights and half-finished redemption. This is
+    // where retiring belongs -- an explicit, reasoned call -- and not on the
+    // ordinary path, where v1.4.186 put it and knocked paid hosts offline.
+    //
+    // Any `.legacy` set is dropped first. It would otherwise be reclaimed by
+    // `restoreRetiredIdentity` on the next admission and silently undo this
+    // rebuild -- which is exactly what a host that collided must not have happen.
+    for (const file of IDENTITY_FILES) fs.rmSync(`${file}.legacy`, { force: true })
+    retireIdentity()
+    publish(hostFile, hostId, 0o644)
+    publish(uuidFile, uuid, 0o644)
+    return { hostId, uuid, source }
   }
 
   function storage(create = false) {
@@ -402,15 +870,53 @@ export function createCragSubscription({
     return { code, claims: verifyCragHostEntitlement(projectRoot, code, hostId, { allowExpired: true, vm }) }
   }
 
+  /** Retire a stored identity so a freshly derived one can take over.
+   *
+   * Every file that belongs to the old identity moves aside together: leaving
+   * `entitlement.code` or `redeem.json` behind would hand the new host id the
+   * previous one's rights and half-finished redemption.
+   *
+   * The suffix decides whether the move can be undone. `restoreRetiredIdentity`
+   * reclaims `.legacy` and nothing else, so a deliberate rebuild retires to
+   * `.retired` and is never walked back, while v1.4.186's automatic retirement
+   * -- which took paid hosts offline -- is.
+   *
+   * The first group is load-bearing and a failure there aborts the retirement: a
+   * half-retired identity is worse than either end state, because `credential()`
+   * would then mint a second key for a host that still holds the first. The
+   * second group is bookkeeping, and losing it is not worth failing a request.
+   */
+  function retireIdentity(suffix = '.retired') {
+    for (const file of IDENTITY_FILES.slice(0, 5)) {
+      try {
+        fs.renameSync(file, `${file}${suffix}`)
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw fail('crag_subscription_storage_unavailable')
+      }
+    }
+    for (const file of IDENTITY_FILES.slice(5)) {
+      try {
+        fs.renameSync(file, `${file}${suffix}`)
+      } catch {
+        // Bookkeeping only; the identity has already moved.
+      }
+    }
+  }
+
   function credential(hostId, initialize = false) {
     const prior = load(hostFile, 0o644, 64)
+    // A stored identity is authoritative again. v1.4.186 retired it here when it
+    // stopped matching the sampled hardware, which is what took paid hosts
+    // offline: the replacement identity was unknown to the Authority, so no
+    // rights came back at all. Refusing is the safe answer -- the caller is
+    // asking for a credential under an id this host is not bound to.
     if (prior != null && prior !== hostId) throw fail()
     let key = load(keyFile, 0o600, 43)
     if (!key) {
       if (
         !initialize ||
         prior ||
-        load(intentFile, 0o600, 512) ||
+        load(intentFile, 0o600, MAX_REDEEM_INTENT_BYTES) ||
         load(entitlementFile, 0o644, 8192) ||
         load(marker, 0o644, 32)
       )
@@ -467,15 +973,17 @@ export function createCragSubscription({
   }
 
   function readLocalRights() {
-    const hostId = identity()
+    // One resolution yields all three: the identity is resolved here anyway, so
+    // carrying the displayable form and its source along costs nothing.
+    const { hostId, uuid, source } = deviceIdentity()
     const previous = current(hostId)
     const pending =
       load(marker, 0o644, 32) != null ||
-      load(intentFile, 0o600, 512) != null ||
+      load(intentFile, 0o600, MAX_REDEEM_INTENT_BYTES) != null ||
       load(rosterIntentFile, 0o600, 1024) != null
     const claims = previous?.claims ?? null
     if (claims && (!safeTime(claims.expires_at) || !safeTime(claims.revision))) throw fail()
-    return { hostId, claims, pending, previous }
+    return { hostId, uuid, source, claims, pending, previous }
   }
 
   function unchangedRights(before, after) {
@@ -490,7 +998,8 @@ export function createCragSubscription({
     if (!previous || previous.claims.expires_at * 1000 > Date.now()) return previous
     const remote = await authority('status', hostId, credential(hostId))
     const confirmed = verifyRights(hostId, remote, previous)
-    if (background && (busy || !unchangedRights({ hostId, pending: false, previous }, readLocalRights()))) return
+    if (background && (exclusiveState || !unchangedRights({ hostId, pending: false, previous }, readLocalRights())))
+      return
     if (confirmed.code === previous.code) return confirmed
     if (current(hostId)?.code !== previous.code) throw invalidRights()
     checkNoIntent()
@@ -500,7 +1009,7 @@ export function createCragSubscription({
 
   async function refreshExpiredEntitlement() {
     if (expiryProbe) return expiryProbe
-    if (busy || !fs.existsSync(entitlementFile)) return
+    if (exclusiveState || !fs.existsSync(entitlementFile)) return
     const { hostId, claims, pending, previous } = readLocalRights()
     const now = Date.now()
     if (pending || !claims || claims.expires_at * 1000 > now) return
@@ -616,7 +1125,7 @@ export function createCragSubscription({
       })
   }
 
-  async function admitInference({ vm, routing, health } = {}) {
+  async function admitOnce({ vm, routing, health } = {}) {
     if (!vm?.id) return null
     const liveCrag = health?.runtime_variant === 'crag-v2' || (!health?.runtime_variant && health?.dataplane === 'crag')
     if (!liveCrag && resolveKernelDataplane(vm, routing) !== 'crag') return null
@@ -635,7 +1144,8 @@ export function createCragSubscription({
         return null
       }
       const rights = readLocalRights()
-      if (!rights.claims || (localKvm && busy)) return usageUnverified()
+      if (!rights.claims) return usageUnverified()
+      if (localKvm && exclusiveState) return EXCLUSIVE_BUSY
       const { license } = getCragLicense(projectRoot, vm)
       if (!license.valid) {
         if (localKvm) {
@@ -678,10 +1188,32 @@ export function createCragSubscription({
     return usageUnverified()
   }
 
+  /**
+   * Any roster change republishes the single host entitlement every slot's grant
+   * is derived from, so an in-flight exclusive operation cannot be narrowed to the
+   * slot it names. Rather than deny every local KVM slot for the whole operation
+   * (#1307: 27 slots, ~25 minutes of rolling 403s during a per-slot migration),
+   * wait for it to finish and re-run the same checks against the settled host.
+   */
+  async function admitInference({ vm, routing, health, slotWaitDeadlineMs } = {}) {
+    const first = await admitOnce({ vm, routing, health })
+    if (first !== EXCLUSIVE_BUSY) return first
+    // Running inside the work body itself: waiting here would wait on us.
+    if (exclusiveScope.getStore()) return usageUnverified()
+    const pending = exclusiveState
+    const budgetMs = exclusiveWaitBudgetMs(slotWaitDeadlineMs)
+    const retryable = { retryable: true, retryAfterSeconds: Math.max(1, Math.ceil(budgetMs / 1000)) }
+    if (!(await settledWithin(pending, budgetMs))) return usageUnverified(retryable)
+    // One retry only: back-to-back operations must not chain a request forever.
+    const second = await admitOnce({ vm, routing, health })
+    return second === EXCLUSIVE_BUSY ? usageUnverified(retryable) : second
+  }
+
   async function status(confirmed, mayRetry = true) {
     let targets
     let inventory = {}
     let target_probe_failed = false
+    let credential_recovery
     try {
       targets = await listTargets()
       if (isLocalCragSlot) {
@@ -703,8 +1235,16 @@ export function createCragSubscription({
     }
     try {
       const local = readLocalRights()
-      const { hostId, claims, pending, previous } = local
+      const { hostId, uuid, source, claims, pending, previous } = local
       const reclaim_pending_count = readDeferredReleases(hostId).filter((entry) => entry.proven).length
+      try {
+        await ensureCredential(hostId)
+      } catch (error) {
+        // A lost credential that cannot be re-established is reported through
+        // the local check below, which is the one that decides what the panel
+        // shows. Recovery is an attempt to avoid that, not a new failure mode.
+        if (error.recovery && error.recovery !== 'unavailable') credential_recovery = error.recovery
+      }
       if (load(hostFile, 0o644, 64)) credential(hostId)
       const needsRefresh = claims && claims.expires_at * 1000 <= Date.now()
       if (needsRefresh && !pending && !confirmed && mayRetry) {
@@ -717,14 +1257,20 @@ export function createCragSubscription({
       }
       let rights = claims ? { reclaim_supported: claims.version === 2 } : {}
       if (claims && !pending) {
-        if (confirmed?.code === previous.code) {
+        if (confirmed?.code === previous.code && confirmed.rights) {
           rights = confirmed.rights
         } else if (!needsRefresh) {
           try {
             const remote = await authority('status', hostId, credential(hostId))
             if (remote.entitlement === previous.code) rights = projection(remote, claims)
-          } catch {
+          } catch (error) {
             // Signed local rights still apply during an Authority outage. Do not guess remote metadata.
+            // A refused credential recovery is not an outage though: it is a
+            // durable fault only the operator can clear -- most often this host
+            // id being shared with another machine. Surfacing it here is the
+            // difference between "the panel looks normal until a redemption
+            // mysteriously fails" and being told what to fix.
+            if (error.recovery && error.recovery !== 'unavailable') credential_recovery = error.recovery
           }
         }
       }
@@ -750,7 +1296,13 @@ export function createCragSubscription({
       if (runtime === null && mayRetry) return status(confirmed, false)
       return {
         ready: targetReady,
+        // The identity itself, so the panel can show what to quote in a support
+        // request and which source it came from. `uuid` is null on an install
+        // whose original source is gone (see `storedUuid`).
+        ...(uuid && { device_uuid: uuid }),
+        identity_source: source,
         ...(target_probe_failed && { target_probe_failed }),
+        ...(credential_recovery && { credential_recovery }),
         state: pending ? 'sync_pending' : claims ? (expired ? 'expired' : 'active') : 'unredeemed',
         ...(claims && { slot_limit: claims.slot_limit, expires_at: claims.expires_at, revision: claims.revision }),
         ...rights,
@@ -764,9 +1316,28 @@ export function createCragSubscription({
         ...runtime,
       }
     } catch {
+      // Report this machine's identity even when nothing above succeeded. It is
+      // derived from local files and never needs the Authority, so withholding it
+      // here only hides it from the hosts that need it most: the panel drops the
+      // whole device-identity block -- and with it the only migration entry --
+      // whenever `device_uuid` is missing, and a host whose credential the
+      // Authority rejects lands in this branch on every single refresh. That is
+      // exactly the host whose way back in is to claim by order id.
+      //
+      // Re-read rather than hoisted out of the `try`: the read itself can throw,
+      // and hoisting it would take the whole status response down with it instead
+      // of degrading to the shape this returned before.
+      let identity
+      try {
+        identity = deviceIdentity()
+      } catch {
+        identity = undefined
+      }
       return {
         ready: false,
         state: 'unavailable',
+        ...(identity?.uuid && { device_uuid: identity.uuid }),
+        ...(identity && { identity_source: identity.source }),
         available_seats: null,
         ...(target_probe_failed && { target_probe_failed }),
         ...inventory,
@@ -776,7 +1347,52 @@ export function createCragSubscription({
     }
   }
 
-  async function authority(action, hostId, key, extra) {
+  /** One recovery is shared by every caller that races into the same 403.
+   * Each one replacing the credential in turn would invalidate the one before
+   * it, so concurrent attempts would take turns locking each other out. */
+  let credentialRecovery = null
+
+  /** The Authority knows this host but rejected our credential -- the usual
+   * cause is a rebuilt data directory that lost `<private>/credential`.
+   *
+   * The stored entitlement is what proves ownership in its place: the Authority
+   * signed it itself and bound it to this host id, so presenting it is enough
+   * to have the credential replaced without touching a single right. Returns
+   * the replacement, or null when this machine has nothing to prove ownership
+   * with (it never activated successfully, so this is not a recovery case). */
+  async function recoverCredential(hostId) {
+    credentialRecovery ??= (async () => {
+      const entitlement = load(entitlementFile, 0o644, MAX_CRAG_HOST_ENTITLEMENT_BYTES)
+      if (!entitlement) return null
+      const replacement = randomBytes(32).toString('base64url')
+      // Only persist once the Authority accepted it: writing first would leave
+      // a credential the Authority never saw. Either order self-heals, since
+      // recovery does not depend on the local credential, but this one keeps
+      // the stored secret meaningful at every point.
+      await authority('recover', hostId, replacement, { entitlement }, false)
+      publish(keyFile, replacement, 0o600)
+      return replacement
+    })().finally(() => {
+      credentialRecovery = null
+    })
+    return credentialRecovery
+  }
+
+  /** A credential that is simply *gone* never reaches the Authority at all:
+   * `credential()` refuses to mint a second one for a host that is already
+   * bound, so the call fails locally and the subscription reads as unavailable.
+   * That is the right default -- minting one silently would orphan the host --
+   * but when the signed entitlement is still on disk, ownership can be proven
+   * and the credential re-established instead of stranding the operator. */
+  async function ensureCredential(hostId) {
+    if (load(keyFile, 0o600, 43) || !load(hostFile, 0o644, 64)) return
+    await recoverCredential(hostId)
+  }
+
+  async function authority(action, hostId, key, extra, allowRecovery = true) {
+    let requestId
+    let status
+    let code
     try {
       const response = await fetchImpl(`${origin}/v1/host-subscriptions/${action}`, {
         method: 'POST',
@@ -786,15 +1402,44 @@ export function createCragSubscription({
         headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json', accept: 'application/json' },
         body: JSON.stringify({ host_id: hostId, ...extra }),
       })
+      const id = response.headers.get('x-request-id')
+      if (authorityRequestId.test(id ?? '')) requestId = id
+      status = response.status
       const envelope = await responseJson(response)
       if (response.ok && envelope?.ok === true && envelope.data && typeof envelope.data === 'object')
         return envelope.data
-      const code = envelope?.error?.code
-      if (envelope?.ok === false && authorityErrors.get(code) === response.status) throw fail(code, response.status)
-    } catch (error) {
-      if (authorityErrors.has(error.code)) throw error
+      if (envelope?.ok === false && authorityErrors.get(envelope.error?.code) === status) {
+        code = envelope.error.code
+      }
+    } catch {
+      // A transport or decoding failure does not prove the Authority rejected the operation.
     }
-    throw fail('crag_subscription_authority_unavailable', 502)
+    const error = code ? fail(code, status) : fail('crag_subscription_authority_unavailable', 502)
+    if (requestId) error.authorityRequestId = requestId
+    if (code === 'auth_forbidden' && allowRecovery) {
+      let replacement
+      try {
+        replacement = await recoverCredential(hostId)
+      } catch (recoveryError) {
+        // Recovery is deliberately refused when this host id is shared with
+        // another machine -- a cloned VPS image that kept its machine-id --
+        // because otherwise the two would take the subscription from each
+        // other. Report the original rejection, but record which case it is so
+        // the panel can say what to do instead of showing a bare 403.
+        error.recovery =
+          recoveryError.code === 'auth_forbidden'
+            ? 'host_id_collision'
+            : recoveryError.code === 'crag_subscription_authority_unavailable'
+              ? 'unavailable'
+              : 'failed'
+        throw error
+      }
+      // Retry once, never in a loop: a replacement the Authority just accepted
+      // that is rejected again is a real failure, not something to grind on.
+      if (replacement) return await authority(action, hostId, replacement, extra, false)
+      error.recovery = 'not_activated'
+    }
+    throw error
   }
 
   function verifyRights(hostId, data, previous, vm) {
@@ -813,19 +1458,126 @@ export function createCragSubscription({
     return { code: data.entitlement, claims: next, rights: projection(data, next) }
   }
 
-  async function finish(hostId, intent, previous, asserted = {}) {
-    const enrollment = Object.hasOwn(intent, 'host_package_sha256')
-      ? hostEnrollmentIdentity(projectRoot, intent.host_package_sha256)
-      : asserted
+  const voucherDigest = (voucher) => createHash('sha256').update(voucher).digest('hex')
+  const redemptionReceiptFile = (digest) => path.join(privateDir, `redeemed-${digest}.json`)
+
+  function appliedRedemption(hostId, digest) {
+    if (!isDigest(digest)) throw fail('crag_subscription_invalid_request', 400)
+    if (identity() !== hostId) throw hostIdentityChanged()
+    const raw = load(redemptionReceiptFile(digest), 0o600, MAX_CRAG_HOST_ENTITLEMENT_BYTES + 512)
+    if (raw === null) return null
+    try {
+      const receipt = JSON.parse(raw)
+      if (
+        Object.keys(receipt).sort().join(',') !== 'entitlement,host_id,version,voucher_sha256' ||
+        receipt.version !== 1 ||
+        receipt.host_id !== hostId ||
+        receipt.voucher_sha256 !== digest
+      )
+        throw invalidRights()
+      const proof = verifyCragHostEntitlement(projectRoot, receipt.entitlement, hostId, { allowExpired: true })
+      const installed = current(hostId)
+      if (
+        !installed ||
+        installed.claims.revision < proof.revision ||
+        (installed.claims.revision === proof.revision && installed.code !== receipt.entitlement)
+      )
+        throw invalidRights()
+      // A receipt proves this voucher was applied; it carries no remote metadata.
+      // Leaving rights unset lets status() read the current plan and usage instead
+      // of reporting a replay as a subscription with no quota information.
+      return installed
+    } catch {
+      throw fail('crag_subscription_invalid_redemption_receipt', 409)
+    }
+  }
+
+  async function prepareRecovery(hostId, intent, previous, useCurrentPackage) {
+    if (!Object.hasOwn(intent, 'host_package_sha256')) return intent
+    const kind = pinnedIntentKind(intent)
+    const digest = hostPackageDigest(projectRoot)
+    if (digest === intent.host_package_sha256) return intent
+    if (!useCurrentPackage) throw hostPackageChanged()
+    if (kind === 'recorded') {
+      // A changed package can replay only the exact original selectors, against
+      // the same trusted issuer. Only the same-voucher response proves payment.
+      recordedEnrollment(projectRoot, intent)
+    } else {
+      // Old records lack request selectors. Host status cannot identify which
+      // voucher produced existing rights, so only a confirmed absent first
+      // subscription permits replacing these records' package pin.
+      if (previous) throw fail('crag_subscription_recovery_unverified', 409)
+      try {
+        await authority('status', hostId, credential(hostId))
+        throw fail('crag_subscription_recovery_unverified', 409)
+      } catch (error) {
+        if (error.code !== 'not_found') throw error
+      }
+      hostEnrollmentIdentity(projectRoot, digest)
+    }
+    if (identity() !== hostId) throw hostIdentityChanged()
+    assertHostPackage(projectRoot, digest)
+    const next = { ...intent, host_package_sha256: digest }
+    // Replace atomically: a crash leaves either the original request or its
+    // explicitly authorized replacement, never an empty transaction window.
+    publish(intentFile, JSON.stringify(next), 0o600)
+    return next
+  }
+
+  // Tell the Authority which shop order bought this voucher, so the buyer can later
+  // migrate it by order id -- the only handle that survives losing this machine.
+  //
+  // Degrades instead of failing: the Authority's redeem request rejects unknown
+  // fields with `invalid_request` (400), so an instance newer than the Authority
+  // would have every redemption die on `order_id` alone. Mapping `invalid_request`
+  // in `authorityErrors` lets us tell that shape rejection apart from a 502
+  // transport/availability failure and retry once without `order_id`. Recording
+  // the order only matters for a migration that has not happened yet; it must
+  // never block the redemption in front of us.
+  async function redeemAtAuthority(hostId, intent, enrollment) {
+    const body = { redemption_code: intent.redemption_code, ...enrollment }
+    // Both paths carry a real shop order id: `order_id` on an order-driven activation
+    // and `shop_order_id` on a device checkout. Shapes are kept in step with the
+    // Authority's own CHECK, so a malformed id is simply not sent rather than relying
+    // on the degrade path below to absorb it.
+    const candidate = intent.shop_order_id ?? intent.order_id
+    const orderId = validOrderId(candidate) ? candidate : undefined
+    if (!orderId) return authority('redeem', hostId, credential(hostId), body)
+    try {
+      return await authority('redeem', hostId, credential(hostId), { ...body, order_id: orderId })
+    } catch (error) {
+      // Only a rejected request shape means this Authority predates `order_id`. A
+      // 502 must keep its meaning -- the redemption may well have committed, and
+      // retrying here would resolve a sync that is supposed to stay pending.
+      if (error?.code !== 'invalid_request') throw error
+      return authority('redeem', hostId, credential(hostId), body)
+    }
+  }
+
+  async function finish(hostId, intent, previous, asserted = {}, replay = false) {
+    const digest = voucherDigest(intent.redemption_code)
+    const applied = appliedRedemption(hostId, digest)
+    if (applied) {
+      remove(marker)
+      remove(intentFile)
+      return applied
+    }
+    let enrollment = asserted
+    if (Object.hasOwn(intent, 'host_package_sha256')) {
+      const kind = pinnedIntentKind(intent)
+      assertHostPackage(projectRoot, intent.host_package_sha256)
+      enrollment =
+        kind === 'recorded'
+          ? recordedEnrollment(projectRoot, intent)
+          : hostEnrollmentIdentity(projectRoot, intent.host_package_sha256)
+    }
     publish(marker, 'pending\n', 0o644)
     let data
     try {
-      data = await authority('redeem', hostId, credential(hostId), {
-        redemption_code: intent.redemption_code,
-        ...enrollment,
-      })
+      data = await redeemAtAuthority(hostId, intent, enrollment)
     } catch (error) {
-      if (error?.code !== 'crag_subscription_authority_unavailable') {
+      // A denial on replay does not tell us whether the original request committed.
+      if (!replay && error?.code !== 'crag_subscription_authority_unavailable') {
         remove(marker)
         remove(intentFile)
       }
@@ -834,6 +1586,13 @@ export function createCragSubscription({
     if (Object.hasOwn(intent, 'host_package_sha256')) assertHostPackage(projectRoot, intent.host_package_sha256)
     const confirmed = verifyRights(hostId, data, previous)
     publish(entitlementFile, confirmed.code, 0o644)
+    // This private receipt links a successful same-voucher redeem response to
+    // signed rights. A generic host status response must never create it.
+    publish(
+      redemptionReceiptFile(digest),
+      JSON.stringify({ version: 1, host_id: hostId, voucher_sha256: digest, entitlement: confirmed.code }),
+      0o600,
+    )
     remove(marker)
     remove(intentFile)
     return confirmed
@@ -881,13 +1640,16 @@ export function createCragSubscription({
   }
 
   async function exclusive(work, { blockBefore = false } = {}) {
-    if (busy) throw fail('crag_subscription_busy', 409)
-    busy = true
+    if (exclusiveState) throw fail('crag_subscription_busy', 409)
+    let settle
+    exclusiveState = { since: Date.now(), done: new Promise((resolve) => (settle = resolve)) }
     const release = holdKvmCragSubscriptionPublications(projectRoot)
     let result, failure
     try {
       if (blockBefore) await blockKvmBindings()
-      result = await work()
+      // The scope marks every async branch started by this body, so a nested
+      // admission can tell it is running under the very operation it would wait for.
+      result = await exclusiveScope.run(true, () => work())
     } catch (error) {
       failure = error
     } finally {
@@ -897,7 +1659,10 @@ export function createCragSubscription({
       } catch (error) {
         failure ??= error
       }
-      busy = false
+      // Clear before settling: a waiter wakes to an idle host with its guests
+      // already re-delivered, never to a state that is still winding down.
+      exclusiveState = null
+      settle()
     }
     if (failure) throw failure
     return result
@@ -968,7 +1733,7 @@ export function createCragSubscription({
   }
 
   function checkNoIntent() {
-    if (readRosterIntent() || load(intentFile, 0o600, 512) || load(marker, 0o644, 32))
+    if (readRosterIntent() || load(intentFile, 0o600, MAX_REDEEM_INTENT_BYTES) || load(marker, 0o644, 32))
       throw fail('crag_subscription_sync_pending', 409)
   }
 
@@ -1029,7 +1794,7 @@ export function createCragSubscription({
           cragTargetIds(projectRoot, target, { preferInstalled: false }).payloadKeyId !== payload_key_id
         )
           throw changed()
-        const machine_code = prepareCragSubscriptionBinding(projectRoot, target)
+        const machine_code = prepareCragSubscriptionBinding(projectRoot, target, { preferInstalled: false })
         if (createHash('sha256').update(machine_code).digest('hex') !== machine_sha256) throw changed()
         const binding = await authority('bind', hostId, credential(hostId), { machine_code, payload_key_id })
         if (binding.seat !== seat || binding.entitlement !== confirmed.code) throw invalidRights()
@@ -1151,7 +1916,7 @@ export function createCragSubscription({
   }
 
   async function bindForStart(vm, previous, hostId, payloadKeyId, options, runtime) {
-    const machineCode = prepareCragSubscriptionBinding(projectRoot, vm)
+    const machineCode = prepareCragSubscriptionBinding(projectRoot, vm, { preferInstalled: !options?.install })
     const bind = (rights) =>
       bindTarget(vm, hostId, rights, machineCode, payloadKeyId, { ...options, allowReissue: true })
     try {
@@ -1169,7 +1934,7 @@ export function createCragSubscription({
     return bind(await reclaimStoppedSeat(vm, rights, runtime))
   }
 
-  function redeem(value, renewal, expectedHost) {
+  function redeem(value, renewal, expectedHost, orderId) {
     return exclusive(
       async () => {
         const redemption_code = typeof value === 'string' && value.trim()
@@ -1180,24 +1945,27 @@ export function createCragSubscription({
         storage(!renewal)
         const previous = current(hostId)
         if (renewal && !previous) throw fail('host_subscription_inactive', 409)
-        const pending = expectedHost && load(intentFile, 0o600, 512)
-        if (pending) {
-          const intent = JSON.parse(pending)
-          if (
-            intent.host_id !== hostId ||
-            intent.redemption_code !== redemption_code ||
-            intent.host_package_sha256 !== packageDigest ||
-            Object.keys(intent).length !== 3 ||
-            readRosterIntent()
-          )
-            throw fail('crag_subscription_sync_pending', 409)
-          await finish(hostId, intent, previous)
-          return
-        }
-        const rawIntent = load(intentFile, 0o600, 512)
+        const rawIntent = load(intentFile, 0o600, MAX_REDEEM_INTENT_BYTES)
         if (rawIntent != null) {
-          const savedIntent = JSON.parse(rawIntent)
-          if (Object.hasOwn(savedIntent, 'order_id') || Object.hasOwn(savedIntent, 'target_fingerprint')) {
+          const saved = JSON.parse(rawIntent)
+          if (
+            !renewal &&
+            saved.host_id === hostId &&
+            saved.redemption_code === redemption_code &&
+            Object.hasOwn(saved, 'host_package_sha256') &&
+            !readRosterIntent()
+          ) {
+            pinnedIntentKind(saved)
+            if (
+              saved.host_package_sha256 !== packageDigest &&
+              !appliedRedemption(hostId, voucherDigest(redemption_code))
+            )
+              throw hostPackageChanged()
+            const confirmed = await finish(hostId, saved, previous, {}, true)
+            return expectedHost ? undefined : status(confirmed)
+          }
+          if (expectedHost) throw fail('crag_subscription_sync_pending', 409)
+          if (Object.hasOwn(saved, 'order_id') || Object.hasOwn(saved, 'target_fingerprint')) {
             await reconcileStaleOrderIntent(hostId, previous)
           }
         }
@@ -1216,7 +1984,12 @@ export function createCragSubscription({
         const intent = {
           host_id: hostId,
           redemption_code,
-          ...(packageDigest && { host_package_sha256: packageDigest }),
+          ...(orderId && { shop_order_id: orderId }),
+          ...(packageDigest && {
+            host_package_sha256: packageDigest,
+            enrollment: hostEnrollmentIdentity(projectRoot, packageDigest),
+            issuer_public_key_id: cragTargetIds(projectRoot, undefined).issuerId,
+          }),
         }
         publish(intentFile, JSON.stringify(intent), 0o600, true)
         const confirmed = await finish(hostId, intent, previous, asserted)
@@ -1247,7 +2020,7 @@ export function createCragSubscription({
     if (roster) {
       const intent = { host_id: hostId, action: 'bind' }
       if (reissue) {
-        const permit_sha256 = readCragSubscriptionReleaseCandidate(projectRoot, vm, hostId)
+        const permit_sha256 = readCragSubscriptionReleaseCandidate(projectRoot, vm, hostId, targetOptions)
         if (
           !previous.claims.roster.some((entry) => entry.seat === reissueSeat && entry.permit_sha256 === permit_sha256)
         )
@@ -1374,7 +2147,7 @@ export function createCragSubscription({
           const standard = standardEnrollment(projectRoot, resolved)
           const staleRoster = readRosterIntent()
           if (staleRoster?.action === 'bind' && !staleRoster.reissue) clearRosterIntent()
-          let raw = load(intentFile, 0o600, 512)
+          let raw = load(intentFile, 0o600, MAX_REDEEM_INTENT_BYTES)
           const binding = orderId ? { order_id: orderId } : { target_fingerprint: target.fingerprint }
           let intent = { host_id: hostId, redemption_code, ...binding }
           if (raw != null) {
@@ -1411,7 +2184,7 @@ export function createCragSubscription({
               intent.issuer_public_key_id !== standard.issuer_public_key_id)
           )
             throw hostPackageUnready()
-          await finish(hostId, intent, current(hostId), asserted ? standard : {})
+          await finish(hostId, intent, current(hostId), asserted ? standard : {}, raw != null)
           onRedeemed?.()
         }
 
@@ -1435,12 +2208,29 @@ export function createCragSubscription({
 
   return {
     status: () => status(),
+    isRedemptionApplied: (hostId, digest) => Boolean(appliedRedemption(hostId, digest)),
     admitInference,
     withRuntimeAdmission,
     purchaseDeviceId: identity,
-    redeemDeviceOrder(hostId, voucher) {
-      if (!isDigest(hostId)) throw fail()
-      return redeem(voucher, false, hostId)
+    /** `{ hostId, uuid, source }`. The panel shows `uuid` (null on an install
+     * whose original source is gone, see `storedUuid`) and `source` says where
+     * the identity came from, which is what makes an identity fault diagnosable
+     * instead of just "unavailable". */
+    deviceIdentity: () => deviceIdentity(),
+    rebuildDeviceIdentity,
+    /** Normalize a device UUID a person typed or pasted, then resolve it to the
+     * host id the protocol speaks. Returns null when it is not a UUID. The one
+     * path from typed-in identity to protocol identity, shared by redemption
+     * and by migrating to a replacement machine. */
+    resolveDeviceUuid: (input) => (normalizeDeviceUuid(input) ? uuidToHostId(input) : null),
+    /** `target` is this machine's identity: either the 64 hex host id, which
+     * existing callers and scripts already pass, or the device UUID the panel
+     * displays. Accepting the UUID is what lets an operator redeem by copying
+     * what is on screen, instead of having to find the hashed form. */
+    redeemDeviceOrder(target, voucher, orderId) {
+      const hostId = isDigest(target) ? target : uuidToHostId(target)
+      if (!hostId) throw fail()
+      return redeem(voucher, false, hostId, orderId)
     },
     async listOrderTargets() {
       try {
@@ -1505,6 +2295,76 @@ export function createCragSubscription({
         },
         { blockBefore: false },
       )
+    },
+    /** Retire this machine's subscription at the Authority.
+     *
+     * Every live voucher is released carrying its remaining window, seats are
+     * cleared, and the host row is deleted. Those vouchers can then be redeemed
+     * on a replacement machine, where they inherit the window rather than
+     * restarting the term -- so replacing hardware neither loses paid time nor
+     * grants free time.
+     *
+     * The voucher code is the secret that authorizes the move, and the Authority
+     * never echoes it back (not even to its holder), so the operator has to
+     * still have it. There is no way around that: the device UUID is shown in
+     * the panel, so if it were sufficient on its own, anyone who saw it could
+     * claim the subscription.
+     *
+     * Deliberately destructive -- this is the operator saying the machine is
+     * done. Local signed rights are dropped once the Authority confirms:
+     * keeping them would have `status()` go on reporting a subscription that no
+     * longer exists, which is exactly the stale-local-truth this module refuses
+     * to show anywhere else.
+     */
+    // Claim the voucher a shop order bought onto this machine.
+    //
+    // This is the path for replacing hardware: the order id is the only handle that
+    // survives losing the old machine, because the voucher code lives at the
+    // supplier behind a receipt key that was stored there. The Authority releases
+    // the voucher from whatever host still holds it, so the old machine does not
+    // have to be reachable -- needing it to release first is what stranded a
+    // subscription whose machine was reinstalled or destroyed.
+    claimByOrder(orderId) {
+      return exclusive(async () => {
+        if (!validOrderId(orderId)) throw fail('crag_subscription_invalid_request', 400)
+        const hostId = identity()
+        checkNoIntent()
+        storage(true)
+        const previous = current(hostId)
+        // The Authority binds the voucher to this host's credential, so it has to
+        // exist before the request: a first claim on a fresh machine has none yet.
+        credential(hostId, true)
+        // Assert the package exactly as redemption does. Without payload_key_id the
+        // Authority records the voucher as an unlabelled baseline, and a baseline
+        // voucher shares one combined window with every other such voucher -- it can
+        // never be moved by order id again. `standardEnrollment` returns {} rather
+        // than throwing when deploy/payload.json is absent, so refuse here instead:
+        // migrating is explicit and low-frequency, and silently making this the last
+        // migration ever possible is not a trade worth taking. A host with no trusted
+        // package could not serve the entitlement being claimed anyway.
+        const enrollment = hostEnrollmentIdentity(projectRoot, hostPackageDigest(projectRoot))
+        if (!enrollment.payload_key_id || !enrollment.issuer_public_key_id) throw hostPackageUnready()
+        const data = await authority('claim-by-order', hostId, credential(hostId), {
+          order_id: orderId,
+          ...enrollment,
+        })
+        const confirmed = verifyRights(hostId, data, previous)
+        publish(entitlementFile, confirmed.code, 0o644)
+        return status(confirmed)
+      })
+    },
+    unbind() {
+      return exclusive(async () => {
+        const hostId = identity()
+        checkNoIntent()
+        if (!current(hostId)) throw fail('crag_subscription_target_unready', 409)
+        const released = await authority('unbind', hostId, credential(hostId))
+        // Only after the Authority confirmed. Dropping them first would strand a
+        // machine whose request never landed: rights gone locally, still held
+        // remotely, and no way to prove either.
+        for (const file of [entitlementFile, marker, deferredReleaseFile]) remove(file)
+        return { ...(await status()), released }
+      })
     },
     async releaseStoppedBinding(vm, { stop } = {}) {
       const unchanged = (supported = false) => ({ released: false, stopped: false, reclaim_supported: supported })
@@ -1623,7 +2483,7 @@ export function createCragSubscription({
         { blockBefore: false },
       )
     },
-    recover() {
+    recover({ useCurrentPackage = false } = {}) {
       return exclusive(async () => {
         if (!fs.existsSync(intentFile) && !fs.existsSync(rosterIntentFile)) {
           if (fs.existsSync(marker)) remove(marker)
@@ -1644,23 +2504,42 @@ export function createCragSubscription({
           await replayDeferredReleases(hostId, confirmed)
           return
         }
-        const raw = load(intentFile, 0o600, 512)
+        const raw = load(intentFile, 0o600, MAX_REDEEM_INTENT_BYTES)
         if (raw == null) return
-        const intent = JSON.parse(raw)
-        if (intent.host_id !== hostId || !validVoucher(intent.redemption_code)) {
-          remove(marker)
-          remove(intentFile)
-          return
+        let intent
+        try {
+          intent = JSON.parse(raw)
+        } catch {
+          throw fail('crag_subscription_recovery_unverified', 409)
         }
+        if (
+          !intent ||
+          typeof intent !== 'object' ||
+          Array.isArray(intent) ||
+          !isDigest(intent.host_id) ||
+          !validVoucher(intent.redemption_code)
+        )
+          throw fail('crag_subscription_recovery_unverified', 409)
+        const orderIntent = Object.hasOwn(intent, 'order_id') || Object.hasOwn(intent, 'target_fingerprint')
+        const pinned = Object.hasOwn(intent, 'host_package_sha256')
+        if (
+          pinned ||
+          Object.hasOwn(intent, 'enrollment') ||
+          (!orderIntent && Object.hasOwn(intent, 'issuer_public_key_id'))
+        )
+          pinnedIntentKind(intent)
+        else if (!orderIntent && Object.keys(intent).sort().join(',') !== 'host_id,redemption_code')
+          throw fail('crag_subscription_recovery_unverified', 409)
+        if (intent.host_id !== hostId) throw hostIdentityChanged()
         // An order may only resume redemption after re-authorizing its checkout pin;
         // keep order_id / target_fingerprint intact for shop polling (it no longer blocks existing slots or new orders).
-        if (Object.hasOwn(intent, 'order_id') || Object.hasOwn(intent, 'target_fingerprint')) return
-        const pinned = Object.hasOwn(intent, 'host_package_sha256')
-        if (pinned) assertHostPackage(projectRoot, intent.host_package_sha256)
+        if (orderIntent) return
         const previous = current(hostId)
+        const applied = appliedRedemption(hostId, voucherDigest(intent.redemption_code))
+        if (!applied) intent = await prepareRecovery(hostId, intent, previous, useCurrentPackage)
         // Old intents without local rights have no original digest, but still require a trusted package.
         if (!pinned && !previous) hostPackageDigest(projectRoot)
-        const confirmed = await finish(hostId, intent, previous)
+        const confirmed = await finish(hostId, intent, previous, {}, true)
         await replayDeferredReleases(hostId, confirmed)
       })
     },
@@ -1707,18 +2586,25 @@ export function createCragSubscription({
         ) {
           throw fail('crag_subscription_target_unready', 409)
         }
-        const permitDigest = readCragSubscriptionReleaseCandidate(projectRoot, vm, hostId)
+        if (!allowLegacyReissue && candidate.code === 'license_payload_key_mismatch')
+          throw fail('crag_subscription_migration_required', 409)
+        const permitDigest = readCragSubscriptionReleaseCandidate(projectRoot, vm, hostId, {
+          preferInstalled: !allowLegacyReissue,
+        })
         const reissueSeat =
           previous.claims.roster?.find((entry) => entry.permit_sha256 === permitDigest)?.seat ??
           (license.valid && license.scope === 'host' ? license.seat : undefined)
-        if (!allowLegacyReissue && (reissueSeat !== undefined || candidate.code === 'license_payload_key_mismatch'))
-          throw fail('crag_subscription_migration_required', 409)
+        if (!allowLegacyReissue && reissueSeat !== undefined) throw fail('crag_subscription_migration_required', 409)
         const { payloadKeyId } = cragTargetIds(projectRoot, vm, { preferInstalled: false })
         if (allowLegacyReissue) {
-          return bindTarget(vm, hostId, previous, prepareCragSubscriptionBinding(projectRoot, vm), payloadKeyId, {
-            install: true,
-            reissueSeat,
-          })
+          return bindTarget(
+            vm,
+            hostId,
+            previous,
+            prepareCragSubscriptionBinding(projectRoot, vm, { preferInstalled: false }),
+            payloadKeyId,
+            { install: true, reissueSeat },
+          )
         }
         await bindForStart(vm, previous, hostId, payloadKeyId, { install: true })
       })

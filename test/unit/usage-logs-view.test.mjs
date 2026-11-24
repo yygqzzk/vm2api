@@ -277,20 +277,22 @@ test('row badges: via only when non-default, context1m from long_context, fast/p
   assert.equal(logs.find((r) => r.id === plain.id).context1mApplied, null)
 })
 
-test('#777 badge: sent priority with a non-priority upstream echo is a Fast downgrade', () => {
+test('request settings show sent Priority or Ultrafast and the upstream echo separately', () => {
   const db = freshDb()
-  const [downgraded, honored, unechoed] = seed(db, [
-    { protocol: 'openai.responses', service_tier: 'priority', upstream_service_tier: 'default' },
+  const [ultrafast, priority, unechoed] = seed(db, [
+    { protocol: 'openai.responses', service_tier: 'ultrafast', upstream_service_tier: 'default' },
     { protocol: 'openai.responses', service_tier: 'priority', upstream_service_tier: 'priority' },
     { protocol: 'openai.responses', service_tier: 'priority' },
   ])
   const logs = new UsageLogsView(db).listBatch({}).logs
   const row = (id) => logs.find((r) => r.id === id)
-  const downgrade = (id) => row(id).specialSettings.find((s) => s.key === 'tier_downgrade')
-  assert.equal(downgrade(downgraded.id)?.value, 'priority → default')
-  assert.equal(row(downgraded.id).upstreamServiceTier, 'default')
-  assert.equal(downgrade(honored.id), undefined)
-  assert.equal(downgrade(unechoed.id), undefined)
+  const echo = (id) => row(id).specialSettings.find((s) => s.key === 'upstream_service_tier')
+  assert.equal(row(ultrafast.id).specialSettings.find((s) => s.key === 'ultrafast')?.label, 'Ultrafast')
+  assert.equal(row(ultrafast.id).upstreamServiceTier, 'default')
+  assert.equal(echo(ultrafast.id)?.label, '上游档位回显')
+  assert.equal(echo(ultrafast.id)?.value, 'default')
+  assert.equal(echo(priority.id)?.value, 'priority')
+  assert.equal(echo(unechoed.id), undefined)
 })
 
 test('overview splits today/yesterday-same-time in the requested zone', () => {
@@ -344,7 +346,7 @@ test('overview splits today/yesterday-same-time in the requested zone', () => {
   assert.equal(utc.yesterdayRequests, 1)
 })
 
-test('active sessions and session suggestions group by outbound session, owner-scoped, newest first', () => {
+test('active sessions group by caller session, owner-scoped, newest first; suggestions stay per outbound session', () => {
   const db = freshDb()
   const now = Date.now()
   const iso = (ago) => new Date(now - ago).toISOString()
@@ -373,21 +375,18 @@ test('active sessions and session suggestions group by outbound session, owner-s
   ])
   const view = new UsageLogsView(db)
   const active = view.activeSessions({ owner_user_id: 'u1', now })
-  assert.equal(active.total, 2)
+  assert.equal(active.total, 1)
   assert.deepEqual(
     active.sessions.map((s) => [s.sessionId, s.clientSessionId, s.requests]),
-    [
-      ['abc-1b', 'client-1', 1],
-      ['abc-1', 'client-1', 2],
-    ],
+    [['client-1', 'client-1', 3]],
   )
-  assert.equal(active.sessions[1].lastStatus, 200)
-  assert.equal(active.sessions[1].keyName, 'alice-key')
-  assert.equal(view.activeSessions({ now }).total, 3)
+  assert.equal(active.sessions[0].lastStatus, 200)
+  assert.equal(active.sessions[0].keyName, 'alice-key')
+  assert.equal(view.activeSessions({ now }).total, 2)
   assert.deepEqual(view.sessionSuggestions({ q: 'abc', owner_user_id: 'u1' }), ['abc-1b', 'abc-1', 'abc-3'])
   assert.deepEqual(view.sessionSuggestions({ q: 'abc-2' }), ['abc-2'])
   assert.deepEqual(view.sessionSuggestions({ q: 'client' }), [])
-  assert.equal(view.overview({ now }).activeSessions, 3)
+  assert.equal(view.overview({ now }).activeSessions, 2)
 })
 
 test('active sessions never resolve the last row from another tenant sharing the session id', () => {
@@ -445,4 +444,57 @@ test('tenant error collection hides other users and anonymous ingress failures',
   const all = repo.windowStats().error_collection
   assert.equal(all.recent.length, 3)
   assert.deepEqual(all.ingress_hits.map((h) => h.ip).sort(), ['198.51.100.7', '203.0.113.9'])
+})
+
+test('active sessions flag one-off (single request, no tools) apart without merging, and list them last', () => {
+  const db = freshDb()
+  const now = Date.now()
+  const iso = (ago) => new Date(now - ago).toISOString()
+  seed(db, [
+    { created_at: iso(1_000), outbound_session_id: 'side-1', api_key_id: 'k1', has_tools: 0 },
+    { created_at: iso(2_000), outbound_session_id: 'side-2', api_key_id: 'k1', has_tools: 0 },
+    { created_at: iso(50_000), outbound_session_id: 'main-1', api_key_id: 'k1', has_tools: 1 },
+    { created_at: iso(40_000), outbound_session_id: 'two-1', api_key_id: 'k1', has_tools: 0 },
+    { created_at: iso(30_000), outbound_session_id: 'two-1', api_key_id: 'k1', has_tools: 0 },
+  ])
+  const active = new UsageLogsView(db).activeSessions({ now })
+  assert.equal(active.total, 4)
+  assert.equal(active.oneOffTotal, 2)
+  assert.deepEqual(
+    active.sessions.map((s) => [s.sessionId, s.oneOff]),
+    [
+      ['two-1', false],
+      ['main-1', false],
+      ['side-1', true],
+      ['side-2', true],
+    ],
+  )
+})
+
+test('failed_only filter matches committed HTTP 200 failed terminals without altering exclude_status_200 (#1213)', () => {
+  const db = freshDb()
+  const rows = seed(db, [
+    { status: 200, final_state: 'verified' },
+    { status: 200, final_state: null },
+    { status: 200, final_state: 'rejected', error_code: 'slot_busy' },
+    { status: 200, final_state: 'incomplete' },
+    { status: 200, final_state: 'failed', error_code: 'gemini_tool_call_required' },
+    { status: 529, final_state: 'rejected', error_code: 'slot_busy' },
+  ])
+  const view = new UsageLogsView(db)
+  const ids = (f) =>
+    view
+      .listBatch(f)
+      .logs.map((r) => r.id)
+      .sort()
+
+  // exclude_status_200 stays pure HTTP status filtering.
+  assert.deepEqual(ids({ exclude_status_200: true }), [rows[5].id])
+
+  // failed_only includes non-2xx AND committed 200 rows whose final_state is not verified,
+  // while leaving verified and legacy unrecorded-terminal 200 rows out.
+  assert.deepEqual(ids({ failed_only: true }), [rows[2].id, rows[3].id, rows[4].id, rows[5].id].sort())
+
+  // Combining status_code=200 + failed_only isolates committed 200 streaming failures.
+  assert.deepEqual(ids({ status_code: '200', failed_only: true }), [rows[2].id, rows[3].id, rows[4].id].sort())
 })

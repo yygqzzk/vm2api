@@ -4,8 +4,9 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [dev]
   pull_request:
+    branches: [dev, main]
   workflow_dispatch:
     inputs:
       full:
@@ -33,8 +34,10 @@ jobs:
       go: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.go == 'true' }}
       web: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.web == 'true' }}
       packaging: ${{ inputs.full || steps.filter.outputs.packaging == 'true' }}
+      oauth: ${{ inputs.full || steps.filter.outputs.oauth == 'true' }}
       unit_tests: ${{ steps.filter.outputs.unit_tests_files || '[]' }}
       web_tests: ${{ steps.filter.outputs.web_tests_files || '[]' }}
+      web_src: ${{ steps.filter.outputs.web_src_files || '[]' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -47,6 +50,7 @@ jobs:
           filters: |
             backend:
               - 'src/**'
+              - 'deploy/payload.json'
               - 'test/unit/**'
               - 'test/fixtures/**'
               - 'test/harness.mjs'
@@ -72,11 +76,21 @@ jobs:
               - 'scripts/fetch-payload.mjs'
               - 'test/deploy/**'
               - '.github/workflows/test.yml'
+            oauth:
+              - 'deploy/payload.json'
+              - 'src/lib/oauth/**'
+              - 'src/lib/identity/vm-identity.mjs'
+              - 'test/unit/oauth-binary.test.mjs'
+              - 'scripts/fetch-payload.mjs'
+              - '.github/workflows/test.yml'
             unit_tests:
               - added|modified: 'test/unit/*.test.mjs'
             web_tests:
               - added|modified: 'web/src/**/*.test.ts'
               - added|modified: 'web/src/**/*.test.tsx'
+            web_src:
+              - added|modified: 'web/src/**/*.ts'
+              - added|modified: 'web/src/**/*.tsx'
 
   ci:
     needs: changes
@@ -106,9 +120,9 @@ jobs:
           cache: npm
           cache-dependency-path: package-lock.json
       - run: npm ci
-        if: needs.changes.outputs.backend == 'true'
+        if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.oauth == 'true'
       - uses: actions/setup-go@v7
-        if: needs.changes.outputs.go == 'true' || needs.changes.outputs.backend == 'true' || inputs.full
+        if: needs.changes.outputs.go == 'true' || needs.changes.outputs.backend == 'true' || inputs.full || contains(needs.changes.outputs.unit_tests, 'test/unit/egress.test.mjs')
         with:
           go-version: '1.25.x'
           cache-dependency-path: |
@@ -129,22 +143,30 @@ jobs:
       - name: backend syntax
         if: needs.changes.outputs.backend == 'true'
         run: find src scripts -name '*.mjs' -print0 | xargs -0 -n1 node --check
+      - name: OAuth binary contract
+        if: needs.changes.outputs.oauth == 'true' && !inputs.full
+        run: |
+          manifest="$RUNNER_TEMP/oauth-test-payload.json"
+          jq -e '.files |= map(select(.path == "bin/kin-oauth-auth")) | select(.files | length == 1)' deploy/payload.json > "$manifest"
+          node scripts/fetch-payload.mjs --manifest "$manifest"
+          node scripts/fetch-payload.mjs --manifest "$manifest" --check
+          node --test test/unit/oauth-binary.test.mjs
       - name: backend tests
         if: needs.changes.outputs.backend == 'true'
         env:
           FULL: ${{ inputs.full || github.repository == 'yygqzzk/vm2api' }}
           CHANGED_TESTS: ${{ needs.changes.outputs.unit_tests }}
         run: |
+          # egress.test.mjs spawns the real helper from bin/kin-egress.
+          if [ "$FULL" = true ] || jq -e 'index("test/unit/egress.test.mjs") != null' <<< "$CHANGED_TESTS" >/dev/null; then
+            (cd worker && CGO_ENABLED=0 go build -o ../bin/kin-egress ./cmd/kin-egress)
+          fi
           if [ "$FULL" = true ]; then
-            npm run test:unit
+            # Four workers for the four vCPUs a standard runner has. The suite is
+            # 412 files and over a quarter of an hour one at a time.
+            VM2API_TEST_CONCURRENCY=4 npm run test:unit
           else
-            if jq -e 'index("test/unit/oauth-binary.test.mjs") != null' <<< "$CHANGED_TESTS" >/dev/null; then
-              manifest="$RUNNER_TEMP/oauth-test-payload.json"
-              jq -e '.files |= map(select(.path == "bin/kin-oauth-auth")) | select(.files | length == 1)' deploy/payload.json > "$manifest"
-              node scripts/fetch-payload.mjs --manifest "$manifest"
-              node scripts/fetch-payload.mjs --manifest "$manifest" --check
-            fi
-            tests=$(jq -r '.[] | split("/")[-1]' <<< "$CHANGED_TESTS")
+            tests=$(jq -r '.[] | split("/")[-1] | select(. != "oauth-binary.test.mjs")' <<< "$CHANGED_TESTS")
             changed=()
             if [ -n "$tests" ]; then
               mapfile -t changed <<< "$tests"
@@ -169,6 +191,7 @@ jobs:
         env:
           FULL: ${{ inputs.full || github.repository == 'yygqzzk/vm2api' }}
           CHANGED_TESTS: ${{ needs.changes.outputs.web_tests }}
+          CHANGED_SRC: ${{ needs.changes.outputs.web_src }}
         run: |
           pnpm install --frozen-lockfile
           if [ "$FULL" = true ]; then
@@ -178,6 +201,18 @@ jobs:
             changed=()
             if [ -n "$tests" ]; then
               mapfile -t changed <<< "$tests"
+            fi
+            # A changed source file is covered by its sibling test, which the
+            # changed-test filter alone never selects. Without this a PR can
+            # break a test it does not touch and still go green.
+            while IFS= read -r src; do
+              [ -n "$src" ] || continue
+              for candidate in "${src%.*}.test.tsx" "${src%.*}.test.ts"; do
+                [ -f "$candidate" ] && changed+=("$candidate")
+              done
+            done <<< "$(jq -r '.[] | ltrimstr("web/")' <<< "$CHANGED_SRC")"
+            if [ ${#changed[@]} -gt 0 ]; then
+              mapfile -t changed < <(printf '%s\n' "${changed[@]}" | sort -u)
             fi
             pnpm test:ci "${changed[@]}"
           fi

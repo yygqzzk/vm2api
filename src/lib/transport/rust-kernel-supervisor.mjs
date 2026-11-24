@@ -4,6 +4,7 @@
  */
 
 import { spawn, spawnSync } from 'node:child_process'
+import { isOverlap } from '../core/handover.mjs'
 import fs from 'node:fs'
 import path from 'node:path'
 import {
@@ -14,6 +15,7 @@ import {
   rustKernelBusy,
 } from './rust-kernel-client.mjs'
 import { maxRequestBytes, readRoutingConfigFile, streamIdleTimeoutMs } from '../core/config.mjs'
+import { vmNodeId } from '../cluster/placement.mjs'
 import { profileForPreset } from '../identity/official-profiles.mjs'
 import { resolveWorkstationProfile } from '../identity/workstation-profile.mjs'
 import { cacheTtlFromRouting, normalizeCacheTtl } from '../protocol/cache-ttl.mjs'
@@ -49,9 +51,10 @@ import {
   runtimeFileOwner,
 } from '../oauth/oauth-credentials.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
+import { repairClaudeConfigFromBackup } from '../vm/claude-config-repair.mjs'
 import { buildNativeTelemetry } from '../vm/native-telemetry.mjs'
 import { defaultSeedPolicy, isTelemetryEnabled } from '../protocol/seed-policy.mjs'
-import { RETIRE_LEGACY_TELEMETRY } from '../vm/slot-process-status.mjs'
+import { RETIRE_LEGACY_TELEMETRY, retireScriptVerdict } from '../vm/slot-process-status.mjs'
 import { checkCragLicense } from '../vm/crag-license.mjs'
 import { publishKvmCragLicense } from '../vm/kvm-crag-license.mjs'
 import { kernelCpuCommand, kernelCpuCommandMatches, usesKernelCpuLimit } from '../vm/kernel-cpu.mjs'
@@ -60,10 +63,15 @@ import { clearKvmCragSubscription } from '../vm/kvm-crag-subscription.mjs'
 import { workerPaths } from './go-worker-client.mjs'
 import { effectiveSlotCount } from '../vm/slot-capacity.mjs'
 
-/** The native host is authenticated separately from account scheduling readiness. */
+/**
+ * The native host is authenticated separately from account scheduling readiness.
+ * A CRAG v2 process pool spawns its Claude processes on demand: with prewarm off an
+ * idle healthy pool reports `cli_pid: 0`, so a live process is not required there.
+ */
 function runtimeReady(health, allowMissingCredential) {
   if (!allowMissingCredential) return rustKernelReachable(health)
-  return rustKernelProcessUp(health) && health?.healthy !== false && Number(health?.cli_pid) > 0
+  if (!rustKernelProcessUp(health) || health?.healthy === false) return false
+  return Number(health?.cli_pid) > 0 || health?.execution_mode === 'v2_process_pool'
 }
 
 function normalizeAutoCompactWindow(value) {
@@ -255,16 +263,16 @@ export const NODE_CLAUDE_SETUP_PY = `
 import json, os
 home = "/home/kincli"
 want = ("/run/kin/work", home)
-for f, create in ((home + "/.claude/.claude.json", True), (home + "/.claude.json", False)):
+for f in (home + "/.claude/.claude.json", home + "/.claude.json"):
+    changed = False
     try:
         doc = json.load(open(f))
     except FileNotFoundError:
-        if not create or not os.path.isdir(os.path.dirname(f)):
-            continue
+        os.makedirs(os.path.dirname(f), mode=0o700, exist_ok=True)
         doc = {}
+        changed = True
     if not isinstance(doc, dict):
         continue
-    changed = False
     if doc.get("hasCompletedOnboarding") is not True:
         doc["hasCompletedOnboarding"] = True
         changed = True
@@ -283,7 +291,8 @@ for f, create in ((home + "/.claude/.claude.json", True), (home + "/.claude.json
             changed = True
     if not changed:
         continue
-    mode = os.stat(f).st_mode & 0o777 if os.path.exists(f) else 0o600
+    existed = os.path.exists(f)
+    mode = os.stat(f).st_mode & 0o777 if existed else 0o600
     tmp = f + ".kin-setup.tmp"
     with open(tmp, "w") as fh:
         fh.write(json.dumps(doc) + "\\n")
@@ -403,11 +412,21 @@ function runDocker(args, { timeoutMs = 5000, env, input } = {}) {
   })
 }
 
+/**
+ * Cluster slots reach their container over one SSH relay hop, so a probe that
+ * fits the local docker-exec budget (400ms) times out on the wire long before
+ * the kernel is down. Keep the local budget for local slots and floor cluster
+ * probes at 3s. The same applies to process checks inside the container.
+ */
+export function clusterProbeMs(exec, baseMs) {
+  return vmNodeId(exec?.vm) ? Math.max(Number(baseMs) || 0, 3000) : baseMs
+}
+
 async function waitForHealth(exec, timeoutMs, allowMissingCredential = false) {
   const deadline = Date.now() + Math.max(200, Number(timeoutMs) || 8000)
   let last = { ok: false, reason: 'not_ready' }
   while (Date.now() < deadline) {
-    last = await rustKernelHealth(exec, { timeoutMs: 400 })
+    last = await rustKernelHealth(exec, { timeoutMs: clusterProbeMs(exec, 400) })
     if (runtimeReady(last, allowMissingCredential)) return { ok: true, reason: 'started_in_vm', health: last }
     await new Promise((resolve) => setTimeout(resolve, 80))
   }
@@ -429,7 +448,7 @@ async function kernelProcessAlive(exec, runDockerExec) {
           'exit 1',
         ].join('\n')
       : 'pgrep -f /home/kincli/.kin/kin-kernel.bin >/dev/null || pgrep -f /home/kincli/.kin/kin-kernel >/dev/null || pidof kin-kernel >/dev/null'
-  const result = await runDockerExec(execArgv(exec, ['sh', '-c', probe]), { timeoutMs: 1500 })
+  const result = await runDockerExec(execArgv(exec, ['sh', '-c', probe]), { timeoutMs: clusterProbeMs(exec, 1500) })
   return result?.ok === true
 }
 
@@ -440,7 +459,7 @@ async function waitForHealthOrExit(exec, { timeoutMs, container, runDockerExec, 
   let checkedProcess = false
   while (Date.now() < deadline) {
     if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
-    last = await rustKernelHealth(exec, { timeoutMs: 400 })
+    last = await rustKernelHealth(exec, { timeoutMs: clusterProbeMs(exec, 400) })
     if (runtimeReady(last, allowMissingCredential)) return { ok: true, reason: 'started_in_vm', health: last }
     // KVM guest boot is minutes under TCG; a missing process at 1.2s is not failure.
     if (!isKvmRuntime(exec?.vm) && !checkedProcess && Date.now() - started >= 1200 && container) {
@@ -807,13 +826,49 @@ function bootWaitMs(timeoutMs, { pid1Kernel, wedged }) {
 
 /** Only actual Linux launches retire the old sender; healthy kernels do no extra exec. */
 async function retireLegacyTelemetryBeforeStart(exec, runDockerExec) {
-  try {
-    const retired = await runDockerExec(execArgv(exec, ['sh', '-c', RETIRE_LEGACY_TELEMETRY]), {
-      timeoutMs: 5000,
-    })
-    if (retired?.ok) return { ok: true }
-  } catch {}
-  return { ok: false, reason: 'legacy_telemetry_stop_failed', error: 'Legacy telemetry process did not stop' }
+  const retired = await retireLegacyTelemetryChecked(
+    execArgv(exec, ['sh', '-c', RETIRE_LEGACY_TELEMETRY]),
+    runDockerExec,
+  )
+  if (retired.unverified) {
+    console.warn(
+      `[rust-kernel] ${exec?.vmId || exec?.vm?.id || 'unknown'} legacy telemetry retire unverified; boot continues`,
+    )
+  }
+  return retired
+}
+
+/**
+ * Shared transport-aware retire: a numeric exit after the script's marker is
+ * its verdict; anything else means the exec never completed (docker CLI
+ * transport error, node-link flap, timeout, spawn error). One retry, then fail open so transport jitter cannot brick
+ * a boot; a genuinely stuck sender still fails deterministically.
+ */
+export async function retireLegacyTelemetryChecked(argv, runDockerExec) {
+  const attempt = async () => {
+    try {
+      return await runDockerExec(argv, { timeoutMs: 5000 })
+    } catch (error) {
+      return { ok: false, error: String(error?.message || error) }
+    }
+  }
+  const deterministicFailure = {
+    ok: false,
+    reason: 'legacy_telemetry_stop_failed',
+    error: 'Legacy telemetry process did not stop',
+  }
+  const first = await attempt()
+  if (first?.ok) return { ok: true }
+  if (retireScriptVerdict(first)) return deterministicFailure
+  const retry = await attempt()
+  if (retry?.ok) return { ok: true }
+  if (retireScriptVerdict(retry)) return deterministicFailure
+  return {
+    ok: true,
+    unverified: true,
+    reason: 'legacy_telemetry_unverified',
+    error: 'Legacy telemetry retire unverified (slot exec unavailable); boot continues',
+  }
 }
 
 async function startKvmGuestKernel(
@@ -954,7 +1009,9 @@ async function startRustKernel(
   if (!paths.socketPath) return { ok: false, reason: 'socket_missing' }
   const existing = await rustKernelHealth(exec, { timeoutMs: healthTimeoutMs })
   if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
-  const staleWrap = wrapNewerThanKernel(exec)
+  // Blue/green overlap: a newer wrap must not restart a kernel the draining controller may be using.
+  // The deploy syncs wraps once that controller exits (handover exclusive pass).
+  const staleWrap = !isOverlap() && wrapNewerThanKernel(exec)
   const currentVm = kernelVm(exec)
   const expectedSlots = wrapSlotCount(currentVm)
   const slotMismatch = !!paths.configPath && kernelSlotsDiffer(paths.configPath, existing, expectedSlots)
@@ -1119,28 +1176,51 @@ export function stopAllRustKernels() {
   starts.clear()
   return { ok: true, stopped: 0, cancelled }
 }
+
+/** Abandon one VM's pending kernel start; its health wait returns `start_cancelled`. */
+export function cancelRustKernelStart(vmId) {
+  const pending = starts.get(String(vmId || ''))
+  if (!pending) return false
+  pending.control.cancelled = true
+  return true
+}
 function kernelConfigText(config) {
   return JSON.stringify(config, null, 2) + '\n'
 }
 
-function acceptNativeClaudeSetup(homeDir, workDir) {
-  // The TUI refuses login, theme, and folder-trust screens. The credential file is
-  // separate; these flags are what Claude reads before it will take a prompt.
-  for (const file of [path.join(homeDir, '.claude', '.claude.json'), path.join(homeDir, '.claude.json')]) {
-    let raw
+function acceptNativeClaudeSetup(homeDir, workDir, vm) {
+  // CLAUDE_CONFIG_DIR points at ~/.claude, so the TUI reads ~/.claude/.claude.json.
+  // ~/.claude.json is a different file. Create the one the CLI opens when it is
+  // missing; otherwise a completed home file still leaves the welcome screen up.
+  // Root must hand a new 0700 dir to the slot user, or kincli cannot read it.
+  const configDir = path.join(homeDir, '.claude')
+  const privileged = typeof process.getuid === 'function' && process.getuid() === 0
+  const owner = runtimeFileOwner(vm)
+  const created = fs.mkdirSync(homeDir, { recursive: true, mode: 0o700 })
+  const home = fs.lstatSync(homeDir)
+  if (!home.isDirectory()) return
+  if (created && privileged) fs.chownSync(homeDir, owner.uid, owner.gid)
+  ensureHostPrivateDir(configDir, { uid: owner.uid, gid: owner.gid, privileged })
+  for (const file of [path.join(configDir, '.claude.json'), path.join(homeDir, '.claude.json')]) {
+    let doc = {}
+    let mode = 0o600
+    let uid = privileged ? owner.uid : null
+    let gid = privileged ? owner.gid : null
+    let existed = false
     try {
-      raw = fs.readFileSync(file, 'utf8')
-    } catch {
-      continue
+      const st = fs.lstatSync(file)
+      if (st.isSymbolicLink() || !st.isFile()) continue
+      existed = true
+      mode = st.mode & 0o777
+      uid = st.uid
+      gid = st.gid
+      const parsed = JSON.parse(fs.readFileSync(file, 'utf8'))
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue
+      doc = parsed
+    } catch (error) {
+      if (error?.code !== 'ENOENT') continue
     }
-    let doc
-    try {
-      doc = JSON.parse(raw)
-    } catch {
-      continue
-    }
-    if (!doc || typeof doc !== 'object' || Array.isArray(doc)) continue
-    let changed = false
+    let changed = !existed
     if (doc.hasCompletedOnboarding !== true) {
       doc.hasCompletedOnboarding = true
       changed = true
@@ -1162,12 +1242,13 @@ function acceptNativeClaudeSetup(homeDir, workDir) {
       changed = true
     }
     if (!changed) continue
-    const st = fs.statSync(file)
     const tmp = `${file}.${process.pid}.tmp`
-    fs.writeFileSync(tmp, `${JSON.stringify(doc)}\n`, { mode: st.mode & 0o777 })
-    try {
-      fs.chownSync(tmp, st.uid, st.gid)
-    } catch {}
+    fs.writeFileSync(tmp, `${JSON.stringify(doc)}\n`, { mode })
+    if (uid != null) {
+      try {
+        fs.chownSync(tmp, uid, gid)
+      } catch {}
+    }
     fs.renameSync(tmp, file)
   }
 }
@@ -1230,6 +1311,14 @@ export function writeKernelConfig(
   const kernelRouting = routing ?? { inference: previous }
   const dataplane = resolveKernelDataplane(target, kernelRouting) || 'wrap'
   const host = slotHost(record)
+  // Before any kernel (cli-node or CRAG) starts the CLI: an empty .claude/.claude.json crash-loops it.
+  if (host.kind === 'local' && !isCodexVm(record)) {
+    try {
+      const fixed = repairClaudeConfigFromBackup(homeDir)
+      if (fixed.repaired)
+        console.warn(`[kernel] ${vm.id}: restored unreadable .claude/.claude.json from ${fixed.backup}`)
+    } catch {}
+  }
   // A macOS node runs the kernel on the host itself: real node paths instead of the container mounts.
   // Unknown until that node has connected once; the slot's own start writes the config then.
   let nodePaths = null
@@ -1324,23 +1413,27 @@ export function writeKernelConfig(
           privileged,
         })
       }
-      acceptNativeClaudeSetup(homeDir, '/run/kin/work')
-      if (config.telemetry && isTelemetryEnabled(defaultSeedPolicy(record.seed_policy || {}))) {
-        const workstation = resolveWorkstationProfile(record)
-        config.telemetry = {
-          ...config.telemetry,
+      acceptNativeClaudeSetup(homeDir, '/run/kin/work', vm)
+    }
+    if (
+      config.telemetry &&
+      isTelemetryEnabled(defaultSeedPolicy(target.seed_policy || {})) &&
+      (!host.bakedKernel || kind !== 'kvm')
+    ) {
+      const workstation = resolveWorkstationProfile(target)
+      config.telemetry = {
+        ...config.telemetry,
+        enabled: true,
+        dmi_dir: '/etc/kin-dmi',
+        identity: {
           enabled: true,
-          dmi_dir: '/etc/kin-dmi',
-          identity: {
-            enabled: true,
-            linux_kernel: workstation.linux_kernel,
-            linux_distro_id: workstation.linux_distro_id,
-            linux_distro_version: workstation.linux_distro_version,
-            shell: workstation.shell,
-            terminal: workstation.terminal,
-            package_managers: workstation.package_managers,
-          },
-        }
+          linux_kernel: workstation.linux_kernel,
+          linux_distro_id: workstation.linux_distro_id,
+          linux_distro_version: workstation.linux_distro_version,
+          shell: workstation.shell,
+          terminal: workstation.terminal,
+          package_managers: workstation.package_managers,
+        },
       }
     }
   }

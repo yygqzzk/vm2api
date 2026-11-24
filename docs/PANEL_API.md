@@ -2,7 +2,7 @@
 
 基址 `/api/panel`。需要**面板登录会话**或 Master `VM2API_API_KEY`。协议密钥不能调面板。信封 `{ ok, data }` / `{ ok: false, error }`。调用方应从 `data` 取业务体。
 
-登录：`POST /api/panel/login` `{ username, password }` → token + Cookie `kin_panel_token`（7 天，HttpOnly）。`POST /api/panel/logout` 撤销。`GET /api/panel/me` → `{ user, role, views, capabilities, version }`。`GET/PUT /onboarding` 为首配进度（见「引导」）。
+登录：`POST /api/panel/login` `{ username, password }` → token + Cookie `kin_panel_token`（7 天，HttpOnly）。账号开了两步验证时返回 401 `{ totp_required: true, challenge }`，需再调 `POST /api/panel/login/totp`（见「两步验证」）。`POST /api/panel/logout` 撤销。`GET /api/panel/me` → `{ user, role, views, capabilities, version }`。`GET/PUT /onboarding` 为首配进度（见「引导」）。
 
 管理台前端固定 `credentials: include`。页面与 API **不同源** 时，须在 API 侧配置受信 Origin：`PANEL_CORS_ORIGINS`（空格或逗号分隔，如 `https://panel.example.com`）和/或 `PUBLIC_BASE_URL` 的 origin。匹配时响应回显该 `Origin`、`Access-Control-Allow-Credentials: true` 与 `Vary: Origin`；未列入的 Origin 仍为 `Access-Control-Allow-Origin: *` 且**不带** credentials（浏览器会拒绝跨源 Cookie 登录）。预检与 JSON/SSE 共用同一 methods/headers 列表（含 `PATCH`）。
 
@@ -19,6 +19,33 @@
 环境变量 `VM2API_ADMIN_USER` / `VM2API_ADMIN_PASSWORD` 只在库里还没有同名用户时灌进第一个 admin；之后以 SQLite `users` 为准，面板「用户」页可增删改、改密码。密码 scrypt。不能删/停用最后一个 admin。
 
 `vms/*.json` 的 `owner_user_id` / `origin`（`platform` \| `admin_assigned` \| `user_created`）是属主 SSOT。`PATCH /vms/:id/owner` 仅 admin。自建 VM 不能收回进平台池。
+
+## 两步验证
+
+可选的 TOTP（RFC 6238：SHA1 / 6 位 / 30 秒 / 前后各容 1 步漂移），**所有角色各自可选开启**，只影响面板登录，API 密钥调用不受影响。状态按用户名存在 SQLite `settings` 键 `panel_2fa:<username>`（小写，与 `users` 表的大小写无关比较一致），没有新表或新列。密钥与恢复码哈希经 `db/secure.mjs`，设了 `VM2API_DB_SECRET` 即为 AES-256-GCM 落盘；轮换过密钥导致无法解密时登录**失败关闭**（500 `totp_secret_unreadable`），不会退化成只要密码。
+
+登录两步：
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/login` | `{ username, password, code? }`。密码对但缺第二因素 → 401 `{ ok:false, totp_required:true, challenge, expires_in:300, error:{ code:"totp_required" } }`，**不发**会话。直接带 `code` 可一次完成。 |
+| POST | `/login/totp` | `{ challenge, code }` → 同 `/login` 的成功体。`code` 接受 6 位动态码或一次性恢复码。challenge 是对 `{用户名, 到期}` 的 HMAC 签名（密钥存 `settings` 键 `panel_2fa_challenge_secret`），无服务端会话、重启和多进程都可验；篡改 401 `totp_challenge_invalid`，超时 401 `totp_challenge_expired`。第二步会重读账号，期间被改角色或停用以最新为准（停用 403 `user_disabled`）。 |
+
+自助管理（需面板会话，master API key 不是账号故 403 `panel_session_required`；排在 RBAC 门禁之前，所以 `user` / `super` 也能管自己的）：
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/2fa` | `{ enabled, pending, confirmed_at, recovery_total, recovery_remaining, digits, period }`。`pending` = 已生成密钥但未确认，此时登录**不拦**。 |
+| POST | `/2fa/setup` | `{ password }` → `{ secret, uri, digits, period, algorithm }`。`uri` 是 `otpauth://totp/...`。密钥此时未生效，放弃绑定不影响现有登录方式。 |
+| POST | `/2fa/enable` | `{ code }` → 状态 + `recovery_codes[10]`（`XXXXX-XXXXX`，**仅此一次返回**，库里只存哈希）。开启后该账号的其它会话被登出。 |
+| POST | `/2fa/disable` | `{ password, code }` → 清除密钥与恢复码。 |
+| POST | `/2fa/recovery` | `{ password }` → 新的 `recovery_codes[10]`，旧的全部失效。 |
+
+改动第二因素一律要求重新验证密码（`password_required` / `password_invalid`）。
+
+管理员兜底：`DELETE /users/:id/2fa` 仅 admin，清掉目标账号的密钥与恢复码（下次登录只要密码）并登出其会话，用于用户同时丢失验证器与恢复码。`GET /users` 每项附 `two_factor`。
+
+防滥用：同一验证码不能复用——通过记录已用时间步实现，窗口内重放返回 400 `totp_code_reused`；恢复码用后标记失效。验证码连续错 5 次锁 15 分钟（429 `totp_too_many_attempts`，进程内计数）。
 
 ## 引导
 
@@ -85,11 +112,12 @@
 | GET/PUT | `/fork/test-reports/rules` | **fork**：GET `?vm_id=` 回 `{ rule }`；PUT `{ vm_ids, rule: { enabled, contains: string[], mode: "all"或"any", when_unmatched: "pending"或"fail" } }`，回 `{ rule, updated }`。每条字符串字面匹配、区分大小写、首尾去空白，最多20条、每条500字符；未命中默认待定。租户仅能写自己的槽；批量目标有越权则整批不写；super仅GET。修改仅影响新测试，不重判历史，不修改调度。见 [结果中心说明](fork/TEST-RUNS.md) |
 | GET/PUT | `/test-schedule/default` | 全局默认调度模板（仅调度时间结构）。GET 所有已登录角色可读；**PUT 仅 admin/master**（body `{ schedule: { frequency, … } }`，`schedule: null` 清除） |
 | POST | `/test-schedule/sync` | 覆盖写调度时间：`{ scope: "all" \| "ids", vm_ids?, schedule }`。MVP **只**同步 `frequency`/时刻/星期/分钟/`timezone`，**不同步** prompt、模型、token·effort、`enabled`。无计划槽创建且 `enabled=false`（模型/Prompt 取该槽已有计划或 test-chat 默认 `hello` + 首个可测模型）。租户 `scope=all` 仅自己的槽；逐槽权限同 test-schedule |
+| POST | `/vms/:id/count-tokens` | Setup Token / Console API Key 经槽 Go worker SOCKS 打官方 `POST /v1/messages/count_tokens`。body `{ model, messages, system?, tools? }`。完整 OAuth 400 `count_tokens_unsupported`。成功 `{ input_tokens, model, credential_mode, vm_id }`。受 `routing.compatibility.count_tokens` 控制，**默认关时返回 404 `not_found`**（与公开入口同一个开关） |
 | POST | `/vms/:id/oauth/refresh` | 只转发 worker `Ensure`，不回 token |
 | POST | `/vms/:id/oauth/to-setup-token` | 把当前完整 OAuth 活票改成 Setup Token（保留 refresh/过期）。已是 setup-token 则幂等 |
 | POST | `/vms/:id/oauth/generate-auth-url` | CAI / Setup Token PKCE 授权链接；要求绑定可用出口。`claude_code` 返回 409 `native_login_required`，请使用专用终端 |
 | POST | `/vms/:id/oauth/exchange-code` | CAI / Setup Token 提交会话 ID 和授权码；导入并同步后才返回成功。Claude Code 的回调由专用终端处理 |
-| POST | `/vms/:id/credentials/sync` | 管理员手动同步 Claude 客户端凭证，成功返回 `{ synced: true }`。无凭证返回 409，同步失败返回 502；不换票、不回传 token。远程槽保留节点已轮换凭证并修复客户端链接 |
+| POST | `/vms/:id/credentials/sync` | 管理员手动同步 Claude 客户端凭证，成功返回 `{ synced: true }`。无凭证返回 409，同步失败返回 502；不换票、不回传 token，并排除凭证内邮箱字段。远程槽保留节点已轮换凭证、剔除遗留邮箱并修复客户端链接 |
 | GET/POST | `/vms/:id/official-cc-bootstrap` | 初装进度 / `{ manual:true }` 再跑 |
 | GET/PUT | `/vms/:id/seed-settings` | 播种；面板默认锁定，解锁后改、播种前确认。`settings.json` 可编辑 env（经 `extra_env`）与 `theme`；`autoUpdates`/`grove_enabled` 与 TZ/LANG/LC_ALL、telemetry/bedrock/vertex 等契约 env 只读展示，TZ/LANG 经 PUT `timezone` / `timezone_follow_proxy` / `locale` 写入槽位后再播种，不经 `extra_env`；`claude_setting` 可编辑。`GET ?debug=1` 额外返回 `telemetry_log`（最近 40 行脱敏上传审计，默认不带） |
 | POST | `/vms/:id/collect-identity` | guest 采集（locale/tz/`guest_machine_id`、槽内 `/etc/os-release` 的 `VERSION_ID`、系统与架构）；Codex Analytics 只使用这次采集的运行环境 |
@@ -115,10 +143,14 @@
 | POST | `/vms/:id/allocate-proxy` | 从池分配 SOCKS5 |
 | POST | `/vms/:id/update-claude-code` | 410，`claude_cli_removed` |
 | DELETE | `/vms/:id` | 多槽时不能删仍占 `active.json` 的槽（409 `switch active first`）；管理台删除确认可在有健康可调度候选时先 `activate` 再删。只解绑本槽代理。成功返回 `{ deleted, reclaim_pending? }`；`reclaim_pending: true` 表示槽已删除，但其 CRAG 订阅绑定仍待回收确认 |
-| POST | `/vms/create` | 种子 VM + Claude Code home；依赖私有 `kin-computer`。未安装返回 400 `computer_service_missing`，身份生成失败返回 400 `computer_create_failed`。Docker 槽可在 `machine` 里可选传 `docker_cpus`（见下） |
+| POST | `/vms/create` | 种子 VM + Claude Code home；依赖私有 `kin-computer`。未安装返回 400 `computer_service_missing`，身份生成失败返回 400 `computer_create_failed`。Docker 槽可在 `machine` 里可选传 `docker_cpus`（见下）；Claude 槽可传 `desktop: true` 同时启用伴生浏览器桌面 |
 | POST | `/vms/import` | sessionKey 导入（必须已有 VM+代理） |
 | POST | `/vms/:id/shell-ticket` | 管理员获取 30 秒单次票据和 `cli_bin`。`{login:true}` 申请专用登录终端，要求绑定可用出口 |
 | WS | `/vms/:id/shell?ticket=&cols=&rows=` | 运维票据打开槽内 shell；登录票据须附 `login=1`，只运行包内原生 `claude auth login`。输入 `{"t":"d","d":"…"}`，尺寸 `{"t":"r","c":列,"r":行}`；二进制帧为终端输出，文本帧为 `exit` / `error`。保存并同步成功后登录会话发送 `{"t":"login","ok":true,"official_cc_bootstrap":…}`，不返回 token |
+| GET | `/vms/:id/desktop` | 伴生浏览器桌面状态 `{enabled, supported, state: running\|stale\|absent\|unsupported, image, container}`（见 [slot-desktop.md](slot-desktop.md)） |
+| POST | `/vms/:id/desktop` | `{enabled: boolean}` 开关伴生桌面；开启时槽在运行即拉起，未运行返回 `state: pending_slot_start`，下次启动槽时自动拉起。关闭只删容器，保留浏览器资料卷 |
+| POST | `/vms/:id/desktop-ticket` | 管理员获取 30 秒单次票据；先确保伴生容器跟上槽位当前网络命名空间 |
+| WS | `/vms/:id/desktop/ws?ticket=` | 二进制帧双向透传 RFB（noVNC 直连，无 websockify），子协议可选 `binary` |
 | GET | `/vms/fleet-status` | 全槽更新状态 |
 | POST | `/vms/fleet-update` | 全槽 roll / 采集；`action=telemetry` 只更新 Go telemetry/egress 服务，不重建 VM |
 | POST | `/vms/reconcile-fingerprints` | 用官方 `~/.claude.json` 对齐指纹 |
@@ -179,6 +211,10 @@
 记录字段：`schedule_off`、`unschedulable{reason,detail,at}`、`schedule_hold{reason,detail,at}`（系统暂停：`maintenance` / `proxy_cooldown`，由写入方自己解除）。`schedulable` / `schedule_disabled_reason` / `schedule_manual` 每次写入时派生，保留给旧读者与回滚。升级后首次启动把旧记录迁到新字段，原文件备份到 `backups/schedule-migration-<ts>/`；上线前可用 `node scripts/replay-schedule-state.mjs --project <dir>` 预览迁移结果。设置 `routing.pool.manual_schedule_wins` 已移除（调度关不会被任何自动路径打开）。
 
 ### 平台独立的槽位限额
+
+Claude 的 `PATCH /api/panel/vms/:id` 接受 `max_primary_sessions` (1-20) 和 `max_subagents_per_session` (0-20). 每项单独传 `null` 恢复继承, 非法值返回 400 `invalid_scheduling_value`. 全局默认由 `PUT /api/panel/routing` 的 `pool` 对象设置. 两项均默认 `null`, 前者跟随本 VM 物理席位上限, 后者关闭家族模式. 列表和详情返回两项生效值、对应的 `_override` 标记及 `scheduling_inherited` 中的继承值.
+
+家族模式下, `seats_used` 统计本 VM 占用的根席位, `seats_max` 为生效的主会话上限 n. 每个 `seat_sessions` 成员及 SSE 对应的 `sessions` 成员另带 `subagents_running` (含已放行请求), `subagents_queued` 和 `subagents_max`. 根迁移后, 当前根席位保留到整个家族的在跑和排队请求结束, 旧 VM 在本地最后一份预约结束时交还席位. 热更新的 n 和 m 用于新进调度的请求. 所有执行预约 (含旧票和免席位探测) 在放行时按 VM 当时的家族模式检查物理位. 关闭模式的快照显示最近观察到的物理容量.
 
 `max_concurrency` / `max_rpm` 传数字钉住本槽，传 `null` 清除覆盖并立即使用本平台全局值。Claude 跟随 `tiers`；OpenAI 跟随 `codex.quota`，不受 Claude 分档保存影响。
 
@@ -330,7 +366,7 @@ H1 删除已绑定槽时，控制面保留最小私有回收记录，只有严�
 | `websocket.enabled` | `true` | 全局推理 WS 总闸，不影响面板终端或集群连接 |
 | `codex.websocket.enabled` | `true` | GPT 推理 WS 子闸；必须与总闸同时开启 |
 | `codex.upstream_transport` | `prefer_websocket` | `prefer_websocket` 或 `http`；入站与上游传输不是同一段连接 |
-| `codex.user_agent` | `codex_cli_rs/0.167.1 (linux x86_64)` | 上游客户端画像；旧出厂值 `0.160.0` 在运行时自动升级，保留自定义值；originator/version 由内核按该画像生成，调用方不能覆盖 |
+| `codex.user_agent` | `codex_cli_rs/0.170.0 (linux x86_64)` | 上游客户端画像，不读取下游用户的系统信息；originator/version 由内核按该画像生成，调用方不能覆盖 |
 | `codex.catalog_client_version` | `auto` | 模型目录同步的客户端版本，与推理 UA 分开 |
 | `codex.client_features.enabled` | `false` | 显式开启后上送槽位独立安装 UUID 与官方 `client_metadata`；不使用 VM/硬件指纹 |
 | `codex.analytics.enabled` | `false` | 显式开启后独立上报运行环境 Analytics，不是推理成功的前提 |
@@ -502,7 +538,7 @@ attempts：每次选中的 VM/账号、错误域、cooldown、提交边界、终
 
 仅 admin。POST/PATCH 字段：`name`（1–40）、`enabled`、`vm_ids`（整表替换；省略则不动成员）。槽不存在 400 `vm_pool_vm_unknown`；槽已在别的池 409 `vm_in_other_pool`；重名 409 `vm_pool_name_taken`。仍有密钥绑定时 DELETE 409 `vm_pool_in_use`，不会把这些密钥放开成全局。
 
-### 协议字段（对齐 Sub2API usage_logs）
+### 协议字段
 
 | 字段 | 说明 |
 |------|------|
@@ -593,7 +629,13 @@ Claude 槽测试走官方 CC 入站（`/v1/messages`）。GPT/Codex 槽测试走
 
 `PUT /proxies/config` 的 `dns_primary` 保持字符串（默认 `auto`）：远程 SOCKS5 透明出口优先使用的 DNS 上游，可选 `auto`、`https://1.1.1.1/dns-query`、`https://8.8.8.8/dns-query`、`8.8.8.8:53`、`1.1.1.1:53`，或自定义 HTTPS DoH URL（如 `https://cloudflare-dns.com/dns-query`、`https://[2606:4700:4700::1111]/dns-query`）。URL 可包含路径、查询参数和 1–65535 的显式端口，主机须为有效域名或 IP literal；不允许 userinfo、fragment、空白、反斜杠或原始逗号（上游链用逗号分隔，参数中的逗号须编码为 `%2C`）。非法值返回 `invalid_dns_primary`，不改动原设置。所选上游排第一，其余内置上游按默认顺序排在其后作为自动 fallback；自定义 URL 后依次为 `https://1.1.1.1/dns-query`、`https://8.8.8.8/dns-query`、`8.8.8.8:53`、`1.1.1.1:53`，`auto` 直接用 kin-egress 内置顺序。DoH 经 SOCKS5 出口访问，域名由 SOCKS5 代理解析；`IP:53` 为经 SOCKS 转发的 DNS-over-TCP，出口到 DNS 服务器之间明文。变更后重载本机已绑定的 `kin-egress`（先 SIGTERM 等待旧进程退出并释放监听端口，超时后 SIGKILL，再启动新进程；启动失败时 `egress` 数组报告错误），不重建槽位；集群节点出口在下次槽位启动 / 重载时读取新设置。本地直连出口不使用此设置。
 
-`PUT /proxies/config` 的 `dns_disable_svcb_https` 为布尔值（默认 `false`），Web「代理 → 管理」显示「关闭 DNS type 64 / 65」开关。开启后向 SOCKS5 透明出口下发 DNS 覆写参数 `dns_empty_types: [64, 65]`：SVCB（64）和 HTTPS（65）查询返回 `NOERROR` 空答案，不访问上游；A、AAAA 等其它查询正常转发。关闭后移除覆写参数，恢复正常查询。非布尔值返回 `invalid_dns_disable_svcb_https`。保存后重载本机已绑定出口，`egress` 数组报告结果；集群出口在下次槽位启动 / 重载时生效，本地直连出口不使用此设置。
+SVCB（64）/ HTTPS（65）覆写**按单条代理生效**。开启后向该代理的 SOCKS5 透明出口下发 `dns_empty_types: [64, 65]`：SVCB 与 HTTPS 查询返回 `NOERROR` 空答案，不访问上游；A、AAAA 等其它查询正常转发。关闭后移除覆写参数，恢复正常查询。本地直连出口没有独立的 kin-egress helper，不支持此设置。
+
+`PUT /proxies/:id` 的 `dns_disable_svcb_https` 为布尔值：只改这一条代理。非布尔值返回 `invalid_dns_disable_svcb_https`，对本地直连行返回 `dns_disable_svcb_https_unsupported`。该条已绑定时重启它自己的 `kin-egress`（`egress` 字段报告结果）；此字段不写入 `worker.json`，所以不重载已绑槽位的 worker。
+
+`PUT /proxies/config` 的 `dns_disable_svcb_https` 为布尔值（默认 `false`），语义是**批量动作**而非继承来源：写入全部非本地代理的该字段，同时作为此后新增代理的初始值。运行时读的是代理自己的字段，池级键不参与。保存后只重载被该次动作真正改变且已绑定的出口，`egress` 数组报告结果；集群出口在下次槽位启动 / 重载时生效。非布尔值返回 `invalid_dns_disable_svcb_https`。
+
+共享出口模式（一个节点一个 helper 带多条上游）下，kin-egress 的 `dns_empty_types` 是 helper 级而非 route 级，无法按条区分，取**交集**：该节点全部成员代理都开启才下发覆写。因此某条代理开启后，只要同节点存在未开启的代理，这条就暂不生效——界面会就此给出提示。升级时 `064_proxy_dns_disable_svcb_https` 迁移把原池级值写入每一条代理，行为不变。
 
 kin-egress 的 UDP DNS 与 TCP 一致：上游全部不可达或解析失败时向客户端返回 `SERVFAIL`（保留查询 ID），不再让 UDP 客户端空等超时；UDP 接收缓冲支持最大 65535 字节报文。
 

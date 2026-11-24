@@ -3,7 +3,7 @@
  * Derived from status / error_code / message so historical rows classify without a migration.
  */
 
-import { isUnanswerablePromptMessage } from '../core/errors.mjs'
+import { isThirdPartyClientMessage, isUnanswerablePromptMessage } from '../core/errors.mjs'
 
 export const ERROR_CLASSES = {
   auth: { id: 'auth', owner: 'client', label: '认证' },
@@ -32,8 +32,11 @@ const CODE_MAP = {
   vm_pool_unavailable: 'request',
   api_key_model_not_allowed: 'request',
   claude_code_only: 'request',
+  client_blocked: 'request',
+  third_party_client: 'request',
   invalid_json: 'request',
   body_too_large: 'request',
+  image_too_large: 'request',
   empty_body: 'request',
   missing_field: 'request',
   invalid_field: 'request',
@@ -79,6 +82,7 @@ const CODE_MAP = {
   request_cancelled: 'timeout',
   client_aborted: 'timeout',
   selection_cancelled: 'timeout',
+  gemini_inference_cancelled: 'timeout',
   ECONNRESET: 'timeout',
   aborted: 'timeout',
   upstream_auth_error: 'credential',
@@ -98,11 +102,12 @@ export const IGNORED_ERROR_CODES = new Set([
   'request_cancelled',
   'client_aborted',
   'selection_cancelled',
+  'gemini_inference_cancelled',
 ])
 
 /**
  * Client ingress auth (missing / unknown / disabled / expired sk-kin).
- * Same cut as sub2api MarkIngressRejected: visible in logs, not an ops/SLA failure.
+ * Log these rejections without counting them as operational or SLA failures.
  */
 export const INGRESS_AUTH_ERROR_CODES = new Set([
   'auth_failed',
@@ -135,6 +140,8 @@ export const SLA_OK_ERROR_CODES = new Set([
   'vm_pool_unavailable',
   'api_key_model_not_allowed',
   'claude_code_only',
+  'client_blocked',
+  'third_party_client',
   // Pool queue full / timeout moved from 429 to 529; SLA keeps counting them as it did at 429.
   'pool_overloaded',
   'pool_wait_queue_full',
@@ -255,6 +262,9 @@ export function classifyRequestError(row = {}) {
   ) {
     id = 'refusal'
   }
+  // "Third-party apps now draw from your extra usage": the caller is not
+  // Claude Code. Older rows logged it as refusal_guard; it is a client error.
+  if (id !== 'auth' && id !== 'credential' && isThirdPartyClientMessage(row?.error_message)) id = 'request'
   if (!id) {
     if (/extra usage|entitlement|quota|5h|7d/.test(text) && (status === 429 || /quota|usage/.test(text))) id = 'quota'
     else if (/socks|proxy|cloudflare|just a moment/.test(text)) id = 'proxy'

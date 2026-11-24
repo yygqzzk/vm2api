@@ -21,7 +21,12 @@ import fs from 'node:fs'
 import crypto from 'node:crypto'
 import path from 'node:path'
 import { nodeSession, remoteSlotDir, remoteSlotOwner, vmNodeId } from './placement.mjs'
-import { hasCredentialPresence, mirrorWorkerCredentialsToVm } from '../oauth/oauth-credentials.mjs'
+import {
+  hasCredentialPresence,
+  mirrorWorkerCredentialsToVm,
+  stripSlotCredentialEmailBytes,
+  stripWorkerCredentialEmail,
+} from '../oauth/oauth-credentials.mjs'
 import { EGRESS_BIN } from '../vm/egress.mjs'
 import { readJsonCached } from '../vm/vm-file.mjs'
 import {
@@ -135,6 +140,53 @@ export async function pushSlotFiles(vm, slotDir, sets = ['run', 'seed'], session
     pushed.push(rel)
   }
   return { pushed }
+}
+
+/**
+ * Publish the egress helper into the node-level mount a shared helper runs from.
+ *
+ * A per-VM helper takes its binary from that VM's own slot-bin, which is also
+ * where the push path puts it. A shared helper belongs to the node rather than
+ * to any VM — it outlives every single one of them — so its container binds
+ * `<root>/egress/slot-bin`, and nothing was putting a binary there.
+ *
+ * Only kin-egress goes here. The rest of slot-bin is the guest's runtime
+ * (worker, CRAG tree, live wrap), which a helper never executes.
+ *
+ * Owned by the SSH user, because that is who the helper container runs as
+ * (`${host.uid}:${host.gid}` in remoteEgressContainer). With CAP_DAC_OVERRIDE
+ * dropped, container root cannot traverse a directory owned by someone else —
+ * the failure looks like `permission denied` on the config, not on the binary.
+ */
+export async function pushSharedEgressBinary(session, projectRoot) {
+  const host = session.host
+  const dir = `${host.root}/egress/slot-bin`
+  const local = clusterBin(
+    'KIN_CLUSTER_EGRESS_BIN',
+    clusterBin('KIN_EGRESS_BIN', fs.existsSync(EGRESS_BIN) ? EGRESS_BIN : path.join(projectRoot, 'bin', 'kin-egress')),
+  )
+  let data
+  try {
+    data = fs.readFileSync(local)
+  } catch {
+    return { ok: false, error: `kin-egress binary not found: ${local}`, code: 'egress_binary_missing' }
+  }
+  const owner = { uid: host.uid, gid: host.gid }
+  const chown = host.uid === 0 ? '' : ` && chown ${owner.uid}:${owner.gid} ${shellQuote(dir)}`
+  await runRemote(session.client, `umask 022 && mkdir -p ${shellQuote(dir)} && chmod 755 ${shellQuote(dir)}${chown}`, {
+    timeoutMs: 20_000,
+  })
+  const target = `${dir}/kin-egress`
+  const sha = crypto.createHash('sha256').update(data).digest('hex')
+  // Every shared helper start lands here; resending an unchanged binary over a
+  // slow node link is what pushed panel requests past the proxy timeout when
+  // the per-slot push did it unconditionally.
+  const reused = (await remoteFileSha256(session.client, target)) === sha
+  if (!reused) {
+    const sftp = await openSftp(session.client)
+    await writeRemoteFile(sftp, target, data, { mode: 0o755, owner })
+  }
+  return { ok: true, dir, path: target, sha256: sha, reused }
 }
 
 /** Publish Go service payloads into the persistent per-slot mount. */
@@ -358,9 +410,11 @@ export async function pushSlotCredentials(vm, slotDir, session = null) {
   await prepareRemoteDir(s, vm)
   const local = path.join(slotDir, CREDENTIALS)
   if (!fs.existsSync(local)) return { pushed: false }
+  const sanitized = stripSlotCredentialEmailBytes(fs.readFileSync(local))
+  if (sanitized.changed) stripWorkerCredentialEmail(path.join(slotDir, 'cli-home'))
   const sftp = await openSftp(s.client)
   const remote = remoteSlotDir(s.host, vm.id)
-  await writeRemoteFile(sftp, `${remote}/${remoteSlotPath(CREDENTIALS)}`, fs.readFileSync(local), {
+  await writeRemoteFile(sftp, `${remote}/${remoteSlotPath(CREDENTIALS)}`, sanitized.data, {
     mode: REMOTE_FILE_MODE,
     owner: ownerFor(s, vm),
   })
@@ -372,25 +426,33 @@ export async function pushSlotCredentials(vm, slotDir, session = null) {
 /** Pull the node credential and repair its metadata even when local bytes already match. */
 export async function pullSlotCredentials(vm, slotDir, session = null) {
   const s = session || (await nodeSession(vmNodeId(vm)))
-  const remote = await readRemoteFileNoFollow(
-    s.client,
-    `${remoteSlotDir(s.host, vm.id)}/${remoteSlotPath(CREDENTIALS)}`,
-  )
+  const remotePath = `${remoteSlotDir(s.host, vm.id)}/${remoteSlotPath(CREDENTIALS)}`
+  const remote = await readRemoteFileNoFollow(s.client, remotePath)
   if (!remote) return { pulled: false, reason: 'remote_missing' }
+  const sanitized = stripSlotCredentialEmailBytes(remote)
+  const bytes = sanitized.data
   const local = path.join(slotDir, CREDENTIALS)
   let mode = 0o600
   let same = false
   try {
-    same = fs.readFileSync(local).equals(remote)
+    same = fs.readFileSync(local).equals(bytes)
     mode = fs.statSync(local).mode & 0o777
   } catch {}
   if (!same) {
     fs.mkdirSync(path.dirname(local), { recursive: true, mode: 0o700 })
     const tmp = `${local}.${process.pid}.${Date.now()}.tmp`
-    fs.writeFileSync(tmp, remote, { mode })
+    fs.writeFileSync(tmp, bytes, { mode })
     // The local seal must survive whatever umask Node runs with.
     fs.chmodSync(tmp, mode)
     fs.renameSync(tmp, local)
+  }
+  let sftp = null
+  if (sanitized.changed) {
+    sftp = await openSftp(s.client)
+    await writeRemoteFile(sftp, remotePath, bytes, {
+      mode: REMOTE_FILE_MODE,
+      owner: ownerFor(s, vm),
+    })
   }
   const vmPath = path.join(path.dirname(slotDir), `${vm.id}.json`)
   let record = readJsonCached(vmPath)
@@ -401,12 +463,12 @@ export async function pullSlotCredentials(vm, slotDir, session = null) {
   if (record) vm.claude = record.claude
   if (!isCodexVm(vm)) {
     await remoteSymlink(
-      await openSftp(s.client),
+      sftp || (await openSftp(s.client)),
       'credentials.json',
       `${remoteSlotDir(s.host, vm.id)}/claude/.credentials.json`,
     )
   }
-  return same ? { pulled: false, reason: 'same' } : { pulled: true }
+  return same && !sanitized.changed ? { pulled: false, reason: 'same' } : { pulled: true }
 }
 
 /**

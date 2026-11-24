@@ -3,7 +3,43 @@ set -eu
 
 ROOT="${KIN_PROJECT_ROOT:-/opt/vm2api}"
 IMAGE_BIN="/opt/vm2api/image-bin"
-mkdir -p "$ROOT/vms" "$ROOT/data" "$ROOT/bin"
+mkdir -p "$ROOT/data"
+# Modes:
+#   (default)  leader boot: take the data-dir lock, refresh shared binaries, exec the server.
+#   standby    KIN_STANDBY=1 without its activation marker: a blue/green standby boots next to the
+#              leader. It neither locks nor touches shared files; the server takes the lock when it
+#              is activated and calls `vm2api-entrypoint sync` once the old controller has exited.
+#   sync       refresh shared binaries only (caller already holds the lock); prints WRAP_CHANGED=0|1.
+MODE="${1:-run}"
+STANDBY=0
+if [ "$MODE" = run ] && [ "${KIN_STANDBY:-}" = 1 ]; then
+  if [ -z "${KIN_STANDBY_ACTIVE_FILE:-}" ] || [ ! -f "$KIN_STANDBY_ACTIVE_FILE" ]; then
+    STANDBY=1
+  fi
+fi
+# A blue/green install (an activation marker exists) runs only through deploy/bluegreen/bg-deploy.sh.
+# A container started the single-container way (plain `docker compose up -d`) would contend with the
+# active colour for the lock and the shared files, so it refuses to start.
+if [ "$MODE" = run ] && [ "${KIN_STANDBY:-}" != 1 ]; then
+  for marker in "$ROOT"/data/run/bg-active-*; do
+    [ -e "$marker" ] || continue
+    echo "vm2api_bluegreen_install: this install runs blue/green ($(basename "$marker")); deploy with deploy/bluegreen/bg-deploy.sh, not docker compose up." >&2
+    echo "vm2api_bluegreen_install: to go back to a single container, see docs/BLUEGREEN.md (rollback)." >&2
+    exit 78
+  done
+fi
+if [ "$MODE" = run ] && [ "$STANDBY" = 0 ]; then
+  # Match the Node startup lock before replacing any shared binaries or configuration.
+  exec 9<"$ROOT/data"
+  flock -n -E 75 9 || {
+    rc=$?
+    if [ "$rc" = 75 ]; then
+      echo 'vm2api_control_plane_already_running: stop the other controller first' >&2
+    fi
+    exit "$rc"
+  }
+fi
+mkdir -p "$ROOT/vms" "$ROOT/bin"
 
 # 镜像安装没有仓库 checkout：把镜像内默认配置补进被 bind-mount 覆盖的 src/config。
 mkdir -p "$ROOT/src/config"
@@ -47,60 +83,72 @@ ensure_bin() {
   chmod 755 "$tmp"
   mv -f "$tmp" "$dest"
 }
-ensure_bin kin-kernel
-ensure_bin kin-egress
-ensure_bin kin-slot-gate
-ensure_bin kin-worker
-ensure_bin kin-api-kernel
-ensure_bin kin-redact
-ensure_bin kin-codex-kernel
-ensure_bin kin-oauth-auth
-ensure_bin kin-computer
-KERNEL="${KIN_KERNEL_BIN:-$ROOT/bin/kin-kernel}"
-if [ ! -x "$KERNEL" ]; then
-  echo "vm2api: $KERNEL missing or not executable after image-bin copy. Rebuild with docker compose build, or put linux amd64 Release files in $ROOT/bin." >&2
-  exit 1
-fi
-API_KERNEL="${KIN_API_KERNEL_BIN:-$ROOT/bin/kin-api-kernel}"
-if [ ! -x "$API_KERNEL" ]; then
-  echo "vm2api: $API_KERNEL missing or not executable after image-bin copy. Rebuild the control-plane image so kin-api-kernel is staged in image-bin." >&2
-  exit 1
-fi
-mkdir -p "$ROOT/share/wrap-cli"
-WRAP_CHANGED=0
-if [ -d /opt/vm2api/image-wrap-cli ]; then
-  # 首装先整目录落地（glibc239 / SAMPLE.json），再由下面的循环按内容覆盖可执行文件。
-  if [ ! -f "$ROOT/share/wrap-cli/cli-node" ]; then
-    cp -a /opt/vm2api/image-wrap-cli/. "$ROOT/share/wrap-cli/"
-    WRAP_CHANGED=1
+
+sync_shared() {
+  ensure_bin kin-kernel
+  ensure_bin kin-egress
+  ensure_bin kin-slot-gate
+  ensure_bin kin-worker
+  ensure_bin kin-api-kernel
+  ensure_bin kin-redact
+  ensure_bin kin-codex-kernel
+  ensure_bin kin-oauth-auth
+  ensure_bin kin-computer
+  KERNEL="${KIN_KERNEL_BIN:-$ROOT/bin/kin-kernel}"
+  if [ ! -x "$KERNEL" ]; then
+    echo "vm2api: $KERNEL missing or not executable after image-bin copy. Rebuild with docker compose build, or put linux amd64 Release files in $ROOT/bin." >&2
+    exit 1
   fi
-  # cli-node 也随镜像覆盖：只在缺失时复制会让升级用户一直留着旧 ELF（#120 baseline 换不进去）。
-  for name in kin-kernel.bin kin-kernel cli-node cc-node; do
-    src="/opt/vm2api/image-wrap-cli/$name"
-    dest="$ROOT/share/wrap-cli/$name"
-    if [ -f "$src" ]; then
-      if [ ! -f "$dest" ] || ! cmp -s "$src" "$dest"; then
-        WRAP_CHANGED=1
+  API_KERNEL="${KIN_API_KERNEL_BIN:-$ROOT/bin/kin-api-kernel}"
+  if [ ! -x "$API_KERNEL" ]; then
+    echo "vm2api: $API_KERNEL missing or not executable after image-bin copy. Rebuild the control-plane image so kin-api-kernel is staged in image-bin." >&2
+    exit 1
+  fi
+  mkdir -p "$ROOT/share/wrap-cli"
+  WRAP_CHANGED=0
+  if [ -d /opt/vm2api/image-wrap-cli ]; then
+    # 首装先整目录落地（glibc239 / SAMPLE.json），再由下面的循环按内容覆盖可执行文件。
+    if [ ! -f "$ROOT/share/wrap-cli/cli-node" ]; then
+      cp -a /opt/vm2api/image-wrap-cli/. "$ROOT/share/wrap-cli/"
+      WRAP_CHANGED=1
+    fi
+    # cli-node 也随镜像覆盖：只在缺失时复制会让升级用户一直留着旧 ELF（#120 baseline 换不进去）。
+    for name in kin-kernel.bin kin-kernel cli-node cc-node; do
+      src="/opt/vm2api/image-wrap-cli/$name"
+      dest="$ROOT/share/wrap-cli/$name"
+      if [ -f "$src" ]; then
+        if [ ! -f "$dest" ] || ! cmp -s "$src" "$dest"; then
+          WRAP_CHANGED=1
+        fi
+        cp "$src" "$dest.new"
+        chmod 755 "$dest.new"
+        mv -f "$dest.new" "$dest"
       fi
-      cp "$src" "$dest.new"
+    done
+  fi
+  # The crag kernel no longer comes from a repo checkout; refresh it from the image like the wrap ELFs.
+  if [ -f /opt/vm2api/image-crag/kin-kernel ]; then
+    mkdir -p "$ROOT/share/crag"
+    dest="$ROOT/share/crag/kin-kernel"
+    if [ ! -f "$dest" ] || ! cmp -s /opt/vm2api/image-crag/kin-kernel "$dest"; then
+      cp /opt/vm2api/image-crag/kin-kernel "$dest.new"
       chmod 755 "$dest.new"
       mv -f "$dest.new" "$dest"
+      WRAP_CHANGED=1
     fi
-  done
-fi
-# The crag kernel no longer comes from a repo checkout; refresh it from the image like the wrap ELFs.
-if [ -f /opt/vm2api/image-crag/kin-kernel ]; then
-  mkdir -p "$ROOT/share/crag"
-  dest="$ROOT/share/crag/kin-kernel"
-  if [ ! -f "$dest" ] || ! cmp -s /opt/vm2api/image-crag/kin-kernel "$dest"; then
-    cp /opt/vm2api/image-crag/kin-kernel "$dest.new"
-    chmod 755 "$dest.new"
-    mv -f "$dest.new" "$dest"
-    WRAP_CHANGED=1
   fi
+  # Bind-mounted share starts empty; seed the image's signed native package once.
+  node /opt/vm2api/scripts/seed-crag.mjs "$ROOT" /opt/vm2api/image-crag
+}
+
+WRAP_CHANGED=0
+if [ "$STANDBY" = 0 ]; then
+  sync_shared
 fi
-# Bind-mounted share starts empty; seed the image's signed native package once.
-node /opt/vm2api/scripts/seed-crag.mjs "$ROOT" /opt/vm2api/image-crag
+if [ "$MODE" = sync ]; then
+  echo "WRAP_CHANGED=$WRAP_CHANGED"
+  exit 0
+fi
 
 if [ ! -S /var/run/docker.sock ]; then
   echo "vm2api: /var/run/docker.sock not mounted; slot create/start will fail." >&2
@@ -166,8 +214,57 @@ if [ -z "${VM2API_DB_SECRET:-}" ] && [ -z "${KIN_DB_SECRET:-}" ]; then
   env_upsert_if_empty VM2API_DB_SECRET "$VM2API_DB_SECRET" "$ENVF"
 fi
 
-if [ "$WRAP_CHANGED" = 1 ] && [ "${KIN_AUTO_SYNC_WRAP:-0}" = 1 ]; then
-  node /opt/vm2api/scripts/sync-wrap-cli.mjs &
+if [ "$STANDBY" = 0 ]; then
+  export VM2API_BOOTSTRAP_LOCK_FD=9 VM2API_BOOTSTRAP_WRAP_CHANGED="$WRAP_CHANGED"
+fi
+
+# Upgrade guard: if an existing SQLite installation (data/kin.db) upgraded its Compose file
+# without setting VM2API_DB_DRIVER or DATABASE_URL in .env, keep SQLite instead of letting
+# docker-compose.yml's default DATABASE_HOST=127.0.0.1 accidentally boot an empty/unreachable PG.
+if [ "${VM2API_DB_DRIVER:-auto}" = "auto" ] && [ -f "${ROOT}/data/kin.db" ]; then
+  if [ -z "${DATABASE_URL:-}" ] && [ -z "${VM2API_DATABASE_URL:-}" ] \
+    && [ -z "$(env_get_file VM2API_DB_DRIVER "$ENVF")" ] \
+    && [ -z "$(env_get_file DATABASE_URL "$ENVF")" ] \
+    && [ -z "$(env_get_file VM2API_DATABASE_URL "$ENVF")" ]; then
+    VM2API_DB_DRIVER=sqlite
+    export VM2API_DB_DRIVER
+    echo "vm2api: existing SQLite detected (${ROOT}/data/kin.db) with no explicit PG config in .env; keeping SQLite. Run deploy/replace-db-to-pg.sh to migrate to PostgreSQL." >&2
+  fi
+fi
+
+# Wait briefly for PostgreSQL readiness when configured so cold container boots never race PG init
+if [ "${VM2API_DB_DRIVER:-auto}" != "sqlite" ] && { [ "${VM2API_DB_DRIVER:-auto}" = "postgres" ] || [ -n "${DATABASE_URL:-}" ] || [ -n "${VM2API_DATABASE_URL:-}" ] || [ -n "${DATABASE_HOST:-}" ] || [ -n "${PGHOST:-}" ]; }; then
+  if command -v pg_isready >/dev/null 2>&1; then
+    pg_url="${VM2API_DATABASE_URL:-${DATABASE_URL:-}}"
+    pg_ready=0
+    if [ -n "$pg_url" ]; then
+      i=0
+      while [ "$i" -lt 25 ]; do
+        if pg_isready -d "$pg_url" >/dev/null 2>&1; then
+          pg_ready=1
+          break
+        fi
+        i=$((i + 1))
+        sleep 1
+      done
+    else
+      pg_host="${DATABASE_HOST:-${PGHOST:-127.0.0.1}}"
+      pg_port="${DATABASE_PORT:-${PGPORT:-5432}}"
+      pg_user="${DATABASE_USER:-${PGUSER:-vm2api}}"
+      i=0
+      while [ "$i" -lt 25 ]; do
+        if pg_isready -h "$pg_host" -p "$pg_port" -U "$pg_user" >/dev/null 2>&1; then
+          pg_ready=1
+          break
+        fi
+        i=$((i + 1))
+        sleep 1
+      done
+    fi
+    if [ "$pg_ready" != 1 ]; then
+      echo "vm2api: PostgreSQL not ready after 25s pre-wait; handing off to Node pool retry." >&2
+    fi
+  fi
 fi
 
 cd /opt/vm2api

@@ -35,6 +35,32 @@ const MAX_SESSIONS = 8
 const SESSION_ENV = 'KIN_PANEL_SHELL'
 const RC_ENV = 'KIN_PANEL_RC'
 const CREDENTIAL_SYNC_INTERVAL_MS = 60_000
+/**
+ * Native login post-processing (read credentials + import) runs over the node
+ * SSH link; a stalled link must not wedge the panel dialog in "waiting for
+ * confirmation" forever. The deadline is generous: a healthy commit takes
+ * seconds, a slow-but-alive cross-ocean link takes well under a minute.
+ * Read per call so tests (and operators) can tune without a process restart.
+ */
+function loginCommitDeadlineMs() {
+  return Math.max(1_000, Number(process.env.KIN_LOGIN_COMMIT_DEADLINE_MS) || 180_000)
+}
+
+const LOGIN_COMMIT_TIMEOUT_MESSAGE =
+  '凭证确认超时（节点链路无响应）。请稍后在槽位详情确认凭证是否已写入；未写入则重新生成授权链接。'
+
+/** Reject with a stable code when `ms` elapses before `promise` settles. */
+function loginDeadline(promise, ms) {
+  let timer
+  const expired = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(Object.assign(new Error('login_commit_timeout'), { code: 'login_commit_timeout' })),
+      ms,
+    )
+    timer.unref?.()
+  })
+  return Promise.race([promise, expired]).finally(() => clearTimeout(timer))
+}
 
 /** Live guest MOTD. Optional probes must not fail startup or print secrets. */
 const SYSTEM_FACTS_RC = [
@@ -240,7 +266,7 @@ export function panelShellLaunch(cliBin) {
     // session there and expose the nested account file at the home path.
     'export HOME="${HOME:-/home/kincli}"',
     'export CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"',
-    'unset CLAUDE_CODE_VERSION ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_OAUTH_REFRESH_TOKEN',
+    'unset CLAUDE_CODE_VERSION CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_OAUTH_REFRESH_TOKEN',
     'export USER_TYPE=external',
     'mkdir -p "$CLAUDE_CONFIG_DIR"',
     'if [ ! -e "$HOME/.claude.json" ] && [ -f "$CLAUDE_CONFIG_DIR/.claude.json" ]; then ln -s .claude/.claude.json "$HOME/.claude.json" 2>/dev/null || true; fi',
@@ -407,7 +433,7 @@ export function createSlotShell({
       }
     }
     const resize = (cols, rows) => {
-      resizeExec(connect, session.execId, { cols, rows }).catch(() => {})
+      resizeExec(connect, session.execId, { cols, rows }).catch(() => { })
     }
     // Listen before the exec opens: input/resize sent during the Docker round
     // trip would otherwise be dropped (ws does not buffer unhandled messages).
@@ -521,22 +547,43 @@ export function createSlotShell({
       if (ended) return
       ended = true
       clearInterval(syncTimer)
-      const info = await inspectExec(connect, session.execId).catch(() => null)
-      if (size.login && info?.ExitCode !== 124) {
+      // One deadline budget covers every node-link hop of the login commit:
+      // inspectExec, readNativeLoginOauth and importOauth. A stalled link at
+      // any hop (including the exit-code inspect) must not wedge the dialog.
+      const commitDeadlineAt = size.login ? Date.now() + loginCommitDeadlineMs() : 0
+      const remainingMs = () => Math.max(0, commitDeadlineAt - Date.now())
+      let inspectStalled = false
+      const info = await (size.login
+        ? loginDeadline(inspectExec(connect, session.execId), remainingMs())
+        : inspectExec(connect, session.execId)
+      ).catch((err) => {
+        if (err?.code === 'login_commit_timeout') inspectStalled = true
+        return null
+      })
+      if (inspectStalled) {
+        sendError(LOGIN_COMMIT_TIMEOUT_MESSAGE)
+      } else if (size.login && info?.ExitCode !== 124) {
         try {
-          const oauth = await readNativeLoginOauth((args) => capture(args, { maxOutputBytes: 132_000 }), configDir)
-          const existing = getVm(projectRoot, vm.id)
-          if (!existing || existing.node_id !== vm.node_id || slotExecContainer(existing) !== container) {
-            throw new Error('虚拟机已迁移或删除，请重新生成授权链接')
-          }
-          const committed = await importOauth?.({
-            vmId: vm.id,
-            vmPath: path.join(projectRoot, 'vms', `${vm.id}.json`),
-            existing,
-            oauth,
-            source: oauth.source,
-            fromNativeLogin: true,
-          })
+          // readNativeLoginOauth + importOauth both cross the node SSH link.
+          // Without a deadline a stalled link wedges the panel dialog forever.
+          const committed = await loginDeadline(
+            (async () => {
+              const oauth = await readNativeLoginOauth((args) => capture(args, { maxOutputBytes: 132_000 }), configDir)
+              const existing = getVm(projectRoot, vm.id)
+              if (!existing || existing.node_id !== vm.node_id || slotExecContainer(existing) !== container) {
+                throw new Error('虚拟机已迁移或删除，请重新生成授权链接')
+              }
+              return importOauth?.({
+                vmId: vm.id,
+                vmPath: path.join(projectRoot, 'vms', `${vm.id}.json`),
+                existing,
+                oauth,
+                source: oauth.source,
+                fromNativeLogin: true,
+              })
+            })(),
+            remainingMs(),
+          )
           if (!committed?.ok) {
             sendError(committed?.error?.message || '授权成功，但面板未能同步凭证')
           } else {
@@ -545,7 +592,11 @@ export function createSlotShell({
             )
           }
         } catch (err) {
-          sendError(err.code?.startsWith('auth_login_') ? err.message : '面板未能保存原生 CC 凭证，请检查槽位后重试')
+          if (err?.code === 'login_commit_timeout') {
+            sendError(LOGIN_COMMIT_TIMEOUT_MESSAGE)
+          } else {
+            sendError(err.code?.startsWith('auth_login_') ? err.message : '面板未能保存原生 CC 凭证，请检查槽位后重试')
+          }
         }
       } else if (size.login) {
         sendError('授权会话已超时，请重新生成链接')

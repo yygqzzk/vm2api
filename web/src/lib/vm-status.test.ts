@@ -20,6 +20,7 @@ import {
   vmRequestingCount,
   vmCircuit,
   vmCircuitTitle,
+  vmFailedAt,
 } from './vm-status'
 
 function liveVm(over: Partial<Vm> = {}): Vm {
@@ -516,6 +517,26 @@ describe('fleetGroup splits 受限 from 在池 and 关闭调用', () => {
     })
     expect(fleetGroup(fallback7d)).toBe('pool')
   })
+
+  it('paints a spent kernel-recovery budget as a red restriction, not quota', () => {
+    const vm = liveVm({
+      schedulable: true,
+      schedule_state: 'restricted',
+      restriction_reason: 'kernel_faulted',
+      restriction_text: '内核故障',
+      availability: { key: 'ok', usable: true, text: '可用' },
+    })
+    expect(poolStatus(vm)).toMatchObject({
+      key: 'kernel_fault',
+      text: '内核故障',
+      cls: 'bad',
+    })
+    expect(fleetGroup(vm)).toBe('restricted')
+    expect(scheduleStateLabel(vm)).toBe('受限')
+    expect(restrictionCopy(vm)).toBe('内核故障')
+    // 与额度限制区分：不是让人等窗口，而是叫人去诊断。
+    expect(poolStatus(vm).cls).not.toBe('warn')
+  })
 })
 
 describe('unit circuit', () => {
@@ -900,5 +921,25 @@ describe('vmRequestingCount', () => {
   it('falls back to VM inflight when the row has no per-session book', () => {
     expect(vmRequestingCount({ inflight: 2 })).toBe(2)
     expect(vmRequestingCount({ inflight: 0, seat_sessions: null })).toBe(0)
+  })
+})
+
+describe('vmFailedAt', () => {
+  it('uses the recorded unschedulable time, not the latest probe', () => {
+    const revokedAt = '2026-11-21T16:17:18.882Z'
+    const vm = liveVm({
+      unschedulable_at: revokedAt,
+      last_probe: { at: '2026-11-22T05:10:00.000Z' },
+      refreshed_at: '2026-11-21T14:52:07.253Z',
+    } as Partial<Vm>)
+    expect(vmFailedAt(vm)).toBe(Date.parse(revokedAt))
+  })
+
+  it('falls back to the latest probe/refresh stamp when none is recorded', () => {
+    const vm = liveVm({
+      last_probe: { at: '2026-11-22T05:10:00.000Z' },
+      refreshed_at: '2026-11-21T14:52:07.253Z',
+    } as Partial<Vm>)
+    expect(vmFailedAt(vm)).toBe(Date.parse('2026-11-22T05:10:00.000Z'))
   })
 })

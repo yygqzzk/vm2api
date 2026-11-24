@@ -147,6 +147,11 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
     max_sessions_override: kind.kind === 'codex' ? openAIPolicy.sessions_override : false,
     session_slots: kind.kind === 'codex' ? null : (vm.policy?.sessionSlots ?? null),
     session_slots_override: kind.kind === 'codex' ? false : vm.policy?.sessionSlotsOverride === true,
+    max_primary_sessions: kind.kind === 'codex' ? null : (vm.policy?.maxPrimarySessions ?? null),
+    max_primary_sessions_override: kind.kind === 'codex' ? false : vm.policy?.maxPrimarySessionsOverride === true,
+    max_subagents_per_session: kind.kind === 'codex' ? null : (vm.policy?.maxSubagentsPerSession ?? null),
+    max_subagents_per_session_override:
+      kind.kind === 'codex' ? false : vm.policy?.maxSubagentsPerSessionOverride === true,
     scheduling_inherited:
       kind.kind === 'codex'
         ? {
@@ -616,6 +621,67 @@ export function clearScheduleHold(projectRoot, id, reason, { tag = null } = {}) 
   })
 }
 
+/**
+ * Automatic proxy holds: probe failures, egress outages, and the legacy
+ * `|proxy=` markers. `proxy_manually_disabled` is operator intent and is never
+ * lifted by a probe.
+ */
+const AUTOMATIC_PROXY_HOLD = /^(egress_down|proxy_probe_failed)(:|$)|\|proxy=/
+
+/**
+ * Reconcile the slot's automatic proxy hold against its current binding.
+ *
+ * A hold carries the proxy it was written for. Re-binding the slot leaves that
+ * tag pointing at a proxy the slot no longer uses, and every clearing path is
+ * tag-guarded, so the slot stayed restricted forever while the panel blamed a
+ * proxy that was already healthy (#1395). A tag that is not the current binding
+ * therefore no longer protects the hold -- it only limits which holds a probe is
+ * allowed to interpret.
+ */
+export function reconcileProxyScheduleHold(projectRoot, id, proxyId, failure = null) {
+  return writeSchedule(projectRoot, id, (vm) => {
+    if (vm.proxy?.id !== proxyId) return false
+    const hold = vm.schedule_hold
+    const tag = hold?.detail?.tag
+    if (hold && hold.reason !== HOLD_PROXY) return false
+    const manual = hold?.detail?.message === 'proxy_manually_disabled'
+    if (failure != null) {
+      if (manual || (tag === proxyId && hold?.detail?.message === failure)) return false
+      // Retag: the hold has to describe the binding it now applies to.
+      return applyHold(vm, HOLD_PROXY, { tag: proxyId, message: failure })
+    }
+    if (!hold || manual) return false
+    // A hold tagged for another proxy (or an untagged pre-migration one) is only
+    // liftable when a probe wrote it; an unrecognised message keeps its hold.
+    if (tag !== proxyId && !AUTOMATIC_PROXY_HOLD.test(hold.detail?.message || '')) return false
+    return applyClearHold(vm, HOLD_PROXY, { tag })
+  })
+}
+
+/**
+ * Lift a `slot-runtime:` maintenance hold older than minAgeMs. Only
+ * withSlotMaintenance owns that tag namespace (kernel installs use their
+ * operation id, migrations use `migration:`, proxies use their own reason),
+ * and a live cutover always has the watchdog held off the slot — so a stale
+ * hold here belongs to an operation whose process died (e.g. a control-plane
+ * restart mid-cutover) and would otherwise pin a healthy slot out of
+ * scheduling forever.
+ */
+export function clearStaleRuntimeMaintenanceHold(projectRoot, id, { tag, minAgeMs = 0, now = Date.now() } = {}) {
+  if (!String(tag || '').startsWith('slot-runtime:')) return false
+  let lifted = false
+  writeSchedule(projectRoot, id, (vm) => {
+    const hold = vm.schedule_hold
+    // Pin to the exact tag the caller saw stale: a newer cutover owns a new tag.
+    if (hold?.reason !== HOLD_MAINTENANCE || hold.detail?.tag !== tag) return false
+    const at = Date.parse(hold.at || '') || 0
+    if (at <= 0 || now - at < Math.max(0, minAgeMs)) return false
+    applyClearHold(vm, HOLD_MAINTENANCE, { tag, now })
+    lifted = true
+  })
+  return lifted
+}
+
 const LEGACY_WORKER_RELOAD = /^[a-z_]*_worker_reload$/
 
 /**
@@ -769,7 +835,15 @@ export function bindVmProxy(projectRoot, id, proxyInfo) {
   vm.proxy_cli_enabled = hasBoundExit(vm.proxy)
   vm.updated_at = new Date().toISOString()
   atomicWriteJson(file, vm)
-  return summarizeVm(vm)
+  // Re-binding changes the premise of an automatic proxy hold: the proxy it was
+  // written for is no longer this slot's exit. Every clearing path is tag-guarded,
+  // so without reconciling here the slot stayed restricted until the new proxy's
+  // next scheduled probe -- a full probe interval, and never at all when that
+  // proxy was already healthy before the probe that follows (#1395). A manual
+  // hold and another subsystem's hold are preserved inside the reconcile, and a
+  // new exit that turns out to be broken gets a fresh hold from its own probe.
+  const reconciled = vm.proxy?.id ? reconcileProxyScheduleHold(projectRoot, id, vm.proxy.id) : null
+  return reconciled || summarizeVm(vm)
 }
 
 /**

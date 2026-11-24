@@ -8,13 +8,13 @@
  */
 import { createHash } from 'node:crypto'
 import {
-  isUnanswerablePromptMessage,
+  isThirdPartyClientMessage,
   isUsagePolicyErrorMessage,
   makeRefusalGuardError,
   REFUSAL_GUARD_MESSAGE,
 } from './errors.mjs'
 import { extractPrompt, normalizeText } from './distill-detect.mjs'
-import { parseUserId } from '../identity/identity-rewrite.mjs'
+import { claudeCodeAgentRootSession, extractCallerSession, parseUserId } from '../identity/identity-rewrite.mjs'
 import { encodeSignature, refusalAskTurns, refusalSignature, refusalUserDocument } from './refusal-similarity.mjs'
 import { stripEnvironmentSection, stripReminders } from '../protocol/jev-prepare.mjs'
 
@@ -24,6 +24,7 @@ export const REFUSAL_GUARD_SETTING = 'refusal_guard_enabled'
 export const REFUSAL_SIMILARITY_SETTING = 'refusal_similarity_enabled'
 export const REFUSAL_SIMILARITY_VALUE_SETTING = 'refusal_similarity'
 export const REFUSAL_DEVICE_BLOCK_SETTING = 'refusal_device_block_enabled'
+export const REFUSAL_SESSION_BLOCK_SETTING = 'refusal_session_block_enabled'
 export const REFUSAL_SIMILARITY_CHOICES = Object.freeze([80, 85, 90, 95])
 export const RISK_AUDIT_SETTING = 'risk_audit_policy'
 export const DEFAULT_BAN_STEPS = Object.freeze([10, 1440, 0])
@@ -212,12 +213,8 @@ export function upstreamRiskReason(result, phrases = []) {
     .filter(Boolean)
     .join('\n')
     .toLowerCase()
-  if (status === 400 && isUnanswerablePromptMessage(text) && !isUsagePolicyErrorMessage(text)) {
-    return 'upstream:extra_usage_session'
-  }
-  if (status === 503 && isUnanswerablePromptMessage(text) && !isUsagePolicyErrorMessage(text)) {
-    return 'upstream:billing_refusal'
-  }
+  // Third-party client billed against extra usage: not a refusal, not risk.
+  if (isThirdPartyClientMessage(text)) return ''
   const isRejection = [400, 403, 422].includes(status) || [400, 403, 422].includes(httpStatus)
   const failed = isRejection || result?.ok === false || !!error
   if (
@@ -258,6 +255,12 @@ function refusalBlockSuffix(match) {
     return {
       message: ban ? ` 该设备此前已被封禁（${ban}）。` : ' 该设备此前已被封禁。',
       details: ban ? { reason: 'device', ban_reason: ban } : { reason: 'device' },
+    }
+  }
+  if (match.kind === 'session') {
+    return {
+      message: ' 这个会话此前被上游拒答，已永久停止转发；请开启新会话。',
+      details: { reason: 'session' },
     }
   }
   if (match.kind === 'similar') {
@@ -342,6 +345,21 @@ export function riskPrincipal(req) {
   return key ? `key:${key}` : 'platform'
 }
 
+const SESSION_ID_MIN = 8
+const SESSION_ID_MAX = 200
+
+/**
+ * Root caller session for the session block. A Claude Code sub-agent hop maps
+ * back to the main session it belongs to, so a refused session's sub-agents
+ * are blocked with it. '' when the caller sent no usable session.
+ */
+export function refusalSessionId({ inbound, body = inbound, headers } = {}) {
+  const ctx = { inbound: inbound || {}, body: body || {}, headers: headers || {} }
+  const id = String(claudeCodeAgentRootSession(ctx) || extractCallerSession(ctx) || '').trim()
+  if (id.length < SESSION_ID_MIN || id.length > SESSION_ID_MAX) return ''
+  return id
+}
+
 export function refusalPromptSignature(inbound, body = inbound) {
   return encodeSignature(refusalSignature(refusalStrictDocument(inbound, body)))
 }
@@ -366,6 +384,8 @@ export function refusalGuardPolicy(readSetting) {
     similarity,
     device_block_enabled: flagOn(read(REFUSAL_DEVICE_BLOCK_SETTING, true)),
     risk_audit: validAudit ? audit : { ...DEFAULT_RISK_POLICY },
+    // Independent of `enabled`: a refused session stops even with the prompt cache off.
+    session_block_enabled: flagOn(read(REFUSAL_SESSION_BLOCK_SETTING, true)),
   }
 }
 
@@ -447,6 +467,9 @@ export function applyRefusalGuardPatch(settings, body = {}) {
   if (Object.hasOwn(body, 'device_block_enabled') && typeof body.device_block_enabled !== 'boolean') {
     problems.push('device_block_enabled 必须是布尔')
   }
+  if (Object.hasOwn(body, 'session_block_enabled') && typeof body.session_block_enabled !== 'boolean') {
+    problems.push('session_block_enabled 必须是布尔')
+  }
   if (Object.hasOwn(body, 'similarity') && normalizeRefusalSimilarity(body.similarity) == null) {
     problems.push('similarity 只能是 80、85、90、95')
   }
@@ -458,11 +481,24 @@ export function applyRefusalGuardPatch(settings, body = {}) {
   if (typeof body.device_block_enabled === 'boolean') {
     settings.set(REFUSAL_DEVICE_BLOCK_SETTING, body.device_block_enabled)
   }
+  if (typeof body.session_block_enabled === 'boolean') {
+    settings.set(REFUSAL_SESSION_BLOCK_SETTING, body.session_block_enabled)
+  }
   if (Object.hasOwn(body, 'similarity')) {
     settings.set(REFUSAL_SIMILARITY_VALUE_SETTING, normalizeRefusalSimilarity(body.similarity))
   }
   if (risk) settings.set(RISK_AUDIT_SETTING, risk)
   return { ok: true }
+}
+
+/** Pre-hop session decision. Does not write. */
+export function matchRefusalSession({ inbound, body = inbound, headers, sessions } = {}) {
+  if (!sessions || typeof sessions.get !== 'function') return null
+  const sessionId = refusalSessionId({ inbound, body, headers })
+  if (!sessionId) return null
+  const row = sessions.get(sessionId)
+  if (!row) return null
+  return { kind: 'session', sessionId, row }
 }
 
 /**

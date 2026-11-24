@@ -31,7 +31,7 @@ function isCatalogModelId(id) {
   if (s.endsWith('-') || s.endsWith('.')) return false
   if (/\.md$/i.test(s)) return false
   if (/^(gpt-[a-z0-9.-]+|codex-[a-z0-9.-]+)$/i.test(s)) return s.split(/[-.]/).length >= 2
-  if (!/^claude-(opus|sonnet|haiku|fable|3)[a-z0-9.-]*$/i.test(s) && s !== 'auto') return false
+  if (!/^claude-(opus|sonnet|haiku|fable|mythos|3)[a-z0-9.-]*$/i.test(s) && s !== 'auto') return false
   if (s === 'auto') return true
   return s.split('-').length >= 3
 }
@@ -40,6 +40,7 @@ const SETTINGS_KEY = 'model_policy'
 const CONTEXT_1M = CONTEXT_1M_BETA
 const FABLE_51_ID = 'claude-fable-5-1'
 const FABLE_52_ID = 'claude-fable-5-2'
+const MYTHOS_52_ID = 'claude-mythos-5-2'
 const FABLE_51_LEGACY_ID = 'claude-fable-5.1'
 const OPUS_55_ID = 'claude-opus-5-5'
 const OPUS_55_LEGACY_ID = 'claude-opus-5.5'
@@ -404,6 +405,14 @@ export function seedDefaultPolicy() {
     aliases: ['claude-fable-5.2'],
   })
 
+  add(MYTHOS_52_ID, {
+    ...structuredClone(models[FABLE_52_ID]),
+    display_name: 'Mythos 5.2',
+    family: 'mythos',
+    sort: 43,
+    aliases: ['claude-mythos-5.2'],
+  })
+
   add('auto', {
     display_name: 'Auto',
     family: 'auto',
@@ -442,6 +451,7 @@ export function seedDefaultPolicy() {
       'claude-3-5-haiku-latest': 'claude-haiku-4-5-20251001',
       fable: 'claude-fable-5',
       'claude-fable-5.2': FABLE_52_ID,
+      'claude-mythos-5.2': MYTHOS_52_ID,
       [FABLE_51_LEGACY_ID]: FABLE_51_ID,
       [OPUS_55_LEGACY_ID]: OPUS_55_ID,
     },
@@ -492,7 +502,9 @@ export function normalizePolicy(raw) {
               ? 'opus'
               : id.includes('fable')
                 ? 'fable'
-                : 'sonnet',
+                : id.includes('mythos')
+                  ? 'mythos'
+                  : 'sonnet',
           capabilities: heuristicCapabilities(id),
           params: {},
         })
@@ -573,6 +585,7 @@ export function familyOfModelId(id = '') {
   if (s.includes('haiku')) return 'haiku'
   if (s.includes('opus')) return 'opus'
   if (s.includes('fable')) return 'fable'
+  if (s.includes('mythos')) return 'mythos'
   if (s.includes('sonnet')) return 'sonnet'
   return 'other'
 }
@@ -842,14 +855,74 @@ export function getModelParams(modelId = '') {
 
 export const MIN_THINKING_BUDGET = 1024
 
-/** Anthropic rejects thinking.enabled.budget_tokens < 1024. Raise max_tokens with it. */
+function makeThinkingIncompatibleError(message, param = 'max_tokens') {
+  const error = new Error(message)
+  error.status = 400
+  error.code = 'thinking_incompatible'
+  error.body = {
+    type: 'error',
+    error: {
+      type: 'invalid_request_error',
+      code: 'thinking_incompatible',
+      ...(param ? { param } : {}),
+      message,
+      details: { retryable: false },
+    },
+  }
+  return error
+}
+
+/**
+ * Platform-generated manual thinking budgets must satisfy 1024 <= budget_tokens < max_tokens
+ * while preserving caller max_tokens. Rejects max_tokens <= 1024 with 400 thinking_incompatible.
+ */
+export function resolvePlatformThinkingBudget(body = {}, fallbackRaw = 4096) {
+  const fallback = Math.max(MIN_THINKING_BUDGET, Math.floor(Number(fallbackRaw) || 4096))
+  if (body?.max_tokens == null) return fallback
+  const rawMax = Number(body.max_tokens)
+  if (!Number.isFinite(rawMax) || rawMax <= 0) return fallback
+  const maxTokens = Math.floor(rawMax)
+  if (maxTokens <= MIN_THINKING_BUDGET) {
+    throw makeThinkingIncompatibleError(
+      `thinking.budget_tokens must be at least ${MIN_THINKING_BUDGET} and less than max_tokens (got max_tokens=${body.max_tokens}); increase max_tokens above ${MIN_THINKING_BUDGET} or disable thinking.`,
+    )
+  }
+  return Math.min(fallback, Math.max(MIN_THINKING_BUDGET, Math.floor(maxTokens / 2)))
+}
+
+/**
+ * Whether an adaptive-thinking body can be repaired via normalizeThinkingForModel
+ * without violating 1024 <= budget_tokens < max_tokens.
+ */
+export function canRepairAdaptiveThinking(body = {}, modelOverride = null) {
+  if (!body || typeof body !== 'object') return true
+  if (!loaded) loadModelPolicy()
+  if (policy.defaults.normalize_thinking === false) return true
+  const thinking = body.thinking
+  if (!thinking || typeof thinking !== 'object') return true
+  if (String(thinking.type || '').toLowerCase() !== 'adaptive') return true
+  const explicitBudget = Number(thinking.budget_tokens)
+  if (Number.isFinite(explicitBudget) && explicitBudget > 0) return true
+  const entry = getModelEntry(body.model || modelOverride || '')
+  const params = entry.params || {}
+  const caps = entry.capabilities || {}
+  if (params.on_enabled === 'convert_to_adaptive') return true
+  const action = params.on_adaptive || (caps.supports_adaptive ? 'passthrough' : 'convert_to_enabled')
+  if (action !== 'convert_to_enabled') return true
+  if (body.max_tokens == null) return true
+  const rawMax = Number(body.max_tokens)
+  if (!Number.isFinite(rawMax) || rawMax <= 0) return true
+  return Math.floor(rawMax) > MIN_THINKING_BUDGET
+}
+
+/** Anthropic rejects thinking.enabled.budget_tokens < 1024. Preserve explicit caller budgets and max_tokens. */
 export function clampEnabledThinkingBudget(body = {}) {
   const thinking = body?.thinking
   if (!thinking || typeof thinking !== 'object') return body
   if (String(thinking.type || '').toLowerCase() !== 'enabled') return body
   const fallback = Number(getModelParams(body.model || '').thinking_fallback_budget) || 4096
   let budget = Number(thinking.budget_tokens)
-  if (!Number.isFinite(budget) || budget <= 0) budget = fallback
+  if (!Number.isFinite(budget) || budget <= 0) budget = resolvePlatformThinkingBudget(body, fallback)
   if (Number(thinking.budget_tokens) !== budget) {
     body.thinking = { ...thinking, type: 'enabled', budget_tokens: budget }
   }
@@ -902,17 +975,19 @@ export function normalizeThinkingByPolicy(body = {}) {
       return body
     }
     if (action === 'convert_to_enabled') {
+      const explicitBudget = Number(thinking.budget_tokens)
+      const fallback = params.thinking_fallback_budget || policy.defaults.thinking_fallback_budget || 4096
       const budget =
-        Number(thinking.budget_tokens) > 0
-          ? Number(thinking.budget_tokens)
-          : params.thinking_fallback_budget || policy.defaults.thinking_fallback_budget || 4096
+        Number.isFinite(explicitBudget) && explicitBudget > 0
+          ? explicitBudget
+          : resolvePlatformThinkingBudget(body, fallback)
       body.thinking = { type: 'enabled', budget_tokens: budget }
       return clampEnabledThinkingBudget(body)
     }
   }
 
   if (type === 'enabled') {
-    // OAuth (sub2api): keep thinking.enabled. convert_to_adaptive is ignored.
+    // OAuth: keep thinking.enabled. convert_to_adaptive is ignored.
     const action = params.on_enabled || 'passthrough'
     if (action === 'strip') {
       delete body.thinking

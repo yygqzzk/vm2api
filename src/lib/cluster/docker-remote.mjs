@@ -7,16 +7,19 @@
 
 import http from 'node:http'
 import net from 'node:net'
-import { ClusterError, forwardOutStreamLocal } from './ssh-link.mjs'
+import { ClusterError, connectUnixSocket, DOCKER_SOCKET_PATH } from './ssh-link.mjs'
 
-export const DOCKER_SOCKET_PATH = '/var/run/docker.sock'
+export { DOCKER_SOCKET_PATH }
 const MAX_RESPONSE_BYTES = 8 << 20
 
 /** @typedef {() => Promise<import('node:stream').Duplex>} DockerConnector */
 
-/** @returns {DockerConnector} */
-export function sshDocker(client) {
-  return () => forwardOutStreamLocal(client, DOCKER_SOCKET_PATH)
+/**
+ * @param {{ signal?: AbortSignal, long?: boolean }} [opts] passed to the bridge slot queue
+ * @returns {DockerConnector}
+ */
+export function sshDocker(client, opts = {}) {
+  return () => connectUnixSocket(client, DOCKER_SOCKET_PATH, { ...opts, docker: true })
 }
 
 /** @returns {DockerConnector} */
@@ -78,6 +81,8 @@ export async function dockerRequest(
       })
       res.on('end', () => {
         clearTimeout(timer)
+        // Done with this one-shot connection: close it rather than wait for the daemon to.
+        stream.destroy?.()
         resolve({ status: res.statusCode || 0, headers: res.headers, body: Buffer.concat(chunks) })
       })
       res.on('error', (err) => {
@@ -484,6 +489,16 @@ export async function containerAction(connect, id, action, { t } = {}) {
   )
 }
 
+/** Send a signal (e.g. HUP for a config reload) to a running container. */
+export async function signalContainer(connect, id, signal) {
+  if (!/^[A-Z0-9]+$/.test(String(signal || ''))) throw new ClusterError(400, 'invalid_signal', '信号名不合法')
+  await dockerJson(
+    connect,
+    { method: 'POST', path: `${containerPath(id)}/kill?signal=${signal}`, timeoutMs: 30_000 },
+    [204],
+  )
+}
+
 export async function removeContainer(connect, id) {
   await dockerJson(connect, { method: 'DELETE', path: `${containerPath(id)}?force=1&v=1`, timeoutMs: 60_000 }, [204])
 }
@@ -554,44 +569,11 @@ function execPath(execId) {
   return `/exec/${execId}`
 }
 
-/** Interactive terminals keep their existing raw-TTY contract. */
-export function openExecTty(connect, id, opts = {}) {
-  return openExecStream(connect, id, { ...opts, tty: true })
-}
-
-/**
- * Docker exec over a hijacked stream. Non-TTY output has Docker's 8-byte
- * multiplex headers; callers must decode them rather than use a PTY for binary data.
- * @returns {Promise<{ execId: string, stream: import('node:stream').Duplex }>}
- */
-export async function openExecStream(
-  connect,
-  id,
-  { cmd, env = [], workingDir, user, tty = false, cols = 80, rows = 24 } = {},
-) {
-  const created = await dockerJson(
-    connect,
-    {
-      method: 'POST',
-      path: `${containerPath(id)}/exec`,
-      body: {
-        Cmd: cmd,
-        Env: env,
-        Tty: tty,
-        AttachStdin: true,
-        AttachStdout: true,
-        AttachStderr: true,
-        ...(user ? { User: user } : {}),
-        ...(workingDir ? { WorkingDir: workingDir } : {}),
-      },
-    },
-    [201],
-  )
-  const start = `${execPath(created.Id)}/start`
+/** POST /exec/:id/start with an HTTP upgrade; resolves the raw hijacked stream. */
+async function hijackExecStart(connect, execId, startBody) {
+  const start = `${execPath(execId)}/start`
   const socket = await connect()
-  const payload = Buffer.from(
-    JSON.stringify({ Detach: false, Tty: tty, ...(tty ? { ConsoleSize: [rows, cols] } : {}) }),
-  )
+  const payload = Buffer.from(JSON.stringify(startBody))
   const agent = new http.Agent({ keepAlive: false })
   agent.createConnection = () => socket
   const stream = await new Promise((resolve, reject) => {
@@ -643,7 +625,86 @@ export async function openExecStream(
     })
     req.end(payload)
   })
+  return stream
+}
+
+export async function openExecTty(connect, id, { cmd, env = [], user, workingDir, cols = 80, rows = 24 } = {}) {
+  const created = await dockerJson(
+    connect,
+    {
+      method: 'POST',
+      path: `${containerPath(id)}/exec`,
+      body: {
+        Cmd: cmd,
+        Env: env,
+        Tty: true,
+        AttachStdin: true,
+        AttachStdout: true,
+        AttachStderr: true,
+        ...(user ? { User: user } : {}),
+        ...(workingDir ? { WorkingDir: workingDir } : {}),
+      },
+    },
+    [201],
+  )
+  const stream = await hijackExecStart(connect, created.Id, { Detach: false, Tty: true, ConsoleSize: [rows, cols] })
   return { execId: created.Id, stream }
+}
+
+/**
+ * Binary-safe exec: no TTY, so no line discipline rewrites bytes (a TTY turns
+ * 0x03 into SIGINT and CR into LF). Docker multiplexes stdout/stderr in 8-byte
+ * framed records when Tty is false; `onStdout` receives the demuxed stdout bytes,
+ * stdin is written raw to `stream`. Used by the slot desktop to pipe RFB.
+ */
+export async function openExecStream(connect, id, { cmd, env = [], workingDir, user, onStdout, onStderr } = {}) {
+  const created = await dockerJson(
+    connect,
+    {
+      method: 'POST',
+      path: `${containerPath(id)}/exec`,
+      body: {
+        Cmd: cmd,
+        Env: env,
+        Tty: false,
+        AttachStdin: true,
+        AttachStdout: true,
+        AttachStderr: true,
+        ...(user ? { User: user } : {}),
+        ...(workingDir ? { WorkingDir: workingDir } : {}),
+      },
+    },
+    [201],
+  )
+  const stream = await hijackExecStart(connect, created.Id, { Detach: false, Tty: false })
+  if (onStdout || onStderr) {
+    const decode = createDockerFrameDecoder((type, chunk) => {
+      if (type === 2) onStderr?.(chunk)
+      else onStdout?.(chunk)
+    })
+    stream.on('data', decode)
+  }
+  return { execId: created.Id, stream }
+}
+
+/**
+ * Decoder for Docker's multiplexed attach stream: [type, 0, 0, 0, size(u32 BE)]
+ * followed by `size` payload bytes. Frames may straddle chunk boundaries.
+ * @param {(type: number, payload: Buffer) => void} onFrame
+ */
+export function createDockerFrameDecoder(onFrame) {
+  let pending = Buffer.alloc(0)
+  return (chunk) => {
+    pending = pending.length ? Buffer.concat([pending, chunk]) : chunk
+    while (pending.length >= 8) {
+      const size = pending.readUInt32BE(4)
+      if (pending.length < 8 + size) break
+      const type = pending[0]
+      const payload = pending.subarray(8, 8 + size)
+      pending = pending.subarray(8 + size)
+      if (size > 0) onFrame(type, payload)
+    }
+  }
 }
 
 export async function resizeExec(connect, execId, { cols, rows }) {
@@ -659,6 +720,14 @@ export async function imagePresent(connect, ref) {
   if (res.status === 404) return false
   if (res.status !== 200) throw new ClusterError(502, 'docker_api_error', dockerMessage(res))
   return true
+}
+
+/** Local image id (`sha256:…`) for a ref, or null when the engine does not have it. */
+export async function imageIdOrNull(connect, ref) {
+  const res = await dockerRequest(connect, { path: `/images/${encodeURIComponent(ref)}/json`, timeoutMs: 15_000 })
+  if (res.status === 404) return null
+  if (res.status !== 200) throw new ClusterError(502, 'docker_api_error', dockerMessage(res))
+  return JSON.parse(res.body.toString('utf8')).Id || null
 }
 
 /** Every image on the engine (repo tags included); the caller filters. */
@@ -681,11 +750,30 @@ export async function removeImageTag(connect, ref) {
   throw new ClusterError(502, 'docker_api_error', dockerMessage(res))
 }
 
+/** Remove a named volume; a missing volume is not an error. */
+export async function removeVolume(connect, name) {
+  const res = await dockerRequest(connect, {
+    method: 'DELETE',
+    path: `/volumes/${encodeURIComponent(name)}?force=1`,
+    timeoutMs: 30_000,
+  })
+  if (res.status === 204 || res.status === 404) return
+  throw new ClusterError(502, 'docker_volume_remove_failed', dockerMessage(res))
+}
+
 export async function inspectNetworkOrNull(connect, name) {
   const res = await dockerRequest(connect, { path: `/networks/${encodeURIComponent(name)}`, timeoutMs: 15_000 })
   if (res.status === 404) return null
   if (res.status !== 200) throw new ClusterError(502, 'docker_api_error', dockerMessage(res))
   return JSON.parse(res.body.toString('utf8'))
+}
+
+/** Every network on the node, IPAM included, so subnet allocation can see what is taken. */
+export async function listNetworks(connect) {
+  const res = await dockerRequest(connect, { path: '/networks', timeoutMs: 20_000 })
+  if (res.status !== 200) throw new ClusterError(502, 'docker_api_error', dockerMessage(res))
+  const parsed = JSON.parse(res.body.toString('utf8'))
+  return Array.isArray(parsed) ? parsed : []
 }
 
 export async function createNetwork(connect, body) {

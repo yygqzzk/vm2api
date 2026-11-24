@@ -29,9 +29,9 @@
 <details>
 <summary>点击展开赞助商说明 · Click to expand</summary>
 
-<a href="https://proxylane.dev/zh-cn/isp-proxies?utm_source=vm2api&utm_medium=affiliate&utm_campaign=vm2api_sponsor_202610&utm_content=github_readme"><img src="docs/images/sponsor-proxylane.png" alt="ProxyLane（赞助商）" width="100%" /></a>
+<a href="https://proxylane.dev/go/vm2api-gh"><img src="docs/images/sponsor-proxylane.png" alt="ProxyLane（赞助商）" width="100%" /></a>
 
-**赞助商（ProxyLane）**：AI 账号专用的原生静态住宅 IP，Scamalytics 低欺诈评分，每个 IP 独享，不限流量，$3.90 起。一个槽位绑一个 IP：把 SOCKS5 `host:port:user:pass` 粘贴到「代理池」→「添加代理」即可。首次购买优惠码 `VM2API30` 享 7 折。详见 [ProxyLane](https://proxylane.dev/zh-cn/isp-proxies?utm_source=vm2api&utm_medium=affiliate&utm_campaign=vm2api_sponsor_202610&utm_content=github_readme)。
+**赞助商（ProxyLane）**：Claude Max 专用的原生静态住宅 IP：从未用于注册 Claude 账号，严格筛选 IP 与网段，Scamalytics 低欺诈评分，一个号一个独享 IP，不限流量，$7.90 起。一个槽位绑一个 IP：把 SOCKS5 `host:port:user:pass` 粘贴到「代理池」→「添加代理」即可。首次购买优惠码 `VM2API30` 享 7 折（有效期到 12 月 31 日）。详见 [ProxyLane](https://proxylane.dev/go/vm2api-gh)。
 
 </details>
 
@@ -410,6 +410,8 @@ VM 页「总计」按当前账号累计本平台已记录的官方价费用和 t
 
 ## 开发验证与 CI
 
+**提 PR 前先确认目标分支（base）是 `dev`。** 功能与修复 PR 一律指向 `dev`，分支从 `origin/dev` 切出；`main` 只接受 `dev → main` 的发版 PR 或 `hotfix/<slug>`，tag 只打在 `main` 上。base 选错不用重开 PR，在 PR 页面标题下方的 base 下拉框改成 `dev` 即可。分支、工作树与发版流程见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。
+
 CI 配置以 [`.github/workflows/test.yml`](.github/workflows/test.yml) 为准，使用 Node.js 22、pnpm 10 和 Go 1.25。日常验证优先运行本次改动涉及的核心测试或指定测试文件，完整回归按需运行。
 
 先按需安装依赖：后端 `npm ci`，前端 `pnpm -C web install --frozen-lockfile`。以下命令均在仓库根目录执行：
@@ -437,7 +439,7 @@ CI 配置以 [`.github/workflows/test.yml`](.github/workflows/test.yml) 为准�
 
 原有 `npm test` / `npm run test:all` 仍执行后端全量单测和 `worker` race 测试，不包含前端、`api-kernel`、`redact` 或 E2E。CI 绿灯只表示该次实际执行的检查通过；日常 CI 不代表全量、ARM 或生产验证已经完成。
 
-Daily CI runs core tests plus added or modified test files for affected components. Full regression and formatting checks are available with `full=true`; native ARM packaging is enabled separately with `arm64=true`.
+Open pull requests against `dev`, branched from `origin/dev`; `main` only takes release PRs from `dev` or `hotfix/<slug>`. If you opened one against `main`, switch the base with the dropdown — no need to reopen. Daily CI runs core tests plus added or modified test files for affected components. Full regression and formatting checks are available with `full=true`; native ARM packaging is enabled separately with `arm64=true`.
 
 ---
 

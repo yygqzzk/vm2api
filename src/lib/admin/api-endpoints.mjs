@@ -2,6 +2,7 @@ import crypto from 'node:crypto'
 import { resolveStoreDb } from '../db/database.mjs'
 import { ApiEndpointsRepo } from '../db/repos/api-endpoints-repo.mjs'
 import {
+  geminiModelsUrl,
   mergeModelLists,
   modelsUrl,
   parseUpstreamModels,
@@ -10,7 +11,12 @@ import {
   upstreamAuthHeaders,
 } from '../pool/api-presets.mjs'
 import { forwardApi, readApiJson } from '../transport/api-kernel-client.mjs'
-import { AUTH_SCHEME_X_API_KEY, resolveAuthScheme } from '../oauth/auth-scheme.mjs'
+import {
+  AUTH_SCHEME_GOOG_API_KEY,
+  AUTH_SCHEME_X_API_KEY,
+  normalizeAuthScheme,
+  resolveAuthScheme,
+} from '../oauth/auth-scheme.mjs'
 
 function nowIso() {
   return new Date().toISOString()
@@ -31,6 +37,24 @@ function riskReviewEnabled(value) {
   return value === true
 }
 
+const BODY_POLICIES = ['persona', 'caller']
+
+/**
+ * How an API endpoint treats the caller's request body.
+ * `persona` (default) keeps the historical behaviour: the configured subscription
+ * persona replaces the caller's identity and billing blocks. `caller` forwards the
+ * caller's own body instead, for upstreams that read those blocks themselves (#1321).
+ */
+function bodyPolicy(value) {
+  if (value === undefined) return BODY_POLICIES[0]
+  if (typeof value !== 'string' || !BODY_POLICIES.includes(value)) {
+    throw Object.assign(new Error(`body_policy must be one of ${BODY_POLICIES.join(', ')}`), {
+      code: 'invalid_body_policy',
+    })
+  }
+  return value
+}
+
 function maskUpstreamKey(key) {
   const s = String(key || '')
   if (s.length <= 8) return s.slice(0, 2) + '…'
@@ -40,6 +64,12 @@ function maskUpstreamKey(key) {
 function endpointAuthScheme(ep = {}, fallbackProtocol = '') {
   const protocol = resolvePreset(ep.kind, ep).protocol || fallbackProtocol
   if (protocol === 'openai') return 'authorization_bearer'
+  if (protocol === 'gemini') {
+    return (
+      normalizeAuthScheme(ep.auth_scheme || ep.headers?.auth_scheme || ep.headers?.anthropic_apikey_auth_scheme) ||
+      AUTH_SCHEME_GOOG_API_KEY
+    )
+  }
   return (
     resolveAuthScheme({
       mode: 'apikey',
@@ -72,11 +102,13 @@ export function publicEndpointView(ep, { reveal = false } = {}) {
     kind: resolvePreset(ep.kind, ep).kind,
     protocol: resolvePreset(ep.kind, ep).protocol,
     risk_review_enabled: ep.risk_review_enabled === true,
+    body_policy: BODY_POLICIES.includes(ep.body_policy) ? ep.body_policy : BODY_POLICIES[0],
     base_url: resolvePreset(ep.kind, ep).base_url || ep.base_url,
     headers: stripAuthSchemeHeader(ep.headers),
     auth_scheme: endpointAuthScheme(ep),
     disable_cooling: !!ep.disable_cooling,
     priority: Number(ep.priority) || 0,
+    owner_user_id: ep.owner_user_id ? String(ep.owner_user_id).trim() || null : null,
     created_at: ep.created_at,
     updated_at: ep.updated_at,
     api_key_entries: (ep.api_key_entries || []).map((k) => ({
@@ -139,12 +171,14 @@ export class ApiEndpointStore {
       kind: preset.kind,
       protocol: preset.protocol,
       risk_review_enabled: riskReviewEnabled(input.risk_review_enabled),
+      body_policy: bodyPolicy(input.body_policy),
       headers: headersWithAuthScheme(
         input.headers && typeof input.headers === 'object' ? input.headers : {},
         input.auth_scheme || input.authScheme,
       ),
       disable_cooling: !!input.disable_cooling,
       priority: Number(input.priority) || 0,
+      owner_user_id: input.owner_user_id ? String(input.owner_user_id).trim() || null : null,
       created_at: nowIso(),
       updated_at: nowIso(),
     }
@@ -162,6 +196,7 @@ export class ApiEndpointStore {
     if (patch.name != null) rec.name = String(patch.name).trim().slice(0, 80) || rec.name
     if (patch.disabled != null) rec.disabled = !!patch.disabled
     if (patch.risk_review_enabled !== undefined) rec.risk_review_enabled = riskReviewEnabled(patch.risk_review_enabled)
+    if (patch.body_policy !== undefined) rec.body_policy = bodyPolicy(patch.body_policy)
     if (patch.prefix != null) rec.prefix = String(patch.prefix).trim()
     if (patch.kind != null || patch.protocol != null || patch.base_url != null) {
       const preset = resolvePreset(patch.kind ?? rec.kind, {
@@ -182,6 +217,9 @@ export class ApiEndpointStore {
     }
     if (patch.disable_cooling != null) rec.disable_cooling = !!patch.disable_cooling
     if (patch.priority != null) rec.priority = Number(patch.priority) || 0
+    if (Object.prototype.hasOwnProperty.call(patch, 'owner_user_id')) {
+      rec.owner_user_id = patch.owner_user_id ? String(patch.owner_user_id).trim() || null : null
+    }
     rec.updated_at = nowIso()
     this.repo.updateEndpoint(rec)
     if (Array.isArray(patch.models)) this.replaceModels(id, patch.models)
@@ -264,20 +302,58 @@ export async function fetchUpstreamModels({
     throw Object.assign(new Error('base_url must be http(s)'), { code: 'invalid_base_url' })
   }
 
+  const authHeaders = {
+    accept: 'application/json',
+    ...upstreamAuthHeaders(preset.protocol, key, {
+      ...headers,
+      auth_scheme: auth_scheme || headers.auth_scheme || headers.anthropic_apikey_auth_scheme,
+    }),
+  }
+
   const models = []
+  if (preset.protocol === 'gemini') {
+    let pageToken = ''
+    let fallbackToV1 = false
+    for (let page = 0; page < 8; page++) {
+      const upstream = await forward({
+        cfg,
+        method: 'GET',
+        url: geminiModelsUrl(preset.base_url, { pageToken, version: 'v1beta' }),
+        headers: authHeaders,
+        body: '',
+        proxyUrl: proxy_url,
+        timeoutMs: 30_000,
+      })
+      const status = Number(upstream.statusCode) || 502
+      const payload = await readApiJson(upstream)
+      const isJsonObject = payload != null && typeof payload === 'object'
+      if (page === 0 && (!isJsonObject || status === 404 || status === 405)) {
+        fallbackToV1 = true
+        break
+      }
+      if (status >= 400) {
+        const message = payload?.error?.message || payload?.message || `upstream ${status}`
+        throw Object.assign(new Error(String(message).slice(0, 300)), {
+          code: 'fetch_models_failed',
+          status,
+        })
+      }
+      models.push(...parseUpstreamModels(payload, 'gemini'))
+      if (!payload?.nextPageToken) break
+      pageToken = String(payload.nextPageToken)
+    }
+    if (!fallbackToV1) {
+      return { kind: preset.kind, protocol: preset.protocol, base_url: preset.base_url, models }
+    }
+  }
+
   let afterId = ''
   for (let page = 0; page < 8; page++) {
     const upstream = await forward({
       cfg,
       method: 'GET',
       url: modelsUrl(preset.base_url, { afterId }),
-      headers: {
-        accept: 'application/json',
-        ...upstreamAuthHeaders(preset.protocol, key, {
-          ...headers,
-          auth_scheme: auth_scheme || headers.auth_scheme || headers.anthropic_apikey_auth_scheme,
-        }),
-      },
+      headers: authHeaders,
       body: '',
       proxyUrl: proxy_url,
       timeoutMs: 30_000,
@@ -289,6 +365,12 @@ export async function fetchUpstreamModels({
       throw Object.assign(new Error(String(message).slice(0, 300)), {
         code: 'fetch_models_failed',
         status,
+      })
+    }
+    if (payload == null || typeof payload !== 'object') {
+      throw Object.assign(new Error('上游 /v1/models 未返回有效的 JSON 模型列表'), {
+        code: 'fetch_models_failed',
+        status: 502,
       })
     }
     models.push(...parseUpstreamModels(payload, preset.protocol))

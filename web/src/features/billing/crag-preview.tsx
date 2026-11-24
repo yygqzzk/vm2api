@@ -1,13 +1,27 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { Eye, EyeOff, Info, ReceiptText } from 'lucide-react'
+import { Eye, EyeOff, Info, KeyRound, ReceiptText } from 'lucide-react'
+import { IconTelegram } from '@/assets/brand-icons'
 import {
+  CRAG_GEMINI_DEFAULT_PLAN,
+  CRAG_GEMINI_UNIT_PRICE_MINOR,
   copyDefaults,
   copyLabels,
   formatPlanDetails,
+  monthlyFor,
   termLabel,
+  yuan,
   type CopyKey,
   type DraftPlan,
 } from './crag-catalog'
+import {
+  FEATURED_LABEL_MAX,
+  densityClass,
+  featuredFallback,
+  join,
+  normalizeLayout,
+  ordersSideClass,
+  pickerColumnClass,
+} from './crag-layout'
 import {
   CommercePlanContent,
   CommerceRulesSummary,
@@ -64,7 +78,10 @@ export function CragPreviewPage() {
     }
     window.addEventListener('message', onMessage)
     if (window.parent !== window)
-      window.parent.postMessage({ type: 'crag-preview:ready' }, '*')
+      window.parent.postMessage(
+        { type: 'crag-preview:ready', caps: ['layout-1'] },
+        '*'
+      )
     return () => {
       window.removeEventListener('message', onMessage)
       root.classList.remove('light', 'dark')
@@ -137,6 +154,24 @@ export function PreviewCanvas({
   const customEnabled = !!commerce && commerce.custom_enabled !== false
   const empty = !plans.length && !customEnabled
 
+  // 纯函数，不包 useMemo：本文件的测试用手搓的 react mock 按调用顺序分配
+  // useState/useRef/useEffect 游标，这里新增任何 hook 都会让既有断言错位。
+  const layout = normalizeLayout(presentation.layout)
+  const density = layout.cardDensity
+  const space = densityClass[density]
+  const featuredSku =
+    layout.featuredSku && plans.some((plan) => plan.sku === layout.featuredSku)
+      ? layout.featuredSku
+      : null
+  // 与正式买家页走同一张表、同一套缺省语义，这样父页未开布局时画布与真实
+  // 买家页也一致（本页原先恒单列、恒旁置，与买家页默认并不相符）。
+  const planGrid = join(
+    'grid',
+    space.grid,
+    pickerColumnClass[layout.planColumns]
+  )
+  const ordersSide = layout.ordersPosition === 'side'
+
   function copy(key: CopyKey) {
     const maxLength = key.includes('title') ? 120 : 500
     return (
@@ -175,6 +210,33 @@ export function PreviewCanvas({
       ...details,
       term: termLabel(plan.term, plan.sku, plan.months),
     }
+    const monthly = monthlyFor(
+      layout,
+      displayPlan.amount_minor,
+      plan.term,
+      plan.months
+    )
+    // 推荐角标是布局在画布上唯一有自然落点的可视元素，故只让它内联可编辑；
+    // 列数 / 密度 / 订单区位置 / featured_sku 仍由父页属性栏负责。
+    // 回传走 edit 通道的 target:'layout'，不是 crag-preview:layout —— 父页那条
+    // 通道只认 plan_columns / orders_position / featured_sku，别的 key 会被丢弃。
+    const featured =
+      plan.sku === featuredSku ? (
+        edit ? (
+          <PreviewField
+            label='推荐角标'
+            value={layout.featuredLabel ?? ''}
+            fallback={featuredFallback}
+            editable
+            maxLength={FEATURED_LABEL_MAX}
+            onSave={(value) =>
+              onEdit?.({ target: 'layout', key: 'featured_label', value })
+            }
+          />
+        ) : (
+          (layout.featuredLabel ?? featuredFallback)
+        )
+      ) : undefined
     const slots = edit
       ? {
           name: (
@@ -239,7 +301,9 @@ export function PreviewCanvas({
         onClick={() => {
           if (edit || plan.remaining !== 0) onPick(plan.sku)
         }}
-        className={`${commerce ? 'flex items-start gap-3 text-sm' : 'grid min-h-16 min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-x-3'} cursor-pointer rounded-xl border bg-card p-4 text-card-foreground shadow-xs transition-colors hover:border-primary/50 ${selected === plan.sku ? 'border-primary bg-primary/5 ring-2 ring-primary/20' : ''}`}
+        className={`${commerce ? 'flex items-start gap-3 text-sm' : join('grid', space.minHeight, 'min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-x-3')} cursor-pointer rounded-xl border bg-card ${space.card} text-card-foreground shadow-xs transition-colors hover:border-primary/50 ${selected === plan.sku ? 'border-primary bg-primary/5 ring-2 ring-primary/20' : ''}`}
+        data-density={density}
+        data-featured={plan.sku === featuredSku || undefined}
       >
         <input
           type='radio'
@@ -252,11 +316,20 @@ export function PreviewCanvas({
           className='mt-1 size-4 shrink-0 accent-primary'
         />
         {commerce ? (
-          <CommercePlanContent plan={displayPlan} slots={slots} />
+          <CommercePlanContent
+            plan={displayPlan}
+            slots={slots}
+            density={density}
+            featured={featured}
+            monthly={monthly}
+          />
         ) : (
           <PickerPlanContent
             plan={option}
             slots={slots}
+            density={density}
+            featured={featured}
+            monthly={monthly}
             duplicateTerm={
               plans.filter(
                 (candidate) =>
@@ -282,15 +355,29 @@ export function PreviewCanvas({
             未发布草稿 · 仅预览，不可购买；库存为草稿配置，不是实时余量。
           </span>
         </div>
-        <header className='mb-6'>
-          <h2 className='text-2xl font-bold tracking-tight sm:text-3xl'>
-            {copy('title')}
-          </h2>
-          <p className='mt-2 max-w-prose text-sm leading-6 text-muted-foreground'>
-            {copy('description')}
-          </p>
+        <header className='mb-6 flex flex-wrap items-start justify-between gap-3'>
+          <div className='min-w-0'>
+            <h2 className='text-2xl font-bold tracking-tight sm:text-3xl'>
+              {copy('title')}
+            </h2>
+            <p className='mt-2 max-w-prose text-sm leading-6 text-muted-foreground'>
+              {copy('description')}
+            </p>
+          </div>
+          <a
+            href='https://t.me/vm2api'
+            target='_blank'
+            rel='noreferrer'
+            title='Telegram 群 @vm2api'
+            className='inline-flex h-8 shrink-0 items-center gap-1.5 rounded-md border border-[#229ED9]/40 bg-[#229ED9]/10 px-2.5 text-sm font-medium text-[#229ED9] outline-hidden transition-colors hover:bg-[#229ED9]/18 focus-visible:ring-2 focus-visible:ring-ring'
+          >
+            <IconTelegram aria-hidden className='size-4 shrink-0' />
+            TG 群
+          </a>
         </header>
-        <div className='grid min-w-0 items-start gap-5 xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]'>
+        <div
+          className={`grid min-w-0 items-start gap-5 ${ordersSide ? ordersSideClass : ''}`}
+        >
           <section className='min-w-0 space-y-4 rounded-2xl border bg-card p-4 text-card-foreground shadow-sm sm:p-5'>
             <div className='flex items-center justify-between gap-3'>
               <h2 className='min-w-0 flex-1 text-base leading-6 font-semibold'>
@@ -315,7 +402,7 @@ export function PreviewCanvas({
                 自定义计价未启用或规则未完整。
               </p>
             ) : null}
-            <div className='grid gap-3'>{plans.map(card)}</div>
+            <div className={planGrid}>{plans.map(card)}</div>
             {customEnabled ? (
               <label className='flex cursor-pointer items-start gap-3 rounded-xl border bg-card p-4 text-sm shadow-xs transition-colors hover:border-primary/50 has-checked:border-primary has-checked:bg-primary/5 has-checked:ring-2 has-checked:ring-primary/20'>
                 <input
@@ -374,6 +461,78 @@ export function PreviewCanvas({
             </section>
           </section>
         </div>
+        <section
+          aria-label='兑换码预览'
+          className='mt-5 min-w-0 space-y-4 rounded-2xl border bg-card p-4 text-card-foreground shadow-sm sm:p-5'
+        >
+          <div className='flex flex-wrap items-center justify-between gap-2'>
+            <div className='flex items-center gap-2'>
+              <KeyRound className='size-4 text-primary' aria-hidden />
+              <h2 className='text-base font-semibold'>
+                兑换码兑换（CRAG / CRAGGemini）
+              </h2>
+            </div>
+            <span className='rounded-full bg-violet-500/10 px-2.5 py-0.5 text-xs font-medium text-violet-700 ring-1 ring-violet-500/20 ring-inset dark:text-violet-300'>
+              支持多码叠加
+            </span>
+          </div>
+          {!plans.some((plan) => plan.product === 'craggemini') ? (
+            <div
+              data-sku={CRAG_GEMINI_DEFAULT_PLAN.sku}
+              className='flex flex-wrap items-start justify-between gap-3 rounded-xl border border-sky-500/25 bg-sky-500/5 p-4 text-sm'
+            >
+              <div className='min-w-0 space-y-1'>
+                <div className='flex flex-wrap items-center gap-1.5'>
+                  <span className='font-semibold'>
+                    {CRAG_GEMINI_DEFAULT_PLAN.name}
+                  </span>
+                  <span className='inline-flex items-center rounded-full bg-sky-500/10 px-2 py-0.5 text-[11px] leading-4 font-medium text-sky-700 ring-1 ring-sky-500/20 ring-inset dark:text-sky-300'>
+                    CRAGGemini
+                  </span>
+                  <span className='inline-flex items-center rounded-full bg-violet-500/10 px-2 py-0.5 text-[11px] leading-4 font-medium text-violet-700 ring-1 ring-violet-500/20 ring-inset dark:text-violet-300'>
+                    可叠加
+                  </span>
+                  <span className='inline-flex items-center rounded-full bg-background px-2 py-0.5 text-[11px] leading-4 font-medium text-muted-foreground tabular-nums ring-1 ring-border ring-inset'>
+                    {yuan(CRAG_GEMINI_UNIT_PRICE_MINOR)} / 槽
+                  </span>
+                </div>
+                <p className='text-xs leading-5 text-muted-foreground'>
+                  {CRAG_GEMINI_DEFAULT_PLAN.description}
+                </p>
+              </div>
+              <div className='text-end tabular-nums'>
+                <span className='block text-lg font-bold tracking-tight'>
+                  {yuan(CRAG_GEMINI_DEFAULT_PLAN.amount_minor)}
+                </span>
+                <span className='block text-xs text-muted-foreground'>
+                  1 个月 · 10 槽位
+                </span>
+              </div>
+            </div>
+          ) : null}
+          <div className='grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto]'>
+            <input
+              type='text'
+              readOnly
+              value=''
+              placeholder='输入 CRAGR1.… 宿主机兑换码（支持 1个月/10槽可叠加码与 7天/10槽测试码）'
+              aria-label='兑换码预览输入'
+              className='h-9 w-full rounded-md border bg-muted/40 px-3 text-sm text-foreground placeholder:text-muted-foreground'
+            />
+            <button
+              type='button'
+              aria-disabled='true'
+              className='inline-flex h-9 items-center justify-center rounded-md border bg-primary/10 px-4 text-sm font-medium text-primary'
+            >
+              兑换 CRAGGemini
+            </button>
+          </div>
+          <p className='text-xs leading-5 text-muted-foreground'>
+            首批测试支持 7 天 / 10 槽测试兑换码（单码可用 100
+            次，同宿主机重复兑换幂等不额外扣次，可与 1 个月 / 10
+            槽兑换码叠加）。 仅画布预览，不发起真实兑换。
+          </p>
+        </section>
       </div>
     </main>
   )

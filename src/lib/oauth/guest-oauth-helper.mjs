@@ -1,7 +1,8 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { hostProxyUrlForVm, slotHost } from '../vm/slot-host.mjs'
+import { slotHost } from '../vm/slot-host.mjs'
+import { resolveSlotOAuthProxy } from '../vm/proxy-resolve.mjs'
 import { slotExecArgv } from '../vm/slot-exec.mjs'
 import { resolveSlotClaude } from '../vm/slot-engine.mjs'
 import { slotExec, startSlotReady } from '../vm/slot-runtime.mjs'
@@ -10,9 +11,13 @@ import { hasBoundExit } from '../vm/egress.mjs'
 import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
 import { postRustKernelTelemetryEvent, rustKernelHealth, rustKernelPaths } from '../transport/rust-kernel-client.mjs'
 import { runSlotProcess } from '../transport/slot-oauth.mjs'
+import { OAUTH_REQUEST_TIMEOUT_MS } from './oauth-contract.mjs'
 
 const pendingAttempt = Symbol('guestOAuthAttempt')
-const safeCode = (value, fallback) => (/^[a-z][a-z0-9_]{0,63}$/.test(value) ? value : fallback)
+// `test` stringifies its argument, so undefined/null match the pattern as "undefined"/"null"
+// and were returned as the code. Require a string, like every other code guard in the tree.
+const safeCode = (value, fallback) =>
+  typeof value === 'string' && /^[a-z][a-z0-9_]{0,63}$/.test(value) ? value : fallback
 
 function fail(code, message) {
   return Object.assign(new Error(message), { code })
@@ -24,6 +29,7 @@ export async function prepareSlotOAuth({
   projectRoot = exec?.projectRoot,
   routing = {},
   timeoutMs,
+  proxyPool,
   startReady = startSlotReady,
   readHealth = rustKernelHealth,
 } = {}) {
@@ -33,7 +39,11 @@ export async function prepareSlotOAuth({
   const vm = getVm(projectRoot, exec.vmId)
   if (!vm?.id) throw fail('oauth_vm_required', 'OAuth target VM is missing')
   const host = slotHost(vm)
-  if (host.native) return { exec: { ...exec, vm }, host }
+  // A native node has no container: the helper runs on the controller, through
+  // this VM's exit as it is now. The caller's payload value is never the exit.
+  if (host.native) {
+    return { exec: { ...exec, vm }, host, controlPlane: true, proxyUrl: resolveSlotOAuthProxy(vm, proxyPool) }
+  }
   const blocked = proxyBlockedReason(vm.proxy)
   if (blocked || !hasBoundExit(vm.proxy)) {
     throw fail(blocked || 'proxy_required', 'OAuth requires the target VM bound egress')
@@ -43,13 +53,14 @@ export async function prepareSlotOAuth({
   // Legacy kernels cannot gain telemetry by restarting. Exchange through the
   // same bound exit on the controller before entering the slot startup path.
   if (health?.vm_telemetry !== true || health?.telemetry_ready !== true) {
-    const proxyUrl = hostProxyUrlForVm(vm)
-    if (proxyUrl == null) throw fail('proxy_required', 'OAuth requires the target VM bound egress')
-    return { exec, host, controlPlane: true, proxyUrl }
+    return { exec, host, controlPlane: true, proxyUrl: resolveSlotOAuthProxy(vm, proxyPool) }
   }
   const boot = await startReady(vm, projectRoot, { routing, allowMissingCredential: true, timeoutMs })
   if (!boot?.ok || boot.rust_ok === false || !boot.rust?.ok || boot.rust.skipped) {
-    throw fail(boot?.rust?.code || boot?.code || 'oauth_runtime_not_ready', 'Target VM native CLI is not ready')
+    // One sanitized code feeds both err.code and the message, so they cannot disagree.
+    // The default inside keeps a missing code from being stringified to "undefined" by safeCode.
+    const code = safeCode(boot?.rust?.code || boot?.code || 'oauth_runtime_not_ready', 'oauth_runtime_not_ready')
+    throw fail(code, `Target VM native CLI is not ready (${code})`)
   }
   const patch = { ...(boot.runtime ? { runtime: boot.runtime } : {}), status: 'running' }
   const stored = patchVmRecord(projectRoot, vm.id, patch)
@@ -83,24 +94,42 @@ export async function finishOAuthImport(oauth, ok) {
   return attempt.record(ok ? 'success' : 'failure', ok ? undefined : 'credential_import_failed')
 }
 
+/**
+ * A controller-side exchange has no env of its own: hand the helper the slot's
+ * **worker** config (`worker.json`), which is what carries `vm_id`, `proxy_url`
+ * and `egress_mode`. `kernel.json` lacks `egress_mode`, and an empty proxy there
+ * made the worker refuse every dial ("upstream transport failed").
+ */
+function workerConfig(exec) {
+  try {
+    const runDir = rustKernelPaths(exec).runDir
+    const configPath = runDir ? path.join(runDir, 'worker.json') : null
+    return configPath && fs.existsSync(configPath) ? { worker_config_path: configPath } : {}
+  } catch {
+    return {}
+  }
+}
+
 export async function runGuestOAuthAuthService(
   payload,
   {
     exec,
     projectRoot = exec?.projectRoot,
     routing,
-    timeoutMs = 15000,
+    timeoutMs = OAUTH_REQUEST_TIMEOUT_MS,
+    proxyPool,
     prepare = prepareSlotOAuth,
     runDocker = runSlotProcess,
     postTelemetry = postRustKernelTelemetryEvent,
     runNative,
   } = {},
 ) {
-  const context = await prepare({ exec, projectRoot, routing, timeoutMs })
+  const context = await prepare({ exec, projectRoot, routing, timeoutMs, proxyPool })
   const { host, configDir, home } = context
   exec = context.exec
-  if (host.native) return runNative(payload)
-  if (context.controlPlane) return runNative({ ...payload, proxy_url: context.proxyUrl })
+  // Native nodes and legacy kernels both exchange on the controller, through the
+  // exit prepare resolved for this VM. Guest execution is below.
+  if (context.controlPlane) return runNative({ ...payload, proxy_url: context.proxyUrl, ...workerConfig(exec) })
   const bin = host.bins.oauthAuth
   if (!bin) throw fail('oauth_auth_bin_missing', 'Target VM OAuth helper is not installed')
   const argv = slotExecArgv(exec.vm, [bin], {
@@ -110,6 +139,12 @@ export async function runGuestOAuthAuthService(
     env: {
       HOME: home,
       CLAUDE_CONFIG_DIR: configDir,
+      // The worker config (`worker.json`) carries vm_id/proxy_url/egress_mode and
+      // is what `kin-worker oauth session-code` needs; the kernel config does not.
+      KIN_WORKER_CONFIG: '/run/kin/worker.json',
+      // 'local' retries the browser stage on the local egress when the bound
+      // proxy is invalid; anything else reports proxy_invalid to the panel.
+      KIN_OAUTH_PROXY_FALLBACK: String(process.env.KIN_OAUTH_PROXY_FALLBACK || ''),
       KERNEL_CONFIG: '/run/kin/kernel.json',
       HTTP_PROXY: '',
       HTTPS_PROXY: '',
@@ -145,27 +180,21 @@ export async function runGuestOAuthAuthService(
   await record('start')
   try {
     const selected = resolveSlotClaude(exec.vm, routing, host)
-    let claudeVersion = payload.claude_version
-    if (selected.native) {
-      const version = await runDocker(
-        slotExecArgv(exec.vm, [selected.bin, '--version'], { user: host.execUser(exec.vm) }),
-        {
-          env: host.dockerEnv(),
-          timeoutMs: Math.min(timeoutMs, 5000),
-        },
-      )
-      claudeVersion =
-        version?.code === 0 && !version.timed_out && !version.output_limit
-          ? /^([0-9]+\.[0-9]+\.[0-9]+)(?:\s|$)/.exec(String(version.stdout || '').trim())?.[1]
-          : undefined
-      if (!claudeVersion)
-        throw fail('oauth_cli_version_unavailable', 'Cannot read the selected native Claude CLI version')
-    }
-    // Linux slots join a kin-eg-* transparent network. A proxy URL may be a
-    // controller-local forwarder and is not reachable from inside the guest.
+    // The crag v2 entrypoint is version-locked by its own path and payload ships
+    // that exact build, so the UA version comes from the entrypoint itself. Asking
+    // the CLI for it cost an exec per exchange and refused valid exchanges whenever
+    // that exec failed, for a value that was already known.
+    const claudeVersion = selected.native ? selected.version : payload.claude_version
+    // Linux slots join a kin-eg-* transparent network: the network picks the exit,
+    // so the helper gets no proxy at all. This '' is not a resolved exit and must
+    // not be replaced by one — a resolved URL may be a controller-local forwarder,
+    // unreachable from inside the guest. The env above is cleared for the same reason.
     const result = await runDocker(argv, {
       env: host.dockerEnv(),
-      timeoutMs: Math.max(timeoutMs * 8, 45000),
+      // Token plus the native follow-ups (profile, two evals, roles,
+      // first-token date, bootstrap) at the per-request ceiling, plus the two
+      // browser-stage hops when the Chrome bridge runs and helper startup.
+      timeoutMs: Math.max(timeoutMs * 9, 120_000),
       stdin:
         JSON.stringify({
           ...payload,

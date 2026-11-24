@@ -1,4 +1,5 @@
-import { isSmallTextTurn, sanitizeAnthropicBody, messageHasTurnControls } from './sanitize.mjs'
+import { assertNoUnrepresentableCragFields, sanitizeCragBodyWhitelist } from './crag-whitelist.mjs'
+import { isSmallTextTurn, messageHasTurnControls, reusableContentBlock, sanitizeAnthropicBody } from './sanitize.mjs'
 import { normalizeToolInputSchemas } from './tool-input-schema.mjs'
 
 const INTERNAL_FIELDS = ['gateway_policy', 'request_context', 'kin_outbound_shape', 'request_id', 'delivery_mode']
@@ -30,14 +31,20 @@ const CRAG_PROVIDER_NAMES = new Set([
   'text_editor_code_execution',
 ])
 
-function invalid(param, reason) {
+function invalid(param, reason, code = 'invalid_kernel_request', details = null) {
   const message = `${param}: ${reason}`
   const error = new Error(message)
   error.status = 400
-  error.code = 'invalid_kernel_request'
+  error.code = code
   error.body = {
     type: 'error',
-    error: { type: 'invalid_request_error', code: error.code, message, param, details: { retryable: false } },
+    error: {
+      type: 'invalid_request_error',
+      code,
+      message,
+      param,
+      details: { retryable: false, ...(details || {}) },
+    },
   }
   throw error
 }
@@ -80,27 +87,54 @@ export function needsCragProviderCompatibility(body, capabilities) {
   return providerTools && history
 }
 
-function validateContent(content, param) {
-  if (typeof content === 'string') return
+function validateContent(content, param, checkReuse) {
+  if (typeof content === 'string') return false
   if (!Array.isArray(content)) invalid(param, 'must be text or an array of content blocks')
+  let reusable = checkReuse
   for (const [index, block] of content.entries()) {
-    const at = `${param}[${index}]`
-    if (typeof block === 'string') continue
-    if (!object(block) || typeof block.type !== 'string' || !block.type) invalid(at, 'must be a typed content block')
-    if (block.type === 'text' && typeof block.text !== 'string') invalid(`${at}.text`, 'must be a string')
+    if (typeof block === 'string') {
+      reusable = false
+      continue
+    }
+    if (!object(block) || typeof block.type !== 'string' || !block.type)
+      invalid(`${param}[${index}]`, 'must be a typed content block')
+    if (block.type === 'text' && typeof block.text !== 'string') invalid(`${param}[${index}].text`, 'must be a string')
+    reusable &&= reusableContentBlock(block)
     if (block.type === 'tool_use') {
-      if (typeof block.id !== 'string' || !block.id) invalid(`${at}.id`, 'is required')
-      if (typeof block.name !== 'string' || !block.name) invalid(`${at}.name`, 'is required')
-      if (!object(block.input)) invalid(`${at}.input`, 'must be an object')
+      if (typeof block.id !== 'string' || !block.id) invalid(`${param}[${index}].id`, 'is required')
+      if (typeof block.name !== 'string' || !block.name) invalid(`${param}[${index}].name`, 'is required')
+      if (!object(block.input)) invalid(`${param}[${index}].input`, 'must be an object')
     }
     if (block.type === 'tool_result') {
-      if (typeof block.tool_use_id !== 'string' || !block.tool_use_id) invalid(`${at}.tool_use_id`, 'is required')
-      if (block.content != null) validateContent(block.content, `${at}.content`)
+      if (typeof block.tool_use_id !== 'string' || !block.tool_use_id)
+        invalid(`${param}[${index}].tool_use_id`, 'is required')
+      if (block.content != null) {
+        const nested = validateContent(block.content, `${param}[${index}].content`, reusable)
+        if (Array.isArray(block.content)) reusable &&= nested
+      }
     }
   }
+  return reusable
 }
 
-function canonicalRequest(body, { reuseCanonicalHistory = false } = {}) {
+function validateMessages(messages, checkReuse = false) {
+  if (!Array.isArray(messages) || !messages.length) invalid('messages', 'must be a non-empty array')
+  let reusable = checkReuse
+  let previousRole = 'assistant'
+  for (const [index, message] of messages.entries()) {
+    const at = `messages[${index}]`
+    if (!object(message)) invalid(at, 'must be an object')
+    const { role, content } = message
+    reusable &&=
+      (role === 'user' || role === 'assistant') && role !== previousRole && Array.isArray(content) && !!content.length
+    previousRole = role
+    if (content == null && messageHasTurnControls(message)) continue
+    reusable = validateContent(content, `${at}.content`, reusable)
+  }
+  return reusable
+}
+
+function canonicalRequest(body, { reuseCanonicalHistory = false, preserveConsecutiveUser = false } = {}) {
   if (!object(body)) invalid('body', 'must be an object')
   const tools = normalizeToolInputSchemas(body.tools, invalid)
   if (tools !== body.tools) body = { ...body, tools }
@@ -131,24 +165,36 @@ function canonicalRequest(body, { reuseCanonicalHistory = false } = {}) {
       invalid('tool_choice.name', 'must identify a supplied tool')
     }
   }
-  if (!Array.isArray(body.messages) || !body.messages.length) invalid('messages', 'must be a non-empty array')
-  for (const [index, message] of body.messages.entries()) {
-    const at = `messages[${index}]`
-    if (!object(message)) invalid(at, 'must be an object')
-    if (message.content == null && messageHasTurnControls(message)) continue
-    validateContent(message.content, `${at}.content`)
-  }
+  if (!reuseCanonicalHistory) validateMessages(body.messages)
   // Keep official extension fields, history bytes and cache anchors. In particular,
   // changing tool IDs or thinking signatures here invalidates CRAG continuation hashes.
-  const out = sanitizeAnthropicBody(body, { reuseCanonicalHistory })
+  const out = sanitizeAnthropicBody(body, {
+    reuseCanonicalHistory: reuseCanonicalHistory && ((messages) => validateMessages(messages, true)),
+    preserveConsecutiveUser,
+  })
   for (const key of INTERNAL_FIELDS) delete out[key]
   if (!out.messages.length) invalid('messages', 'contains no content after normalization')
   return out
 }
 
 /** Structured native_messages: the CLI owns system layout and cache policy. */
-export function prepareCliNodeRequest(body) {
-  const out = canonicalRequest(body)
+export function prepareCliNodeRequest(body, { requestContext = null } = {}) {
+  if (body?.service_tier != null) {
+    if (body.service_tier !== 'auto' && body.service_tier !== 'standard_only') {
+      invalid('service_tier', 'must be "auto" or "standard_only"')
+    }
+    if (body.service_tier === 'standard_only') {
+      invalid(
+        'service_tier',
+        'service_tier="standard_only" is not supported on the Claude VM / cli-node execution path; omit service_tier or use "auto" if default capacity is acceptable',
+        'unsupported_capability',
+        { field: 'service_tier', value: body.service_tier, execution_path: 'claude_vm' },
+      )
+    }
+  }
+  const out = canonicalRequest(body, {
+    preserveConsecutiveUser: requestContext?.purpose === 'auto_mode_classifier',
+  })
   for (const key of Object.keys(out)) {
     if (key.startsWith('crag_')) delete out[key]
   }
@@ -156,16 +202,26 @@ export function prepareCliNodeRequest(body) {
   delete out.cacheTtl
   delete out.session_slots
   delete out.effort
+  if (out.service_tier === 'auto') delete out.service_tier
   return out
 }
 
 /** Native CRAG imports history itself; PTY projection remains worker-owned. */
-export function prepareCragRequest(body, health) {
-  const out = canonicalRequest(body, { reuseCanonicalHistory: !isSmallTextTurn(body) })
-  if (needsCragProviderCompatibility(out, health?.capabilities) && out.crag_prompt != null) {
+export function prepareCragRequest(body, health, { requestContext = null } = {}) {
+  assertNoUnrepresentableCragFields(body)
+  const isClassifier = requestContext?.purpose === 'auto_mode_classifier'
+  const reuseHistory = !isSmallTextTurn(body) && !isClassifier
+  const normalized = canonicalRequest(body, {
+    reuseCanonicalHistory: reuseHistory,
+    preserveConsecutiveUser: isClassifier,
+  })
+  if (needsCragProviderCompatibility(normalized, health?.capabilities) && normalized.crag_prompt != null) {
     invalid('crag_prompt', 'provider compatibility requests must use system instead')
   }
-  delete out.auto_compact_window
+  const { body: out } = sanitizeCragBodyWhitelist(normalized, {
+    capabilities: health?.capabilities,
+    preserveCanonicalHistory: reuseHistory,
+  })
   if (out.crag_options != null) {
     if (!object(out.crag_options)) invalid('crag_options', 'must be an object')
     const aliases = Object.fromEntries(Object.entries(out.crag_options).filter(([key]) => CRAG_ALIASES.has(key)))

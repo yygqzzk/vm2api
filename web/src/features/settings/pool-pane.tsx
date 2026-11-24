@@ -25,7 +25,12 @@ import { Switch } from '@/components/ui/switch'
 import { SEAT_CAP_MAX, SeatCells } from '@/components/scheduler-viz'
 import { SEAT_CAP_STEPS, withCurrent } from '@/features/vm/scheduling-steps'
 import { PoolLivePanel } from './pool-live-panel'
-import { ChipGroup, SliderSetting, StepperSetting } from './scheduler-controls'
+import {
+  ChipGroup,
+  FamilyLimitSelect,
+  SliderSetting,
+  StepperSetting,
+} from './scheduler-controls'
 
 type Obj = Record<string, unknown>
 type PoolDialog = 'strategy' | 'seats' | 'queue' | 'retry' | 'circuit'
@@ -428,6 +433,7 @@ export function PoolPane({
   pending = false,
 }: PoolPaneProps) {
   const strategy = pool.strategy === 'fill' ? 'fill' : 'balanced'
+  const resetPriority = pool.reset_priority !== false
   const seatCap = Math.min(
     SEAT_CAP_MAX,
     Math.max(1, numOf(inference, 'session_slots', SEAT_CAP_MAX))
@@ -499,6 +505,7 @@ export function PoolPane({
     if (open === 'strategy') {
       onPoolChange({
         strategy: poolDraft.strategy,
+        reset_priority: poolDraft.reset_priority !== false,
       })
     } else if (open === 'seats') {
       onInferenceChange({
@@ -507,6 +514,8 @@ export function PoolPane({
       })
       onPoolChange({
         seat_grace_ms: poolDraft.seat_grace_ms,
+        max_primary_sessions: poolDraft.max_primary_sessions ?? null,
+        max_subagents_per_session: poolDraft.max_subagents_per_session ?? null,
         seat_budget_reserve_pct: poolDraft.seat_budget_reserve_pct,
       })
     } else if (open === 'queue') {
@@ -560,7 +569,7 @@ export function PoolPane({
         <SummaryButton
           icon={Layers}
           title='分配策略'
-          value={strategy === 'fill' ? '填充' : '平衡'}
+          value={`${strategy === 'fill' ? '填充' : '平衡'}${resetPriority ? ' · 临近重置优先' : ''}`}
           desc='Claude 新 session 开席的优先顺序'
           pending={pending}
           disabled={saving}
@@ -657,6 +666,21 @@ export function PoolPane({
                   value={poolDraft.strategy === 'fill' ? 'fill' : 'balanced'}
                   onChange={(next) => updateDraft('pool', { strategy: next })}
                 />
+                <div className='flex items-center justify-between gap-4 rounded-md border px-3 py-2.5'>
+                  <div>
+                    <Label htmlFor='pool-reset-priority'>临近重置优先</Label>
+                    <p className='text-xs leading-5 text-muted-foreground'>
+                      开启：离周额度刷新越近的账号级别越高，先被用掉。关闭：所有自动级别的账号同一级，按上面的策略平均分配。手动级别不受影响。
+                    </p>
+                  </div>
+                  <Switch
+                    id='pool-reset-priority'
+                    checked={poolDraft.reset_priority !== false}
+                    onCheckedChange={(value) =>
+                      updateDraft('pool', { reset_priority: value })
+                    }
+                  />
+                </div>
               </>
             ) : null}
             {open === 'seats' ? (
@@ -692,6 +716,38 @@ export function PoolPane({
                         numOf(inferenceDraft, 'session_slots', SEAT_CAP_MAX)
                       )
                     )}
+                  />
+                </div>
+                <div className='flex items-center justify-between gap-4 rounded-md border px-3 py-2.5'>
+                  <Label>主会话上限</Label>
+                  <FamilyLimitSelect
+                    label='主会话上限'
+                    min={1}
+                    emptyText='跟随 VM 物理席位上限'
+                    value={
+                      typeof poolDraft.max_primary_sessions === 'number'
+                        ? poolDraft.max_primary_sessions
+                        : null
+                    }
+                    onChange={(value) =>
+                      updateDraft('pool', { max_primary_sessions: value })
+                    }
+                  />
+                </div>
+                <div className='flex flex-wrap items-center justify-between gap-2 rounded-md border px-3 py-2.5'>
+                  <Label>每会话子代理上限</Label>
+                  <FamilyLimitSelect
+                    label='每会话子代理上限'
+                    min={0}
+                    emptyText='关闭(子代理各占一个席位)'
+                    value={
+                      typeof poolDraft.max_subagents_per_session === 'number'
+                        ? poolDraft.max_subagents_per_session
+                        : null
+                    }
+                    onChange={(value) =>
+                      updateDraft('pool', { max_subagents_per_session: value })
+                    }
                   />
                 </div>
                 <div className='flex items-center justify-between gap-4 rounded-md border px-3 py-2.5'>
@@ -959,7 +1015,8 @@ export function PoolPane({
                 />
                 <SliderSetting
                   id='failover-same-hop'
-                  label='同 VM 单次重试最长占用'
+                  label='同 VM 重试的上一轮耗时上限'
+                  desc='仅限制按耗时判定的重试；设为 0 时不进行这类重试。'
                   value={numOf(
                     failoverDraft,
                     'same_account_retry_max_hop_ms',
@@ -968,7 +1025,7 @@ export function PoolPane({
                   min={0}
                   max={30000}
                   step={500}
-                  format={(ms) => (ms ? fmtDuration(ms) : '不限')}
+                  format={(ms) => (ms ? fmtDuration(ms) : '0 ms')}
                   fallback={FAILOVER_DEFAULTS.same_account_retry_max_hop_ms}
                   presets={[0, 5000, 10000, 20000, 30000]}
                   onChange={(value) =>

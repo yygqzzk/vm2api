@@ -25,7 +25,7 @@
 
 | 条件 | 实现 |
 |------|------|
-| UA | `^claude-cli/\d+\.\d+\.\d+`（sub2api 同款前缀；vscode / cowork / desktop 都算） |
+| UA | `^claude-cli/\d+\.\d+\.\d+`（vscode / cowork / desktop 都算） |
 | `metadata.user_id` | 合法官方 user id |
 | tools | 不能是 OpenAI `{type:function}` / `tool_choice.type=function`。`/v1/messages` 上这种 tools 会先转 Anthropic，但仍判非官方 |
 | system | 含 `x-anthropic-billing-header:`、官方 `cc_entrypoint`（`cli` / `sdk-cli` / `vscode` / `cowork` / `desktop`）、或官方身份行（含 `You are Claude Code` / `Claude Agent SDK` 变体）。`local-agent` 仅在 UA 含对应入口和 Agent SDK、平台为 `desktop_app` 且客户端版本有效时继续原有官方校验；OMP 专属特征仍优先排除 |
@@ -82,7 +82,7 @@ system提示词页有两套。cli-node 仍用上面的模板。CRAG 一套只认
 
 槽位显式 `zero` 覆盖成 replace。`official` / `official_full` / `official_303` 在这条 print 上都收成 append 尾巴；只要 identity 没有旗标，自定义模板不贴进去。print 不传 `--tools ""` 和 `--no-chrome`，内置工具和 Chrome 保持官方默认。thinking、temperature、betas、system 上的 `cache_control` 协议层可以收到，helper 不转发。今天进官方 CLI 的是 `--model`、64 KiB append/replace 文本、preload 的 `max_tokens` / `effort` / 已有 cache marker 的 ttl，以及调用方工具变成 MCP。
 
-官方 Claude Code 的 `agent_summary` 旁路只按当前完整摘要指令识别，沿用独立执行会话、席位与父会话粘性隔离。CRAG 的工具续接按工具 ID 认领，换 session ID 不会隔离继承的 `tool_result`：print 入核前，仅将已识别摘要的末条 user 消息中的工具结果展开为只读标签和原始内容块，保留正文、图片、错误标记、缓存断点及尾随 system 提示。历史工具调用/结果对与正常主请求保持原样；不靠匹配工具输出里的 `tool_result replayed` 文本触发清洗，不吞真实重放错误、不重发已消费结果。
+官方 Claude Code 的 `agent_summary` 旁路只按当前完整摘要指令识别，使用独立执行会话, stickyKey 为空. 默认独占席位. 家族模式下, 有效根登记使摘要共享根席位并计入 m, 可与父请求并行执行. 根 VM 不可用时, 已验证的摘要用独立摘要 ID 在其他 VM 申请普通席位, 包括外形与短探测相同的单轮 Haiku 摘要. CRAG 的工具续接按工具 ID 认领，换 session ID 不会隔离继承的 `tool_result`：print 入核前，仅将已识别摘要的末条 user 消息中的工具结果展开为只读标签和原始内容块，保留正文、图片、错误标记、缓存断点及尾随 system 提示。历史工具调用/结果对与正常主请求保持原样；不靠匹配工具输出里的 `tool_result replayed` 文本触发清洗，不吞真实重放错误、不重发已消费结果。
 
 
 面板预览表达 Node 给出的模板内容；cli-hop 最终线序以上述 CLI-owned 前缀为准，不把 Node 对象预览当成最终 wire 抓包。更新 CLI 二进制后需要替换槽内副本并重启相应 kernel/CLI；配置热读不能让旧进程自动加载新 ELF。删除旧环境文本后首次前缀会冷写，后续 cache_read 数值须实测，不能保证必然不低于旧值。0注入 + 常驻约束关闭 + 无调用方 agent 的真实模型可见输出须单独验收。
@@ -96,6 +96,8 @@ Go worker JSON 透传，不必因人设重建 worker。
 ## DSH 工具结果裁剪与缓存
 
 `routing.compatibility.preserve_pruned_tool_results: true` 可为槽位推理开启 DSH 工具结果裁剪保护；缺省关闭，API 直连端点不启用。它不会修改客户端配置或路由粘性。
+
+`routing.compatibility.crag_drop_foreign_thinking: true` 让 CRAG print 在发出前丢掉不是本账号签发的 thinking 块（`thinking_signature_owners` 里没有记录或记在别的账号上）；命中进行中的工具循环时清掉循环内 thinking 并关闭 thinking，结果记在 `hop_meta.thinking_owner_crag`。缺省关闭：签名记录不完整时（清库、记录开始前的老会话）会误丢本账号的 thinking，并让提示缓存失效。
 
 DSH 在压缩压力下会把旧工具结果改为前4096码点、固定middle-pruned标记和后1024码点。开启后，网关在同一认证密钥、严格的DSH `session-UUID`、模型和完整历史前缀内，仅恢复精确等于该裁剪结果的旧文本。必须有此前完整verified且未重试的请求作为原文基线；仅收到keepalive、取消、失败或不完整流不会提交原文。真正的历史编辑、删消息、工具参数变化及摘要替换不还原。
 
@@ -152,11 +154,13 @@ Rikka / 客户端 `search_web`、`scrape_web` **不是** Anthropic 自带搜索�
 
 Claude 后端先转换 Messages、Chat Completions 或 Responses 的结构，再清洗工具与历史，最后按目标运行时能力组装。混用 OpenAI function 与 Claude 托管工具时保留后者的版本和参数；已声明原生搜索时不会用 OpenAI 搜索别名生成的默认工具替换它。根级组合 schema 只在能无损转换时改写，否则按工具字段返回 400，不会放宽原约束。
 
+`/v1/messages` 可转换混入的 Chat `tool_calls` 和 `role: tool` 历史，原生块不经 Chat 解析器。`/v1/responses` 可从 `input[].additional_tools` 读取 Codex 动态工具声明，沿用命名空间和响应名称映射；相同声明去重，冲突按原字段返回 400。Responses 中交错的并行工具历史只在调用组尚未结束、没有消息或缓存边界时归并；缺失或孤立结果不在入口伪造。
+
 CRAG 声明 `provider_managed_tools_v1` 且支持对应工具时使用独立的 provider-compat 执行路径。该路径传结构化 `system`，不传 `crag_prompt`，包括 `zero` 人设；不支持时不删除调用方的托管工具，返回可定位的能力错误。普通 CRAG 与 cli-node 的出站路径不变。
 
 `sanitizeInboundBody` / `request-rectifier`：
 
-- 非法 Anthropic `role` 按 Sub2API 清洗
+- 清洗非法 Anthropic `role`
 - 非官方补 tool 对、短签名预过滤
 - OpenAI `response_format` → `output_config`；`refusal` → `content_filter`
 - 空 refusal 记 `content_filter_refusal`
@@ -174,7 +178,7 @@ CRAG 声明 `provider_managed_tools_v1` 且支持对应工具时使用独立的 
 出站前 `stripInvalidThinkingBlocks` 保留可回放的历史思维块：
 
 1. `thinking` 即使文本为空，只要有完整签名也保留；这是 `display: omitted` 的正常响应形态。
-2. Opus / Sonnet / Haiku 5.5 按 sub2api：非空且非 dummy 的签名都算有效，不看长度；`redacted_thinking` 有 `data` 就留，没有 `data` 时再看签名。历史里只要有一块无效，整段 thinking / `redacted_thinking` 都拆掉，只留正文；拆完没有内容的轮删掉。全部有效时不拆。
+2. Opus / Sonnet / Haiku 5.5：非空且非 dummy 的签名都算有效，不看长度；`redacted_thinking` 有 `data` 就留，没有 `data` 时再看签名。历史里只要有一块无效，整段 thinking / `redacted_thinking` 都拆掉，只留正文；拆完没有内容的轮删掉。全部有效时不拆。
 3. 更早的型号仍逐块过滤：签名短于 24、空签名、dummy 签名删掉，合法签名块留下。`redacted_thinking` 不看 `data`，只在签名达到 24 字符时留。
 4. 保留路径（cli-hop 首跳，以及默认 HTTP hop）不走上面的拆链，只在 `stripInvalidThinkingBlocks` 的这一支里处理：`redacted_thinking` 不看 `data` 和签名，原样留。`thinking` 只有签名可用（非空、不少于 24、非 dummy）才留，空正文也留；缺失、空、短于 24、dummy 的删掉，不再补 `signature: ""`。不走保留路径时，`redacted_thinking` 仍按上面第 2、3 条删。当前没有按账号归属过滤签名的步骤。
 
@@ -196,9 +200,9 @@ native CLI 对已有缓存 marker 的 wire system 直接保留块边界、显式
 
 ## Codex 模型与运行环境
 
-Codex 目录客户端 `auto` 跟随官方 npm 发布；网络不可用且没有缓存时使用已核实的 `0.167.1`。推理 UA 单独配置，新安装的默认画像同步到该版本，不覆盖已部署机自定义 UA。内核保留所选画像的 originator/version，忽略下游伪造的身份与设备证明头。
+Codex 目录客户端 `auto` 跟随官方 npm 发布；网络不可用且没有缓存时使用已核实的 `0.170.0`。推理 UA 单独配置，新安装的默认画像同步到该版本，不覆盖已部署机自定义 UA。内核保留所选画像的 originator/version，忽略下游伪造的身份与设备证明头。
 
-GPT 模型以账号返回的 `/backend-api/codex/models` 为准，6.2 等新增 ID 不在网关改名，也不按型号猜测能力、可用性或价格。同步发现的新 ID 沿用默认关闭，管理员启用后才调度。静态回退目录补齐官方参考目录中的 `gpt-6-astra`、`gpt-6.1-sol`、`gpt-6.1-terra` 与 `gpt-5.6-sol/terra/luna`。Responses、Chat 和 Completions 的 `ultra` 推理档位原样保留；Completions 也保留显式 `reasoning` / `reasoning_effort`。槽位测试、定时计划和日志支持该档位，具体模型是否接受由上游判断。
+GPT 模型以账号返回的 `/backend-api/codex/models` 为准，新增 ID 不在网关改名，也不按型号猜测能力、可用性或价格。静态回退目录补齐官方参考目录中的 `gpt-6.2-astra`、`gpt-6.2-sol`、`gpt-6-astra`、`gpt-6.1-sol`、`gpt-6.1-terra` 与 `gpt-5.6-sol/terra/luna`，这些 ID 默认启用，账号目录确认后立即可调度；回退目录之外、同步新发现的陌生 ID 仍默认关闭，管理员启用后才调度。回退目录的新增代次由 `gpt_model_policy.seed_version` 守护，对已同步过的实例一次性补齐，不整体合并回退目录，以免复活上游已下线的旧型号。6.2 两款尚无官方公布价目，内置价表不臆造，其用量按未计价处理。Responses、Chat 和 Completions 的 `ultra` 推理档位原样保留；Completions 也保留显式 `reasoning` / `reasoning_effort`。槽位测试、定时计划和日志支持该档位，具体模型是否接受由上游判断。
 
 `codex.analytics.enabled` 仍默认关闭。启用后的 `codex_thread_initialized` 使用当前槽内采集的系统、系统版本和架构，不读取内核所在控制面宿主。先执行槽位 `collect-identity`；数据不完整时不发送，不伪造环境或 CLI 工具事件。字段、队列和隐私边界见 [面板 API · OpenAI 传输与隐私](PANEL_API.md#openai-传输与隐私)。
 
@@ -228,6 +232,7 @@ GPT 模型以账号返回的 `/backend-api/codex/models` 为准，6.2 等新增 
 | 头 | 作用 |
 |----|------|
 | `x-kin-delivery: verified` | 缓冲到终态 |
+| `x-kin-queue: off` | Claude 号池不排队等席位：能立刻拿到席位与内核槽位就照常接；席位被占（含自己会话的席位，或开启 `failover.keep_session_home` 时原账号内核无空槽）即回 529 `pool_overloaded`，不换号、不等待（会话轮次串行不受影响） |
 | `x-kin-cache-ttl: 1h` | Node 重写模式的首次会话 TTL 选择；不覆盖 native 透传 caller / 模板显式 TTL |
 | `x-kin-vm` | 仅 master：钉槽（虚拟机测试 loopback） |
 | `x-session-id` 等 | sticky 键，见 `routing.sticky` |

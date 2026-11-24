@@ -10,6 +10,8 @@ export function cragSubscriptionRoute(method, path) {
   if (path === `${ROOT}/redeem`) return { action: 'redeem' }
   if (path === `${ROOT}/recover`) return { action: 'recover' }
   if (path === `${ROOT}/upgrade`) return { action: 'upgrade' }
+  if (path === `${ROOT}/unbind`) return { action: 'unbind' }
+  if (path === `${ROOT}/claim-by-order`) return { action: 'claim' }
   const match = BIND.exec(path)
   return match ? { action: 'bind', id: match[1] } : null
 }
@@ -24,26 +26,85 @@ const messages = {
   crag_subscription_host_identity_changed: 'Restore the original host identity before retrying.',
   crag_subscription_storage_unavailable: 'Check the host subscription data directory before retrying.',
   crag_subscription_host_package_unready: 'Install or restore the trusted CRAG host package before retrying.',
+  crag_subscription_host_package_changed:
+    'The CRAG package changed during redemption. Confirm recovery with the current trusted package.',
+  crag_subscription_recovery_unverified:
+    'Existing host rights cannot confirm this voucher. Keep the original order and ask the administrator to reconcile it.',
+  crag_subscription_invalid_redemption_receipt:
+    'The saved redemption receipt could not be verified. Keep the original order and check the host subscription data.',
+  payload_key_unknown:
+    'The authorization service no longer offers the CRAG package key this redemption recorded. Keep the original record and contact the administrator with the request ID.',
+  issuer_mismatch:
+    'The CRAG issuer this redemption recorded does not match the authorization service. Restore the matching trusted package before retrying.',
+  auth_forbidden:
+    'The authorization service rejected this host request. Contact the administrator with the request ID; do not reset the host credential.',
+  host_transfer_cooldown:
+    'This host was retired too recently. Its vouchers become transferable again once the cooldown ends; see cooldown_until on the last retirement.',
+  not_found: 'No host subscription or slot was found at the authorization service.',
+  redeem_unavailable: 'This voucher code is invalid, expired, or already used. Check the code before retrying.',
   vm_not_found: 'VM not found.',
   crag_subscription_failed: 'The host subscription operation failed. Refresh its status before retrying.',
 }
 
+// Claiming by order id. Kept separate from `messages` because `not_found`,
+// `redeem_unavailable`, and `request_conflict` have different meanings on other
+// routes (mirroring `cragOrderClaimErrors` in the panel). Each of these is final
+// for the id as given, so the copy points at the one action that can still change
+// the outcome rather than inviting a retry that cannot succeed.
+const claimMessages = {
+  not_found:
+    'No voucher is recorded for that order id. Check the id on the original order; an order redeemed before order ids were recorded has to be migrated with its voucher code instead.',
+  redeem_unavailable:
+    'That order shares a combined quota window with other vouchers on its host and cannot be moved on its own. Retire the whole host instead.',
+  request_conflict:
+    'That order id is already recorded against a different voucher. Keep the original order and ask the administrator to reconcile it; do not redeem again.',
+}
+
+const authorityRequestId = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i
+const credentialRecoveries = new Set(['not_activated', 'host_id_collision', 'failed'])
+
 export function createCragSubscriptionHandler({ subscription, getVm, publicBaseUrl, json, readRawBody }) {
-  const reject = (res, status, code) =>
-    json(res, status, {
+  const reject = (res, status, code, error, action) => {
+    const message =
+      action === 'claim' && Object.hasOwn(claimMessages, code)
+        ? claimMessages[code]
+        : Object.hasOwn(messages, code)
+          ? messages[code]
+          : messages.crag_subscription_failed
+    const validRecovery = credentialRecoveries.has(error?.recovery) ? error.recovery : undefined
+    const validRequestId =
+      typeof error?.authorityRequestId === 'string' && authorityRequestId.test(error.authorityRequestId)
+        ? error.authorityRequestId
+        : undefined
+    const details =
+      validRecovery || validRequestId
+        ? {
+            ...(validRecovery && { recovery: validRecovery }),
+            ...(validRequestId && { authority_request_id: validRequestId }),
+          }
+        : undefined
+    return json(res, status, {
       ok: false,
-      error: { code, message: Object.hasOwn(messages, code) ? messages[code] : messages.crag_subscription_failed },
+      error: {
+        code,
+        message,
+        ...(details && { details }),
+      },
     })
+  }
   const ok = (res, data) => json(res, 200, { ok: true, data })
 
   return async (req, res, { action, id }) => {
     res.setHeader('Cache-Control', 'no-store')
     const identity = panelIdentity(req)
-    if (req.apiKeyKind || !identity.user || identity.role !== 'admin') return reject(res, 403, 'forbidden')
+    // The master API key is the operator's own automation (seat binding for new slots); it is not a browser
+    // session, so the same-origin CSRF guard does not apply to it.
+    const master = req.apiKeyKind === 'master'
+    if (!master && (req.apiKeyKind || !identity.user || identity.role !== 'admin')) return reject(res, 403, 'forbidden')
 
     let body
     if (action !== 'status') {
-      if (!sameOriginPost(req, publicBaseUrl)) return reject(res, 403, 'crag_subscription_origin_denied')
+      if (!master && !sameOriginPost(req, publicBaseUrl)) return reject(res, 403, 'crag_subscription_origin_denied')
       if (!/^application\/json(?:\s*;|$)/i.test(req.headers['content-type'] || '')) {
         return reject(res, 415, 'crag_subscription_json_required')
       }
@@ -60,19 +121,25 @@ export function createCragSubscriptionHandler({ subscription, getVm, publicBaseU
       const valid =
         action === 'redeem'
           ? Object.keys(body).length === 1 && typeof body.redemption_code === 'string'
-          : Object.keys(body).length === 0
+          : action === 'claim'
+            ? Object.keys(body).length === 1 && typeof body.order_id === 'string'
+            : action === 'recover'
+              ? Object.keys(body).length === 0 || (Object.keys(body).length === 1 && body.use_current_package === true)
+              : Object.keys(body).length === 0
       if (!valid) return reject(res, 400, 'crag_subscription_invalid_request')
     }
 
     try {
       if (action === 'redeem') return ok(res, await subscription.redeem(body.redemption_code))
       if (action === 'upgrade') return ok(res, await subscription.upgrade())
+      if (action === 'unbind') return ok(res, await subscription.unbind())
+      if (action === 'claim') return ok(res, await subscription.claimByOrder(body.order_id))
       if (action === 'bind') {
         const vm = getVm(id)
         if (!vm) return reject(res, 404, 'vm_not_found')
         return ok(res, await subscription.bind(vm))
       }
-      if (action === 'recover') await subscription.recover()
+      if (action === 'recover') await subscription.recover({ useCurrentPackage: body.use_current_package === true })
       return ok(res, await subscription.status())
     } catch (error) {
       // Do not echo vendor responses, local paths, or voucher inputs to the panel.
@@ -84,7 +151,7 @@ export function createCragSubscriptionHandler({ subscription, getVm, publicBaseU
       ) {
         return reject(res, 500, 'crag_subscription_failed')
       }
-      return reject(res, error.status === 401 ? 502 : error.status, error.code)
+      return reject(res, error.status === 401 ? 502 : error.status, error.code, error, action)
     }
   }
 }

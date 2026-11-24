@@ -32,8 +32,12 @@ export const REMOTE_KERNEL_ENTRY = `${REMOTE_LIVE_DIR}/kin-kernel`
 export const REMOTE_CLI_NODE_BIN = `${REMOTE_LIVE_DIR}/cli-node`
 export const REMOTE_CC_NODE_BIN = `${REMOTE_LIVE_DIR}/cc-node`
 export const REMOTE_CRAG_ENTRY = `${REMOTE_LIVE_DIR}/crag-kernel`
-export const REMOTE_CRAG_CLAUDE = `${REMOTE_LIVE_DIR}/crag-v2/claude-code-2.1.321/claude`
-export const LOCAL_CRAG_CLAUDE = '/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude'
+// The crag v2 entrypoint is version-locked: payload ships exactly this build
+// (share/crag/kernels/v2/<arch>/claude-code-<version>/claude), so the version is
+// known from the path and never has to be read back off the CLI.
+export const CRAG_CLAUDE_VERSION = '2.1.321'
+export const REMOTE_CRAG_CLAUDE = `${REMOTE_LIVE_DIR}/crag-v2/claude-code-${CRAG_CLAUDE_VERSION}/claude`
+export const LOCAL_CRAG_CLAUDE = `/home/kincli/.kin/crag-v2/claude-code-${CRAG_CLAUDE_VERSION}/claude`
 export const CONTAINER_CRAG_V2_CLAUDE = LOCAL_CRAG_CLAUDE
 
 export const KERNEL_NATIVE_SLOT_COUNT = 20
@@ -130,6 +134,12 @@ export function normalizeInferenceConfig(raw = {}) {
     strict: raw.strict === true,
     eager_start: optionalBool(raw.eager_start, true),
     health_ttl_ms: optionalTtlMs(raw.health_ttl_ms, 2000),
+    // Consumed by rustHealthTimeoutMs (gateway dial budget); without this entry
+    // the key is stripped on save and can never be configured from the panel.
+    health_timeout_ms: optionalTtlMs(raw.health_timeout_ms, 800),
+    // Consumed by rustDownReprobeMs (kernel-router.mjs); 0 turns the local-slot
+    // re-probe off, so 0 must survive normalisation like any other value.
+    kernel_down_reprobe_ms: Math.min(10_000, Math.round(optionalTtlMs(raw.kernel_down_reprobe_ms, 2500))),
     tcp_nodelay: optionalBool(raw.tcp_nodelay, true),
     session_slots: normalizeSessionSlots(raw.session_slots),
     prewarm_enabled: raw.prewarm_enabled === true,
@@ -197,7 +207,13 @@ export function resolveCragKernelVersion(vm, routing = {}) {
 export function resolveSlotClaude(vm, routing = {}, host = {}) {
   const dataplane = resolveKernelDataplane(vm, routing)
   const native = dataplane === 'crag' && resolveCragKernelVersion(vm, routing) === 'v2'
-  if (native) return { bin: host.bakedKernel ? REMOTE_CRAG_CLAUDE : LOCAL_CRAG_CLAUDE, native: true }
+  if (native) {
+    return {
+      bin: host.bakedKernel ? REMOTE_CRAG_CLAUDE : LOCAL_CRAG_CLAUDE,
+      native: true,
+      version: CRAG_CLAUDE_VERSION,
+    }
+  }
   return {
     bin: dataplane === 'wrap' ? host.bins?.cli || CONTAINER_CLI_NODE_BIN : host.bins?.cc || CONTAINER_CC_NODE_BIN,
     native: false,

@@ -277,7 +277,7 @@ test('KVM host permits enforce H2 roster replacement, revocation and pending syn
   activateCragSubscriptionBinding(root, vm, renewed.code)
   assert.equal(checkCragLicense(root, vm).ok, true)
   assert.equal(readCragSubscriptionFiles(root, vm).permit, renewed.code)
-  fs.writeFileSync(path.join(publicDir, 'sync-pending'), 'pending\n')
+  fs.writeFileSync(path.join(publicDir, 'sync-pending'), 'pending\n', { mode: 0o644 })
   assert.equal(checkCragLicense(root, vm).ok, true)
   assert.equal(readCragSubscriptionFiles(root, vm).permit, renewed.code)
   fs.unlinkSync(path.join(publicDir, 'sync-pending'))
@@ -440,7 +440,7 @@ test('atomic H1 and S1 replacements, downgrade, renewal and sync are re-read on 
   replace(entitlement, issueHostEntitlement(root, hostId, { issued_at: now + 86400, expires_at: now + 172800 }).code)
   await assertDenied(context, 'license_not_yet_valid')
   replace(entitlement, host.code)
-  fs.writeFileSync(path.join(publicDir, 'sync-pending'), '')
+  fs.writeFileSync(path.join(publicDir, 'sync-pending'), '', { mode: 0o644 })
   assert.equal(checkCragLicense(root, vm).ok, true)
   fs.unlinkSync(path.join(publicDir, 'sync-pending'))
   assert.equal(checkCragLicense(root, vm).ok, true)
@@ -700,6 +700,37 @@ test('remote KVM keeps the upstream normalized identity and signed subscription 
     crypto.createHash('sha256').update(permit.code).digest('hex'),
   )
 })
+
+test('explicit installation can authenticate an old host permit against the current trusted issuer without trusting a partial installed tree', (t) => {
+  const { root, vm, hostId, permit, machineCode } = fixture(t)
+  const installed = path.join(root, 'vms', vm.id, 'cli-home', '.kin', 'crag-v2')
+  fs.mkdirSync(path.join(installed, 'claude-code-2.1.321'), { recursive: true })
+  seedEncryptedPackage(root, { payloadKey: crypto.randomBytes(32) })
+  assert.equal(getCragLicense(root, vm).license.code, 'license_unconfigured')
+  assert.throws(() => readCragSubscriptionReleaseCandidate(root, vm, hostId), { code: 'license_unconfigured' })
+  assert.throws(() => prepareCragSubscriptionBinding(root, vm), { code: 'license_unconfigured' })
+  assert.equal(prepareCragSubscriptionBinding(root, vm, { preferInstalled: false }), machineCode)
+  assert.equal(
+    readCragSubscriptionReleaseCandidate(root, vm, hostId, { preferInstalled: false }),
+    crypto.createHash('sha256').update(permit.code).digest('hex'),
+  )
+  assert.equal(getCragLicense(root, vm).license.code, 'license_unconfigured', 'ordinary reads must remain fail closed')
+})
+
+for (const invalid of ['wrong-host', 'wrong-vm', 'wrong-issuer', 'tampered-candidate']) {
+  test(`explicit installation refuses to authenticate a host permit with ${invalid}`, (t) => {
+    const { root, vm, hostId, machineCode, registration, pkg } = fixture(t)
+    if (invalid === 'wrong-host') replace(registration, issueSlotPermit(root, machineCode, '0'.repeat(64)).code)
+    if (invalid === 'wrong-vm')
+      replace(registration, issueSlotPermit(root, machineCode, hostId, { vm_id: 'vm-other' }).code)
+    if (invalid === 'wrong-issuer') {
+      const other = fixture(t)
+      replace(registration, issueSlotPermit(other.root, machineCode, hostId).code)
+    }
+    if (invalid === 'tampered-candidate') fs.appendFileSync(path.join(pkg, 'crag-v2.payload.enc'), 'tampered')
+    assert.throws(() => readCragSubscriptionReleaseCandidate(root, vm, hostId, { preferInstalled: false }))
+  })
+}
 
 test('KVM independent export preserves U1 on both local and remote placements', (t) => {
   const { root, vm } = fixture(t, { activate: false })

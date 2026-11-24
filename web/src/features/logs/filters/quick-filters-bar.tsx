@@ -4,6 +4,7 @@ import {
   Calendar,
   CalendarDays,
   RefreshCw,
+  XCircle,
   type LucideIcon,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -42,13 +43,23 @@ export function QuickFiltersBar({
   const statusGroup: Preset[] = [
     {
       id: 'errors-only',
-      label: '仅错误',
+      label: '仅非 2xx',
       icon: AlertCircle,
       active: !!filters.excludeStatus200,
       toggle: () =>
         filters.excludeStatus200
           ? { ...filters, excludeStatus200: undefined }
           : { ...filters, excludeStatus200: true, statusCode: undefined },
+    },
+    {
+      id: 'failed-only',
+      label: '所有失败',
+      icon: XCircle,
+      active: !!filters.failedOnly,
+      toggle: () =>
+        filters.failedOnly
+          ? { ...filters, failedOnly: undefined }
+          : { ...filters, failedOnly: true, excludeStatus200: undefined },
     },
     {
       id: 'show-retries',

@@ -93,8 +93,8 @@ export function LogsPage() {
   const stats = useQuery(logStatsQueryOptions(since))
   const muted =
     mutedOverride ?? resolveMutedClasses(stats.data?.muted_error_classes)
-  const errorCollection = (stats.data?.window?.error_collection ||
-    {}) as ErrorCollection
+  const errorCollection = stats.data?.window?.error_collection as
+    ErrorCollection | undefined
 
   const apiFilters = useMemo(
     () => filtersToApi(filters, muted),
@@ -218,6 +218,7 @@ export function LogsPage() {
       : filters.excludeStatus200
         ? '仅非 2xx'
         : '全部状态',
+    filters.failedOnly ? '所有失败（含流式 200）' : null,
     errorClass
       ? `错误类 ${ERROR_CLASS_META[errorClass]?.label || errorClass}`
       : null,
@@ -248,18 +249,22 @@ export function LogsPage() {
             setIsFilterOpen(true)
           }}
         />
-        <ErrorCollectionPanel
-          collection={errorCollection}
-          muted={muted}
-          activeClass={errorClass}
-          onToggleMute={handleToggleMute}
-          onSelectClass={(id) =>
-            applyFilters({
-              ...filters,
-              errorClass: id === errorClass ? undefined : id,
-            })
-          }
-        />
+        {stats.isError && !stats.data ? (
+          <p className='text-sm text-destructive'>错误统计加载失败</p>
+        ) : errorCollection ? (
+          <ErrorCollectionPanel
+            collection={errorCollection}
+            muted={muted}
+            activeClass={errorClass}
+            onToggleMute={handleToggleMute}
+            onSelectClass={(id) =>
+              applyFilters({
+                ...filters,
+                errorClass: id === errorClass ? undefined : id,
+              })
+            }
+          />
+        ) : null}
         {filterCount > 0 ? <UsageLogsStatsPanel filters={apiFilters} /> : null}
         <RequestIdSearch filters={filters} onApply={applyFilters} />
         <Collapsible open={isFilterOpen} onOpenChange={setIsFilterOpen}>
@@ -369,6 +374,7 @@ export function LogsPage() {
         open={exportOpen}
         onOpenChange={setExportOpen}
         currentSummary={currentSummary}
+        currentErrorClass={errorClass}
         onExport={handleExport}
       />
       {isFullscreen ? (

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import {
   CREDENTIAL_ENSURE_COOLDOWN_MS,
   classifyUpstreamResult,
+  isPreFirstFrameTransportFailure,
   repairAnthropicRequest,
   shouldContinue,
 } from '../../src/lib/pool/upstream-error-policy.mjs'
@@ -133,6 +134,23 @@ test('#163: a bare 429 is unknown for every model; the model name never decides 
   }
 })
 
+test('a long Retry-After alone never parks an account or model', () => {
+  for (const model of ['claude-fable-5-2', 'claude-opus-5-5']) {
+    const policy = classifyUpstreamResult(
+      {
+        status: 429,
+        headers: { 'retry-after': '109005' },
+        body: { error: { type: 'rate_limit_error', message: "This request would exceed your account's rate limit." } },
+      },
+      { model, now: 1000 },
+    )
+    assert.equal(policy.reason, 'rate_limited_unknown')
+    assert.equal(policy.action, 'continue')
+    assert.equal(policy.cooldownUntil, null)
+    assert.equal(policy.decision.cooldownUntilMs, null)
+  }
+})
+
 test('#1139: only a proven Fable window cools the Fable family', () => {
   const error = { type: 'rate_limit_error', message: 'Error' }
   const body = { type: 'error', error }
@@ -154,12 +172,7 @@ test('#1139: only a proven Fable window cools the Fable family', () => {
       'fable_rate_limited',
       'continue-and-cooldown',
     ],
-    [
-      'forwarded Retry-After',
-      { ...result, headers: { 'Retry-After': '7' } },
-      'rate_limited_unknown',
-      'continue-and-cooldown',
-    ],
+    ['forwarded Retry-After', { ...result, headers: { 'Retry-After': '7' } }, 'rate_limited_unknown', 'continue'],
     ['no native facts', { status: 429, body }, 'rate_limited_unknown', 'continue'],
     [
       'different error text',
@@ -694,7 +707,7 @@ test('Usage Policy API Error stops the request and is cached with no expiry', ()
   }
 })
 
-test('third-party extra-usage 400 and 503 are cached refusals, not invalid requests', () => {
+test('third-party extra-usage 400 and 503 stop as third_party_client without cooldown or refusal cache', () => {
   const messages = [
     "HTTP 400: Third-party apps now draw from your extra usage, not your plan limits. We've added a $20 credit to get you started.",
     'API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"Third-party apps now draw from your extra usage, not your plan limits."}}',
@@ -712,10 +725,11 @@ test('third-party extra-usage 400 and 503 are cached refusals, not invalid reque
         },
       })
       assert.equal(policy.action, 'stop', `${status} ${message}`)
-      assert.equal(policy.reason, 'usage_policy_refusal')
-      assert.equal(policy.rememberRefusal, true)
-      assert.equal(policy.refusalTtlMs, 0)
+      assert.equal(policy.reason, 'third_party_client')
+      assert.equal(policy.scope, 'request')
+      assert.equal(policy.rememberRefusal, undefined)
       assert.equal(policy.cooldownUntil, null)
+      assert.equal(policy.retrySameAccount, false)
       assert.equal(policy.circuit, undefined)
       assert.equal(policy.decision.origin, 'client')
       assert.equal(shouldContinue(policy), false)
@@ -1127,4 +1141,173 @@ test('explicit overload errors retain overload classification', () => {
     const policy = classifyUpstreamResult({ status, body: { error: { message: 'Overloaded' } } })
     assert.equal(policy.reason, 'provider_overloaded')
   }
+})
+
+test('fable usage-credits 429 moves on and marks the account, not the request', () => {
+  for (const message of ['Usage credits are required for this model.', 'Extra usage required for this model']) {
+    const policy = classifyUpstreamResult(
+      { status: 429, body: { type: 'error', error: { type: 'rate_limit_error', message } } },
+      { model: 'claude-fable-5-2', now: 1000 },
+    )
+    assert.equal(policy.reason, 'fable_credits_required')
+    assert.equal(policy.scope, 'account')
+    assert.equal(policy.action, 'continue')
+    assert.equal(policy.retrySameAccount, false)
+    assert.equal(policy.cooldownUntil, null)
+  }
+  const fast = classifyUpstreamResult(
+    { status: 429, body: { error: { message: 'Usage credits are required for fast mode' } } },
+    { model: 'claude-fable-5-2' },
+  )
+  assert.equal(fast.reason, 'entitlement_required')
+})
+
+function cragPreFirstFrame502(error, bodyError = error, overrides = {}) {
+  return {
+    ok: false,
+    status: 502,
+    upstreamStatus: 200,
+    via: 'rust-kernel-stream',
+    nativeHandoff: true,
+    committed: false,
+    firstByteAt: null,
+    firstByteMs: null,
+    ttftMs: null,
+    terminalState: 'incomplete',
+    transportError: false,
+    providerResult: {
+      type: 'kin_provider_result',
+      schema_version: 2,
+      source: 'crag',
+      provider_complete: false,
+      usage_complete: false,
+      http_status: null,
+      public_status: 502,
+      error,
+    },
+    body: {
+      type: 'error',
+      error: bodyError,
+    },
+    ...overrides,
+  }
+}
+
+test('#1562: CRAG nativeHandoff pre-first-frame 502 splice_rst cools proxy without same-account retry', () => {
+  const now = 1_700_000_000_000
+  const providerError = {
+    type: 'transport_error',
+    message:
+      'splice_rst dest=api.anthropic.com:443: read tcp 10.0.0.2:41234->198.51.100.9:1080: connection reset by peer',
+  }
+  for (const bodyError of [providerError, { type: 'api_error', message: 'provider error' }]) {
+    const result = cragPreFirstFrame502(providerError, bodyError)
+    assert.equal(isPreFirstFrameTransportFailure(result), true)
+    const policy = classifyUpstreamResult(result, { now })
+    assert.equal(policy.scope, 'proxy')
+    assert.equal(policy.action, 'continue-and-cooldown')
+    assert.equal(policy.reason, 'proxy_transport_failure')
+    assert.equal(policy.cooldownUntil, now + 60_000)
+    assert.equal(policy.retrySameAccount, false)
+    assert.equal(policy.decision.action, 'next_unit')
+    assert.equal(shouldContinue(policy), true)
+  }
+})
+
+test('#1562: CRAG pre-first-frame 502 SOCKS5 i/o timeout cools proxy instead of retrying as provider_timeout', () => {
+  const now = 1_700_000_000_000
+  const socksTimeout = {
+    type: 'transport_error',
+    message: 'socks_dial dest=api.anthropic.com:443: read SOCKS5 greeting: i/o timeout',
+  }
+  for (const model of ['claude-sonnet-4-5', 'claude-fable-5-2']) {
+    for (const bodyError of [socksTimeout, { type: 'api_error', message: 'provider error' }]) {
+      const result = cragPreFirstFrame502(socksTimeout, bodyError)
+      const policy = classifyUpstreamResult(result, { model, now })
+      assert.equal(policy.scope, 'proxy', model)
+      assert.equal(policy.action, 'continue-and-cooldown', model)
+      assert.equal(policy.reason, 'proxy_transport_failure', model)
+      assert.equal(policy.cooldownUntil, now + 60_000, model)
+      assert.equal(policy.retrySameAccount, false, model)
+      assert.equal(policy.decision.action, 'next_unit', model)
+      assert.equal(shouldContinue(policy), true, model)
+    }
+  }
+})
+
+test('#1562: pre-first-frame generic transport_error 502 switches units and counts toward circuit', () => {
+  const now = 1_700_000_000_000
+  const cases = [
+    [
+      'crag nativeHandoff transport_error',
+      cragPreFirstFrame502({ type: 'transport_error', message: 'unexpected EOF writing request body' }),
+    ],
+    [
+      'crag v2 provider_complete=false http_status=null',
+      cragPreFirstFrame502({ type: 'api_error', message: 'upstream HTTP/2 stream error' }),
+    ],
+    [
+      'non-nativeHandoff SSE code=transport_error',
+      {
+        ok: false,
+        status: 502,
+        nativeHandoff: false,
+        committed: false,
+        firstByteAt: null,
+        terminalState: 'incomplete',
+        transportError: false,
+        providerResult: null,
+        body: {
+          type: 'error',
+          error: { type: 'api_error', code: 'transport_error', message: 'unexpected EOF writing request body' },
+        },
+      },
+    ],
+  ]
+  for (const [label, result] of cases) {
+    assert.equal(isPreFirstFrameTransportFailure(result), true, label)
+    const policy = classifyUpstreamResult(result, { now })
+    assert.equal(policy.scope, 'worker', label)
+    assert.equal(policy.action, 'continue', label)
+    assert.equal(policy.reason, 'upstream_network_error', label)
+    assert.equal(policy.cooldownUntil, null, label)
+    assert.equal(policy.retrySameAccount, false, label)
+    assert.equal(policy.circuit, true, label)
+    assert.equal(policy.decision.scope, 'unit', label)
+    assert.equal(policy.decision.action, 'next_unit', label)
+    assert.equal(shouldContinue(policy), true, label)
+  }
+})
+
+test('#1562: committed or post-first-byte streams are not classified as pre-first-frame transport failures', () => {
+  const now = 1_700_000_000_000
+  const spliceError = {
+    type: 'transport_error',
+    message: 'splice_rst dest=api.anthropic.com:443: connection reset by peer',
+  }
+  const committedResult = cragPreFirstFrame502(spliceError, spliceError, {
+    committed: true,
+    firstByteAt: now - 50,
+  })
+  assert.equal(isPreFirstFrameTransportFailure(committedResult), false)
+  const committedPolicy = classifyUpstreamResult(committedResult, { now })
+  assert.equal(committedPolicy.action, 'stop')
+  assert.equal(committedPolicy.reason, 'downstream_committed_or_incomplete')
+
+  const verifiedPostFirstByte = cragPreFirstFrame502(spliceError, spliceError, {
+    committed: false,
+    firstByteAt: now - 50,
+    firstByteMs: 50,
+  })
+  assert.equal(isPreFirstFrameTransportFailure(verifiedPostFirstByte), false)
+  const postFirstBytePolicy = classifyUpstreamResult(verifiedPostFirstByte, { now })
+  assert.equal(postFirstBytePolicy.reason, 'empty_response')
+  assert.equal(postFirstBytePolicy.scope, 'stream')
+
+  const postFirstByteSocksTimeout = cragPreFirstFrame502(
+    { type: 'transport_error', message: 'socks_dial dest=api.anthropic.com:443: read SOCKS5 greeting: i/o timeout' },
+    { type: 'transport_error', message: 'socks_dial dest=api.anthropic.com:443: read SOCKS5 greeting: i/o timeout' },
+    { committed: false, firstByteAt: now - 50 },
+  )
+  assert.equal(classifyUpstreamResult(postFirstByteSocksTimeout, { now }).reason, 'provider_timeout')
 })

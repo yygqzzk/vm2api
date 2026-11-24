@@ -33,9 +33,17 @@ for (const runtime of ['kvm', 'docker']) {
     )
     const previousPath = process.env.PATH
     process.env.PATH = `${binDir}:${previousPath}`
+    const previousCragRoot = process.env.KIN_CRAG_V2_ROOT
     t.after(() => {
       process.env.PATH = previousPath
+      if (previousCragRoot === undefined) delete process.env.KIN_CRAG_V2_ROOT
+      else process.env.KIN_CRAG_V2_ROOT = previousCragRoot
     })
+    // Opening the terminal resolves the CRAG v2 package, which is a payload
+    // asset and never in the checkout. Seed the fixture tree under this test's
+    // own project root so the manual full sweep does not need a staged payload.
+    delete process.env.KIN_CRAG_V2_ROOT
+    seedEncryptedPackage(root)
     const shell = createSlotShell({ projectRoot: root, logger: { warn() {} } })
     const sockets = new Set()
     const shellId = 'a'.repeat(64)

@@ -15,7 +15,7 @@
 import fs from 'node:fs'
 import net from 'node:net'
 import path from 'node:path'
-import { forwardOutStreamLocal } from './ssh-link.mjs'
+import { connectUnixSocket } from './ssh-link.mjs'
 
 export class SocketRelay {
   /**
@@ -23,12 +23,15 @@ export class SocketRelay {
    * on first use, so they can listen at boot before the SSH link is up.
    * `dialDirect` (slot relays on a node with a direct link) returns `{ sock, ready }`
    * from dialGate, or null to use the SSH link.
-   * @param {{ socketPath: string, remotePath: string|(() => Promise<string>), getClient: () => import('ssh2').Client|null, dialDirect?: () => Promise<{ sock: import('node:net').Socket, ready: Promise<unknown> }|null>, logger?: Pick<Console, 'warn'> }} opts
+   * `docker` is set only by the Docker bridge owner; kernel/worker sockets
+   * must never be opened through Docker's daemon-only dial-stdio transport.
+   * @param {{ socketPath: string, remotePath: string|(() => Promise<string>), getClient: () => import('ssh2').Client|null, docker?: boolean, dialDirect?: () => Promise<{ sock: import('node:net').Socket, ready: Promise<unknown> }|null>, logger?: Pick<Console, 'warn'> }} opts
    */
-  constructor({ socketPath, remotePath, getClient, dialDirect = null, logger = console }) {
+  constructor({ socketPath, remotePath, getClient, docker = false, dialDirect = null, logger = console }) {
     this.socketPath = socketPath
     this.remotePath = remotePath
     this.getClient = getClient
+    this.docker = docker
     this.dialDirect = dialDirect
     this.logger = logger
     this.server = null
@@ -106,14 +109,20 @@ export class SocketRelay {
       return
     }
     let remote
+    // A dialer that hangs up while we wait for a bridge slot must not get a bridge opened for it.
+    const abort = new AbortController()
+    const onLocalClose = () => abort.abort()
+    local.once('close', onLocalClose)
     try {
       const target = typeof this.remotePath === 'function' ? await this.remotePath() : this.remotePath
-      remote = await forwardOutStreamLocal(client, target)
+      remote = await connectUnixSocket(client, target, { docker: this.docker, long: true, signal: abort.signal })
     } catch {
       // A missing remote socket (kernel restarting) is the normal "not ready" answer;
       // the caller's health poll sees a reset, same as a local ECONNREFUSED.
       local.destroy()
       return
+    } finally {
+      local.off?.('close', onLocalClose)
     }
     if (local.destroyed) {
       remote.close()
@@ -157,12 +166,21 @@ export class SocketRelay {
     return true
   }
 
-  async stop() {
+  /**
+   * unlink:false is for a controller that handed over: the path now belongs to the new leader, and
+   * closing a listening unix server also unlinks its path in libuv. So leave the listener to die
+   * with the process instead of closing it.
+   */
+  async stop({ unlink = true } = {}) {
     const server = this.server
     this.server = null
     this.listening = false
     for (const sock of this.active) sock.destroy()
     this.active.clear()
+    if (!unlink) {
+      server?.unref?.()
+      return
+    }
     if (server) await new Promise((resolve) => server.close(() => resolve()))
     fs.rmSync(this.socketPath, { force: true })
   }

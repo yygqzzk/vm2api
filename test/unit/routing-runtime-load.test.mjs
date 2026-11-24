@@ -11,6 +11,19 @@ function runtimeFor(file) {
   return createRoutingRuntime({ routingConfigPath: file })
 }
 
+test('routing persistence rejects invalid bot URLs before applying other changes', async () => {
+  const routingConfig = { sticky: { enabled: true } }
+  const runtime = createRoutingRuntime({ routingConfig })
+  await assert.rejects(
+    runtime.persistRoutingPatch({
+      sticky: { enabled: false },
+      notify: { feishu: { webhook: 'https://example.test/webhook' } },
+    }),
+    { code: 'invalid_feishu_webhook' },
+  )
+  assert.deepEqual(routingConfig, { sticky: { enabled: true } })
+})
+
 test('successful model access clears its denial without promoting a Pro account to Max', async () => {
   const { openDatabase, closeDatabase } = await import('../../src/lib/db/database.mjs')
   const { AccountQuota } = await import('../../src/lib/pool/account-quota.mjs')
@@ -489,7 +502,7 @@ test('native interval publication reports an unreachable remote VM as failed, no
   const vms = path.join(root, 'vms')
   const routingFile = path.join(root, 'routing.json')
   const user = 'cd'.repeat(32)
-  const seed = { telemetry_disabled: false }
+  const seed = { telemetry_disabled: true }
   for (const [id, extra] of [
     ['vm-claude', {}],
     ['vm-node', { node_id: 'node-test' }],
@@ -513,7 +526,7 @@ test('native interval publication reports an unreachable remote VM as failed, no
     const localSeed = JSON.parse(
       fs.readFileSync(path.join(vms, 'vm-claude', 'cli-home', '.claude', 'kin-seed.json'), 'utf8'),
     )
-    assert.equal(localSeed.seed_policy.telemetry_disabled, false)
+    assert.equal(localSeed.seed_policy.telemetry_disabled, true)
     assert.equal(fs.existsSync(path.join(vms, 'vm-claude', 'cli-home', '.claude', 'settings.json')), true)
     assert.equal(fs.existsSync(path.join(vms, 'vm-claude', 'cli-home', '.claude', 'claude.setting')), true)
     assert.equal(fs.existsSync(path.join(vms, 'vm-codex', 'run', 'kernel.json')), false)
@@ -523,6 +536,41 @@ test('native interval publication reports an unreachable remote VM as failed, no
     )
     assert.equal((await runtime.persistRoutingPatch({ sticky: {} })).telemetry_sync, null)
     assert.equal(JSON.parse(fs.readFileSync(routingFile, 'utf8')).telemetry.upload_interval_seconds, 3600)
+    const opted = await runtime.persistRoutingPatch({ telemetry: { default_enabled: true } })
+    assert.equal(opted.telemetry_sync.updated, 1)
+    assert.deepEqual(opted.telemetry_sync.failed, ['vm-node'])
+    assert.equal(
+      JSON.parse(fs.readFileSync(path.join(vms, 'vm-claude.json'), 'utf8')).seed_policy.telemetry_disabled,
+      false,
+    )
+    assert.equal(
+      JSON.parse(fs.readFileSync(path.join(vms, 'vm-codex.json'), 'utf8')).seed_policy.telemetry_disabled,
+      true,
+    )
+    assert.equal(
+      (await runtime.persistRoutingPatch({ telemetry: { default_enabled: false } })).telemetry_sync.updated,
+      1,
+    )
+    assert.equal(
+      JSON.parse(fs.readFileSync(path.join(vms, 'vm-claude.json'), 'utf8')).seed_policy.telemetry_disabled,
+      false,
+    )
+    const suppressed = await runtime.persistRoutingPatch({ telemetry: { disable_nonessential_traffic: true } })
+    assert.equal(suppressed.telemetry_sync.updated, 1)
+    assert.equal(JSON.parse(fs.readFileSync(routingFile, 'utf8')).telemetry.disable_nonessential_traffic, true)
+    assert.equal(
+      JSON.parse(fs.readFileSync(path.join(vms, 'vm-claude', 'cli-home', '.claude', 'settings.json'), 'utf8')).env
+        .CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC,
+      '1',
+    )
+    const unsuppressed = await runtime.persistRoutingPatch({ telemetry: { disable_nonessential_traffic: false } })
+    assert.equal(unsuppressed.telemetry_sync.updated, 1)
+    assert.equal(JSON.parse(fs.readFileSync(routingFile, 'utf8')).telemetry.disable_nonessential_traffic, false)
+    assert.equal(
+      JSON.parse(fs.readFileSync(path.join(vms, 'vm-claude', 'cli-home', '.claude', 'settings.json'), 'utf8')).env
+        .CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC,
+      undefined,
+    )
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
@@ -553,6 +601,35 @@ test('PUT /api/panel/routing rejects an invalid vm patch before persist', async 
   assert.equal(response.status, 400)
   assert.equal(response.body?.error?.code, 'invalid_vm_config')
   assert.match(response.body?.error?.message, /memory/)
+})
+
+test('PUT /api/panel/routing returns telemetry publication failures to the panel', async () => {
+  const response = {}
+  const handlePanel = createPanelHandler({
+    cfg: { paths: { project: os.tmpdir() }, limits: { max_body_bytes: 4096 } },
+    routingConfig: { telemetry: { default_enabled: false, upload_interval_seconds: 600 } },
+    stickyRouter: { stats: () => ({}) },
+    persistRoutingPatch: async () => ({
+      concurrency: { skipped: 0 },
+      rpm: { skipped: 0 },
+      session_slots: { updated: 0, skipped: 0 },
+      telemetry_sync: { updated: 1, queued: 0, skipped: 0, failed: ['vm-node'] },
+    }),
+    requireAuth(req) {
+      req.apiKeyKind = 'master'
+      req.panelRole = 'admin'
+      return true
+    },
+    json(_res, status, payload) {
+      response.status = status
+      response.body = payload
+      return true
+    },
+    readBody: async () => ({ telemetry: { default_enabled: true } }),
+  })
+  await handlePanel({ method: 'PUT' }, {}, new URL('http://localhost/api/panel/routing'))
+  assert.equal(response.status, 200)
+  assert.deepEqual(response.body?.data?.telemetry_sync?.failed, ['vm-node'])
 })
 
 test('persistRoutingPatch round-trips websocket gates and analytics', async () => {
@@ -613,6 +690,56 @@ test('persistRoutingPatch replaces codex.model_mappings with the full table the 
     await runtime.persistRoutingPatch({ codex: { model_mappings: { 'my-fast': 'gpt-6-luna' } } })
     saved = JSON.parse(fs.readFileSync(routingFile, 'utf8'))
     assert.deepEqual(saved.codex.model_mappings, { 'codex-auto-review': 'gpt-6-luna', 'my-fast': 'gpt-6-luna' })
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('persistRoutingPatch merges and normalizes batch_group and loadRoutingConfig normalizes persisted batch_group', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-routing-batch-group-'))
+  const routingFile = path.join(root, 'routing.json')
+  const routingConfig = { concurrency: {}, tiers: {} }
+  fs.writeFileSync(routingFile, JSON.stringify(routingConfig))
+  try {
+    const runtime = persistHarness(root, routingFile, routingConfig)
+    await runtime.persistRoutingPatch({
+      batch_group: { enabled: true, keys: ['k-1', '', 'k-2'], min: 2, max: 6, per_member_concurrency: 4 },
+    })
+    let saved = JSON.parse(fs.readFileSync(routingFile, 'utf8'))
+    assert.deepEqual(saved.batch_group, {
+      enabled: true,
+      enabled_for_all: false,
+      keys: ['k-1', 'k-2'],
+      min: 2,
+      max: 6,
+      per_member_concurrency: 4,
+      idle_ttl_s: 900,
+      observe: false,
+    })
+    await runtime.persistRoutingPatch({ batch_group: { observe: true } })
+    saved = JSON.parse(fs.readFileSync(routingFile, 'utf8'))
+    assert.equal(saved.batch_group.enabled, true)
+    assert.equal(saved.batch_group.observe, true)
+    assert.deepEqual(saved.batch_group.keys, ['k-1', 'k-2'])
+
+    fs.writeFileSync(
+      routingFile,
+      JSON.stringify({
+        codex: { quota: { max_concurrency: 2 } },
+        batch_group: { enabled: 1, min: -3, per_member_concurrency: 0 },
+      }),
+    )
+    const loaded = runtimeFor(routingFile).loadRoutingConfig()
+    assert.deepEqual(loaded.batch_group, {
+      enabled: false,
+      enabled_for_all: false,
+      keys: [],
+      min: 1,
+      max: 0,
+      per_member_concurrency: 3,
+      idle_ttl_s: 900,
+      observe: false,
+    })
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
