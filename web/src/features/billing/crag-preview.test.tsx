@@ -43,6 +43,18 @@ describe('CRAG draft boundary', () => {
     expect(html).not.toContain('¥0')
   })
 
+  it('shows the Telegram group on the preview canvas', () => {
+    const html = renderToStaticMarkup(
+      <PreviewCanvas
+        draft={{ plans: [plan] }}
+        selected={null}
+        onPick={vi.fn()}
+      />
+    )
+    expect(html).toContain('href="https://t.me/vm2api"')
+    expect(html).toContain('TG 群')
+  })
+
   it('rejects invalid theme, edit and duplicate draft ids', () => {
     expect(parseDraftMessage({ ...message, theme: 'system' })).toBeNull()
     expect(parseDraftMessage({ ...message, edit: 'true' })).toBeNull()
@@ -121,6 +133,38 @@ describe('CRAG draft boundary', () => {
         draft: { plans: [], presentation: copyDefaults, commerce: null },
       })
     ).not.toBeNull()
+  })
+
+  it('accepts presentation.layout instead of discarding the whole draft', () => {
+    for (const layout of [
+      {},
+      null,
+      { plan_columns: 3, orders_position: 'side' },
+      { card_density: 'compact', show_monthly_price: false },
+      { featured_sku: 'quarter', featured_label: '最超值' },
+      // 取值非法与未知键都交 normalizeLayout 兜底，不该让草稿整条失效。
+      { plan_columns: 9 },
+      { orders_position: 'float' },
+      { hero_video: 'x' },
+    ]) {
+      const parsed = parseDraftMessage({
+        ...message,
+        draft: { plans: [], presentation: { title: '订阅', layout } },
+      })
+      expect(parsed).not.toBeNull()
+      expect(parsed?.draft.presentation?.layout).toEqual(layout)
+    }
+  })
+
+  it('still rejects a layout that is not an object', () => {
+    for (const layout of ['side', 3, true, []]) {
+      expect(
+        parseDraftMessage({
+          ...message,
+          draft: { plans: [], presentation: { layout } },
+        })
+      ).toBeNull()
+    }
   })
 
   it('validates commerce without fabricating limits', () => {
@@ -245,5 +289,46 @@ describe('draft canvas shared presentation', () => {
     expect(html).not.toContain('<script>')
     expect(html).not.toContain('contenteditable')
     expect(html).not.toMatch(/<button[^>]*>创建订单<\/button>/)
+  })
+
+  it('renders CRAGGemini 1m/10-slot stackable plan and redemption preview on the canvas', () => {
+    const parsed = parseDraftMessage({
+      ...message,
+      draft: {
+        plans: [
+          {
+            sku: 'craggemini-1m-10',
+            term: '1m',
+            amount_minor: 10000,
+            slot_limit: 10,
+            product: 'craggemini',
+            stackable: true,
+            name: 'CRAGGemini 1个月兑换码 · 10 槽',
+          },
+        ],
+      },
+    })
+    expect(parsed).not.toBeNull()
+    expect(
+      parseDraftMessage({
+        ...message,
+        draft: { plans: [{ ...plan, product: 'unknown-product' }] },
+      })
+    ).toBeNull()
+
+    const defaultHtml = renderToStaticMarkup(
+      <PreviewCanvas
+        draft={{ plans: [plan] }}
+        selected={null}
+        onPick={vi.fn()}
+      />
+    )
+    expect(defaultHtml).toContain('兑换码兑换（CRAG / CRAGGemini）')
+    expect(defaultHtml).toContain('CRAGGemini 1个月兑换码 · 10 槽')
+    expect(defaultHtml).toContain('¥100')
+    expect(defaultHtml).toContain('¥10 / 槽')
+    expect(defaultHtml).toContain('可叠加')
+    expect(defaultHtml).toContain('7 天 / 10 槽')
+    expect(defaultHtml).toContain('100')
   })
 })

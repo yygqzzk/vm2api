@@ -17,12 +17,16 @@ export type VmSortKey =
 /**
  * 状态优先级：在池 → 受限 → 关闭调用 → 未使用 → 无效凭证 → revoke。
  * cool / quota 是受限，不与在池同级。
+ * Gemini 的推理证据单独排列，不参与在池或坏凭证的排序口径。
  */
 function statusRank(vm: Vm): number {
   return (
     {
       pool: 0,
+      host_verified: 0.25,
+      pending: 0.5,
       restricted: 1,
+      host_failed: 1.5,
       off: 2,
       none: 3,
       unschedulable: 4,
@@ -88,7 +92,7 @@ export function sortVms(
     }
   }
   return vms.slice().sort((a, b) => {
-    // 无效凭证恒后置，不受排序键与方向影响。按「今日花费」倒序时一台已吊销
+    // 无效凭证恒后置，不受排序键与方向影响。按「今日花费 · 北京时间」倒序时一台已吊销
     // 的高消耗槽本来会窜到第一行 —— 它已经不能用了，占着头部只会误导。
     // 组内按失效时间排（最近坏的在前），同样不看排序键。
     const da = vmCredDead(a)

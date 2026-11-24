@@ -1,6 +1,9 @@
 # VM-native telemetry
 
-Telemetry is an explicit per-VM seed-policy opt-in. New VMs are disabled.
+Telemetry is a per-VM seed-policy opt-in. New VMs follow
+`routing.telemetry.default_enabled` (missing or false means off). Turning that
+switch on also enables every existing Claude VM; turning it off does not opt
+existing VMs out.
 `kin-seed.json` → `seed_policy.telemetry_disabled` is the only enable authority.
 Linux Docker and KVM use the existing resident cli-node, supervised by the Rust
 kernel, as the sole upstream sender. macOS native slots report `unsupported`.
@@ -74,6 +77,15 @@ are whole minutes from **60–86400** seconds. Changes are published and observe
 without restarting the VM or inference process. All events share that cadence:
 no key-event, full-queue, shutdown, credential-ready or geo-ready forced flush.
 Empty batches are not sent.
+`routing.telemetry.default_enabled` defaults to **false**. When it changes to
+true, every Claude VM is opted in and the policy is published. Changing it back
+to false only affects VMs created afterward.
+`routing.telemetry.disable_nonessential_traffic` defaults to **false**. Unless
+explicitly enabled, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is kept unset
+(and stripped from legacy `settings.json` entries) because official Claude Code
+treats any set value—including `"0"`—as essential-traffic mode, which blocks
+`/usage`; enabling it writes `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"`
+across Claude slots.
 
 ## Queue and disable semantics
 
@@ -141,8 +153,10 @@ CRAG uses a separate Unix-socket control route, not the queue/ACK protocol
 above. `kin-seed.json` explicitly opts in with `seed_policy.telemetry_disabled:
 false`. The panel writes the guest's `CLAUDE_CONFIG_DIR/settings.json` alongside
 it. On enable it removes `DISABLE_TELEMETRY`, `CLAUDE_CODE_DISABLE_TELEMETRY`,
-`DO_NOT_TRACK`, and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`; on disable it
-writes the kill switches. Other kernels retain their existing settings policy.
+and `DO_NOT_TRACK`; on disable it writes the telemetry kill switches.
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` stays unset in both states unless
+`routing.telemetry.disable_nonessential_traffic` is `true` (which writes `"1"`).
+Other kernels retain their existing settings policy.
 
 The panel checks `POST /internal/v1/telemetry/apply` and, only on a restart-required
 response, uses slot maintenance to drain requests, restart the selected CRAG

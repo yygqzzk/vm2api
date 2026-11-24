@@ -8,6 +8,8 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { normalizeCragKernelVersion, normalizeKernelDataplane, normalizeSlotPersonaPreset } from '../vm/slot-engine.mjs'
+import { materializeAutomaticCache } from './cache-ttl.mjs'
+import { isOnlyOfficialCliIdentitySystem, sanitizeSafeguardsForCrag } from './crag-whitelist.mjs'
 import { normalizeImageContentBlocks } from './images.mjs'
 import { needsCragProviderCompatibility } from './kernel-request.mjs'
 /**
@@ -435,7 +437,15 @@ export function prepareCragPrintBody(
     foldSystemMessages = true,
   } = {},
 ) {
-  const out = { ...(body || {}) }
+  // The CRAG kernel reads block markers only and 400s on a top-level
+  // cache_control. Convert it here, before any early return, so every path out
+  // of this function hands the kernel the standard shape.
+  const out = materializeAutomaticCache({ ...(body || {}) })
+  if (out.safeguards !== undefined) {
+    const sg = sanitizeSafeguardsForCrag(out.safeguards, capabilities)
+    if (sg.value === undefined) delete out.safeguards
+    else out.safeguards = sg.value
+  }
   const nativeV3 = Array.isArray(capabilities) && capabilities.includes('generation_controls_v3')
   if (nativeV3 && Array.isArray(out.messages)) {
     out.messages = out.messages.map((message) => {
@@ -492,7 +502,8 @@ export function prepareCragPrintBody(
       },
     })
   }
-  const tail = officialPassthrough ? '' : callerSystemTail(body?.system)
+  const skipRelocatedPlaceholder = !officialPassthrough && isOnlyOfficialCliIdentitySystem(body?.system)
+  const tail = officialPassthrough || skipRelocatedPlaceholder ? '' : callerSystemTail(body?.system)
   if (!tail) return out
   if (textCache && mode === 'append') {
     out.system = body.system

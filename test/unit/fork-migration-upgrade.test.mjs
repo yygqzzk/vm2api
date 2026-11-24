@@ -105,6 +105,14 @@ test('1.4.076 migrations preserve accounts and correlated usage across lifetime-
     '058_crag_shop_activation.sql',
     '059_risk_audit_bans.sql',
     '060_crag_shop_order_dispatch.sql',
+    '061_refusal_session_blocks.sql',
+    '062_crag_shop_order_closed.sql',
+    '063_api_endpoint_body_policy.sql',
+    '064_proxy_dns_disable_svcb_https.sql',
+    '065_crag_shop_redemption.sql',
+    '066_crag_shop_device_host.sql',
+    '067_crag_shop_activation_error.sql',
+    '068_multi_tier_key_permissions.sql',
   ])
   assert.deepEqual(db.prepare('SELECT * FROM accounts').all(), accounts)
   const usage = db.prepare('SELECT id, request_id, correlation_id, usage_account_id FROM usage_logs').get()
@@ -142,6 +150,14 @@ test('1.4.115 upgrades preserve correlated history and keep the previous schema 
     '049_api_key_endpoint.sql',
     '059_risk_audit_bans.sql',
     '060_crag_shop_order_dispatch.sql',
+    '061_refusal_session_blocks.sql',
+    '062_crag_shop_order_closed.sql',
+    '063_api_endpoint_body_policy.sql',
+    '064_proxy_dns_disable_svcb_https.sql',
+    '065_crag_shop_redemption.sql',
+    '066_crag_shop_device_host.sql',
+    '067_crag_shop_activation_error.sql',
+    '068_multi_tier_key_permissions.sql',
   ])
   assert.deepEqual(db.prepare('SELECT * FROM accounts').all(), accounts)
   const reopened = f.open({ migrationsDir: legacy })

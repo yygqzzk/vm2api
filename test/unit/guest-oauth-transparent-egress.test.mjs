@@ -8,6 +8,7 @@ import {
   prepareSlotOAuth,
   runGuestOAuthAuthService,
 } from '../../src/lib/oauth/guest-oauth-helper.mjs'
+import { CRAG_CLAUDE_VERSION } from '../../src/lib/vm/slot-engine.mjs'
 
 test('OAuth without native telemetry uses the persisted bound exit without starting the slot', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-oauth-legacy-'))
@@ -113,23 +114,65 @@ test('guest OAuth helper delegates egress selection to the slot network', async 
   }
 })
 
-test('guest OAuth uses the installed native Claude version, and does not exchange when it is unreadable', async () => {
+test('a helper failure without a usable code falls back instead of reporting undefined', async () => {
+  const exec = {
+    projectRoot: '/srv/vm2api',
+    vmId: 'vm-01',
+    vm: { id: 'vm-01', runtime: { type: 'docker' } },
+  }
+  const run = (error) =>
+    runGuestOAuthAuthService(
+      { operation: 'exchange_code', code: 'fixture-code', code_verifier: 'fixture-verifier' },
+      {
+        exec,
+        prepare: async () => ({
+          exec,
+          host: {
+            bins: { oauthAuth: '/usr/local/bin/kin-oauth-auth' },
+            dockerEnv: () => ({}),
+            execUser: () => 'kincli',
+          },
+          configDir: '/home/kincli/.claude',
+          home: '/home/kincli',
+        }),
+        postTelemetry: async () => ({ ok: true }),
+        runDocker: async () => ({ code: 0, stdout: JSON.stringify({ ok: false, ...(error ? { error } : {}) }) }),
+      },
+    )
+
+  // A code the panel can act on is kept.
+  await assert.rejects(run({ code: 'authorize_client_attestation', message: 'boom' }), {
+    code: 'authorize_client_attestation',
+    message: 'boom',
+  })
+  // Everything the pattern rejects becomes the fallback, including a missing or
+  // non-string code — `undefined`/`null` used to pass the bare regexp test.
+  for (const error of [undefined, {}, { message: 'boom' }, { code: null }, { code: 'Bad Code' }, { code: 42 }]) {
+    await assert.rejects(run(error), (err) => {
+      assert.equal(err.code, 'oauth_auth_failed')
+      return true
+    })
+  }
+})
+
+test('guest OAuth takes the version from the locked crag entrypoint, without an extra exec', async () => {
   const exec = {
     projectRoot: '/srv/vm2api',
     vmId: 'vm-01',
     vm: { id: 'vm-01', dataplane: 'crag', crag_kernel_version: 'v2', runtime_type: 'kvm' },
   }
   const calls = []
-  const run = (stdout) =>
+  const run = (vm) =>
     runGuestOAuthAuthService(
+      // A caller-supplied version must not win over the entrypoint's own.
       { operation: 'exchange_code', claude_version: '0.0.0' },
       {
-        exec,
+        exec: { ...exec, vm },
         prepare: async () => ({
-          exec,
+          exec: { ...exec, vm },
           host: {
             bakedKernel: true,
-            bins: { oauthAuth: '/usr/local/bin/kin-oauth-auth' },
+            bins: { oauthAuth: '/usr/local/bin/kin-oauth-auth', cli: '/opt/kin/cli-node' },
             dockerEnv: () => ({}),
             execUser: () => 'kincli',
           },
@@ -139,15 +182,79 @@ test('guest OAuth uses the installed native Claude version, and does not exchang
         postTelemetry: async () => ({ ok: true }),
         runDocker: async (argv, { stdin }) => {
           calls.push({ argv, stdin })
-          if (argv.at(-1) === '--version') return { code: 0, stdout }
           return { code: 0, stdout: JSON.stringify({ ok: true, credential: { access_token: 'fixture-access' } }) }
         },
       },
     )
-  await run('2.1.321 (Claude Code)\n')
-  assert.equal(calls[0].argv.at(-1), '--version')
-  assert.ok(calls[0].argv.includes('/usr/local/bin/kin-guest-exec'))
-  assert.equal(JSON.parse(calls[1].stdin).claude_version, '2.1.321')
-  await assert.rejects(run('unknown'), { code: 'oauth_cli_version_unavailable' })
-  assert.equal(calls.length, 3)
+
+  const credential = await run(exec.vm)
+  assert.equal(credential.access_token, 'fixture-access')
+  assert.equal(JSON.parse(calls[0].stdin).claude_version, CRAG_CLAUDE_VERSION)
+  // One exec only: the helper itself. Reading the version back off the CLI cost an
+  // exec per exchange and refused valid exchanges when it failed.
+  assert.equal(calls.length, 1)
+  assert.ok(!calls.some((call) => call.argv.includes('--version')))
+
+  // A non-crag slot has no locked entrypoint, so the caller's value stands.
+  await run({ ...exec.vm, dataplane: 'wrap' })
+  assert.equal(JSON.parse(calls[1].stdin).claude_version, '0.0.0')
+  assert.equal(calls.length, 2)
+})
+
+test('a slot that is not ready reports why in the OAuth error message', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-oauth-notready-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  fs.mkdirSync(path.join(root, 'vms'))
+  const vm = {
+    id: 'vm-01',
+    runtime: { type: 'docker' },
+    status: 'running',
+    proxy: { id: 'px-bound', host: '127.0.0.1', port: 20881 },
+  }
+  fs.writeFileSync(path.join(root, 'vms', 'vm-01.json'), JSON.stringify(vm))
+  const prepare = (boot) =>
+    prepareSlotOAuth({
+      exec: { projectRoot: root, vmId: vm.id, vm },
+      readHealth: async () => ({ vm_telemetry: true, telemetry_ready: true }),
+      startReady: async () => boot,
+    })
+  await assert.rejects(prepare({ ok: false, code: 'cluster_unavailable' }), {
+    code: 'cluster_unavailable',
+    message: 'Target VM native CLI is not ready (cluster_unavailable)',
+  })
+  await assert.rejects(prepare({ ok: false }), {
+    message: 'Target VM native CLI is not ready (oauth_runtime_not_ready)',
+  })
+})
+
+test('the readiness error code and message stay consistent for odd codes', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-oauth-notready2-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  fs.mkdirSync(path.join(root, 'vms'))
+  const vm = {
+    id: 'vm-01',
+    runtime: { type: 'docker' },
+    status: 'running',
+    proxy: { id: 'px-bound', host: '127.0.0.1', port: 20881 },
+  }
+  fs.writeFileSync(path.join(root, 'vms', 'vm-01.json'), JSON.stringify(vm))
+  const prepare = (boot) =>
+    prepareSlotOAuth({
+      exec: { projectRoot: root, vmId: vm.id, vm },
+      readHealth: async () => ({ vm_telemetry: true, telemetry_ready: true }),
+      startReady: async () => boot,
+    })
+  const fallback = {
+    code: 'oauth_runtime_not_ready',
+    message: 'Target VM native CLI is not ready (oauth_runtime_not_ready)',
+  }
+  // not a safe code: err.code is sanitized too, not only the text
+  await assert.rejects(prepare({ ok: false, code: 'Bad Code: /etc/passwd' }), fallback)
+  await assert.rejects(prepare({ ok: false, code: '9starts_with_digit' }), fallback)
+  await assert.rejects(prepare({ ok: false, code: null }), fallback)
+  // nested rust code wins over the outer one
+  await assert.rejects(prepare({ ok: false, code: 'outer_code', rust: { ok: false, code: 'kernel_faulted' } }), {
+    code: 'kernel_faulted',
+    message: 'Target VM native CLI is not ready (kernel_faulted)',
+  })
 })

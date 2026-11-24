@@ -8,6 +8,8 @@ import {
   installKernelTargets,
   releaseKernelInstallSafetyHold,
   resumePendingKernelInstalls,
+  cancelKernelInstall,
+  listActiveKernelInstalls,
 } from '../../src/lib/vm/kernel-install.mjs'
 import { kvmKernelSelector, selectChangedPayloadFiles } from '../../src/lib/cluster/remote-slot-files.mjs'
 import { describeKernelCatalog, pullKernelRelease } from '../../src/lib/admin/kernel-catalog.mjs'
@@ -28,6 +30,7 @@ import { cragV2PackageRoot, materializeResolvedKernel } from '../../src/lib/vm/w
 import { writeKernelConfig } from '../../src/lib/transport/rust-kernel-supervisor.mjs'
 import {
   activateFixture,
+  fixtureAuthority,
   issueFixtureCode,
   issueHostEntitlement,
   issueSlotPermit,
@@ -352,8 +355,14 @@ for (const health of [{ ok: false }, { ok: true, rust_ok: false }, { ok: true, r
   })
 }
 
-for (const authenticated of [true, false]) {
-  test(`failed pinned CRAG update reports rollback only after authenticated native health (${authenticated})`, async (t) => {
+for (const [label, health, recovered] of [
+  ['healthy idle pool', { internalTokenAuthenticated: true, ready_slots: 1, cli_pid: 0 }, true],
+  ['unauthenticated', { internalTokenAuthenticated: false, ready_slots: 1, cli_pid: 0 }, false],
+  ['not ready', { internalTokenAuthenticated: true, ready_slots: 0, cli_pid: 0 }, false],
+  ['license invalid', { internalTokenAuthenticated: true, ready_slots: 1, license_valid: false, cli_pid: 0 }, false],
+  ['recovering', { internalTokenAuthenticated: true, ready_slots: 1, recovering: true, cli_pid: 0 }, false],
+]) {
+  test(`failed pinned CRAG update verifies rollback readiness (${label})`, async (t) => {
     const previous = { kernel: 'crag', version: '3.1.2', installed_at: '2026-11-16T00:00:00Z' }
     const { root, vm, home } = fixture(t, {
       dataplane: 'crag',
@@ -393,7 +402,7 @@ for (const authenticated of [true, false]) {
       rustKernelHealth(exec, options) {
         assert.equal(exec.vmId, vm.id)
         assert.deepEqual(options, { requireInternalToken: true })
-        return { ok: true, healthy: true, cli_pid: 42, internalTokenAuthenticated: authenticated }
+        return { ok: true, healthy: true, execution_mode: 'v2_process_pool', ...health }
       },
     })
     const result = await installKernelTargets({
@@ -404,16 +413,16 @@ for (const authenticated of [true, false]) {
     assert.equal(starts, 2, JSON.stringify(result))
     assert.equal(result.ok, false, 'the requested version never became ready')
     assert.equal(result.items[0].code, 'kernel_health_timeout')
-    assert.equal(result.items[0].rolled_back, authenticated)
-    assert.equal(result.items[0].stopped, !authenticated)
-    assert.equal(stops, authenticated ? 2 : 3)
+    assert.equal(result.items[0].rolled_back, recovered)
+    assert.equal(result.items[0].stopped, !recovered)
+    assert.equal(stops, recovered ? 2 : 3)
     assert.deepEqual(fs.readFileSync(registration), oldGrant)
     assert.deepEqual(fs.readFileSync(manifest), oldManifest)
     const saved = getVm(root, vm.id)
     assert.deepEqual(saved.kernel_installation, previous)
-    assert.equal(saved.schedulable, authenticated)
-    assert.equal(saved.status, authenticated ? 'running' : 'stopped')
-    if (authenticated) assert.equal(saved.kernel_operation, undefined)
+    assert.equal(saved.schedulable, recovered)
+    assert.equal(saved.status, recovered ? 'running' : 'stopped')
+    if (recovered) assert.equal(saved.kernel_operation, undefined)
     else {
       assert.equal(saved.kernel_operation.phase, 'failed')
       const backup = path.join(root, 'vms', vm.id, saved.kernel_operation.rollback_package, 'package')
@@ -665,6 +674,137 @@ test('a pinned CRAG install verifies runtime admission before authorizing, stopp
   assert.equal(result.ok, true, JSON.stringify(result))
   assert.deepEqual(events, ['verify', 'admit', 'verify', 'bind', 'verify', 'stop', 'health', 'release'])
 })
+
+for (const [label, reissue, expected] of [
+  ['an admin-confirmed reissue reaches authorizeInstall', true, true],
+  ['a plain install does not ask for a legacy reissue', undefined, false],
+]) {
+  test(`${label} (#1263)`, async (t) => {
+    const { root, vm: _vm } = fixture(t)
+    let seen = 'never-called'
+    let authorized = false
+    const life = lifecycle(root)
+    const result = await installKernelTargets({
+      projectRoot: root,
+      targets: [{ ...target()[0], expected_tag: 'v1.4.104', ...(reissue === undefined ? {} : { reissue }) }],
+      routing: {},
+      cragSubscription: {
+        // The allowLegacyReissue branches themselves are covered in
+        // crag-subscription.test.mjs; this layer only has to pass the flag on.
+        authorizeInstall(desired, options) {
+          seen = options?.allowLegacyReissue
+          activateFixture(root, desired)
+          authorized = true
+        },
+      },
+      ops: {
+        ...life.ops,
+        describeKernelCatalog: () => [{ id: 'crag', ready: true, release_tag: 'v1.4.104' }],
+        checkCragLicense: () => (authorized ? { ok: true } : { ok: false, code: 'license_required' }),
+      },
+    })
+    assert.equal(result.ok, true, JSON.stringify(result))
+    // Compare the opt-in itself, not whether it arrived as false or undefined.
+    assert.equal(seen === true, expected)
+  })
+}
+
+for (const partialInstall of [false, true]) {
+  test(`explicit pinned reissue replaces a mismatched signed grant before stopping (${partialInstall ? 'partial tree' : 'no installed tree'})`, async (t) => {
+    const { root, vm, home } = fixture(t)
+    const old = activateFixture(root, vm)
+    const registration = path.join(cragLicenseDirectory(root, vm), 'registration.code')
+    const oldGrant = fs.readFileSync(registration)
+    const identity = fs.readFileSync(path.join(cragLicenseDirectory(root, vm), 'device.json'))
+    if (partialInstall) {
+      fs.mkdirSync(path.join(home, '.kin', 'crag-v2', 'claude-code-2.1.321'), { recursive: true })
+      assert.equal(getCragLicense(root, vm).license.code, 'license_unconfigured')
+    }
+    fixtureAuthority(root).payloadKey = randomBytes(32)
+    seedEncryptedPackage(root)
+    assert.equal(getCragLicense(root, vm, { preferInstalled: false }).license.code, 'license_payload_key_mismatch')
+    const events = []
+    const life = lifecycle(root, {
+      stopSlot() {
+        events.push('stop')
+        assert.equal(getCragLicense(root, vm, { preferInstalled: false }).license.valid, true)
+        return { ok: true }
+      },
+    })
+    const result = await installKernelTargets({
+      projectRoot: root,
+      targets: [{ ...target()[0], expected_tag: 'v1.4.104', reissue: true }],
+      cragSubscription: {
+        authorizeInstall(desired, options) {
+          assert.equal(desired.id, vm.id)
+          assert.equal(options.allowLegacyReissue, true)
+          events.push('authorize')
+          // Simulate the issuer returning a signature for this exact candidate;
+          // the installer must verify it before stopping the old runtime.
+          fs.writeFileSync(registration, issueFixtureCode(root, old.machine_code).code)
+        },
+      },
+      ops: {
+        ...life.ops,
+        describeKernelCatalog: () => [{ id: 'crag', ready: true, release_tag: 'v1.4.104' }],
+      },
+    })
+    assert.equal(result.ok, true, JSON.stringify(result))
+    assert.deepEqual(events, ['authorize', 'stop'])
+    assert.notDeepEqual(fs.readFileSync(registration), oldGrant)
+    assert.deepEqual(fs.readFileSync(path.join(cragLicenseDirectory(root, vm), 'device.json')), identity)
+    assert.equal(getCragLicense(root, getVm(root, vm.id)).license.valid, true)
+    assert.equal(getVm(root, vm.id).dataplane, 'crag')
+  })
+}
+
+for (const scenario of ['no-reissue', 'no-pin', 'no-authorizer', 'issuer-unavailable', 'permit-not-replaced']) {
+  test(`payload migration rejects ${scenario} before stopping and preserves the old grant`, async (t) => {
+    const { root, vm } = fixture(t)
+    activateFixture(root, vm)
+    fixtureAuthority(root).payloadKey = randomBytes(32)
+    seedEncryptedPackage(root)
+    const registration = path.join(cragLicenseDirectory(root, vm), 'registration.code')
+    const before = fs.readFileSync(registration)
+    let authorizations = 0
+    const result = await installKernelTargets({
+      projectRoot: root,
+      targets: [
+        {
+          ...target()[0],
+          ...(scenario !== 'no-pin' && { expected_tag: 'v1.4.104' }),
+          ...(scenario !== 'no-reissue' && { reissue: true }),
+        },
+      ],
+      ...(scenario !== 'no-authorizer' && {
+        cragSubscription: {
+          authorizeInstall() {
+            authorizations++
+            if (scenario === 'issuer-unavailable') {
+              throw Object.assign(new Error('issuer unavailable'), { code: 'crag_subscription_authority_unavailable' })
+            }
+          },
+        },
+      }),
+      ops: {
+        describeKernelCatalog: () => [{ id: 'crag', ready: true, release_tag: 'v1.4.104' }],
+        stopSlot: () => assert.fail('unconfirmed migration must not stop the slot'),
+      },
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.items[0].stopped, false)
+    assert.equal(authorizations, ['issuer-unavailable', 'permit-not-replaced'].includes(scenario) ? 1 : 0)
+    assert.equal(
+      result.items[0].code,
+      scenario === 'issuer-unavailable'
+        ? 'crag_subscription_authority_unavailable'
+        : 'crag_subscription_migration_required',
+    )
+    assert.deepEqual(fs.readFileSync(registration), before)
+    assert.equal(getVm(root, vm.id).status, 'running')
+    assert.equal(getVm(root, vm.id).dataplane, 'wrap')
+  })
+}
 
 for (const node_id of [undefined, 'remote-kvm']) {
   test(`a confirmed ${node_id ? 'remote' : 'local'} KVM reinstall verifies a signed host permit before stopping`, async (t) => {
@@ -966,6 +1106,92 @@ test('cluster Docker CRAG install is not rejected as a local-only slot', async (
   assert.notEqual(result.items[0].code, 'crag_v2_unsupported_placement')
   assert.equal(result.items[0].stopped, false)
 })
+
+test('CRAG update stages a stopped cluster slot without starting it, including after reconnect', async (t) => {
+  const { root, vm } = fixture(t, {
+    status: 'stopped',
+    node_id: 'remote-node',
+    dataplane: undefined,
+    crag_kernel_version: undefined,
+    schedule_off: true,
+    schedule_off_reason: 'stopped',
+  })
+  const routing = { inference: { dataplane: 'crag' } }
+  const payload_tag = 'payload-2026.11.20-crag-3.1.8'
+  const targets = [{ id: vm.id, kernel: 'crag', payload_tag, update_existing: true }]
+  let attempts = 0
+  const ops = {
+    describeKernelCatalog: () => [{ id: 'crag', ready: true, version: '3.1.8', payload_tag }],
+    checkCragLicense: () => ({ ok: true }),
+    nodeReady: () => true,
+    stopSlot: (candidate) => {
+      assert.equal(candidate.status, 'stopped')
+      return { ok: true }
+    },
+    suspendVmRuntimeRestart: () => assert.fail('不能对本机 Docker 操作集群槽'),
+    startSlotReady: () => assert.fail('更新不能启动已停止的槽'),
+    deployBakedKernel: async (_root, candidate) => {
+      assert.equal(candidate.node_id, 'remote-node')
+      return ++attempts === 1 ? { ok: false, code: 'ssh_closed' } : { ok: true }
+    },
+    initializeSlotSeedFiles: async () => {},
+    writeKernelConfig: () => ({ configPath: '/tmp/kernel.json' }),
+  }
+  const first = await installKernelTargets({ projectRoot: root, targets, routing, ops })
+  assert.equal(first.items[0].code, 'ssh_closed')
+  assert.equal(getVm(root, vm.id).kernel_operation.phase, 'pending')
+  const resumed = await resumePendingKernelInstalls({ projectRoot: root, routing, ops })
+  assert.equal(resumed.ok, true, JSON.stringify(resumed))
+  assert.equal(resumed.items[0].payload_tag, payload_tag)
+  assert.equal(resumed.items[0].restarted, false)
+  const saved = getVm(root, vm.id)
+  assert.equal(saved.status, 'stopped')
+  assert.equal(saved.schedule_off, true)
+  assert.equal(saved.kernel_operation, undefined)
+  assert.equal(saved.kernel_installation.payload_tag, payload_tag)
+  assert.equal(saved.dataplane, undefined)
+  assert.equal(saved.crag_kernel_version, undefined)
+})
+
+for (const field of ['active_requests', 'continuations', 'queued', 'missing_relay']) {
+  test(`CRAG update leaves a cluster slot with ${field} untouched`, async (t) => {
+    const relay = '/tmp/remote-kernel.sock'
+    const { root, vm } = fixture(t, {
+      node_id: 'remote-node',
+      dataplane: 'crag',
+      runtime: field === 'missing_relay' ? {} : { kernel_socket: relay },
+    })
+    const payload_tag = 'payload-2026.11.20-crag-3.1.8'
+    const result = await installKernelTargets({
+      projectRoot: root,
+      targets: [{ id: vm.id, kernel: 'crag', payload_tag, update_existing: true }],
+      ops: {
+        describeKernelCatalog: () => [{ id: 'crag', ready: true, payload_tag }],
+        checkCragLicense: () => ({ ok: true }),
+        stopSlot: () => assert.fail('不能停止仍有请求或续接的槽'),
+        rustKernelHealth: async (exec) => {
+          assert.notEqual(field, 'missing_relay', '缺少节点转发时不能探测本机套接字')
+          assert.equal(exec.vm.runtime.kernel_socket, relay)
+          assert.equal(getVm(root, vm.id).schedule_hold.reason, 'maintenance')
+          return {
+            healthy: true,
+            runtime_variant: 'crag-v2',
+            license_valid: true,
+            active_requests: 0,
+            continuations: 0,
+            queued: 0,
+            [field]: 1,
+          }
+        },
+      },
+    })
+    assert.equal(result.items[0].code, 'crag_slot_not_idle')
+    const saved = getVm(root, vm.id)
+    assert.equal(saved.status, 'running')
+    assert.equal(saved.schedule_hold, undefined)
+    assert.equal(saved.kernel_operation, undefined)
+  })
+}
 
 for (const stage of ['policy', 'materialize', 'seed', 'config']) {
   test(`post-stop ${stage} failure retains previous selection and remains durably stopped`, async (t) => {
@@ -1374,4 +1600,161 @@ test('kernel installation resets an open request circuit only after verified rea
   })
   assert.equal(repaired.ok, true, JSON.stringify(repaired))
   assert.equal(unitCircuit.view(account).state, 'closed')
+})
+
+test('a forced cancel stops the installer at its next checkpoint without starting the slot', async (t) => {
+  const { root, vm } = fixture(t)
+  let releaseStop
+  const stopping = new Promise((resolve) => (releaseStop = resolve))
+  let stopEntered
+  const entered = new Promise((resolve) => (stopEntered = resolve))
+  let started = false
+  const life = lifecycle(root, {
+    async stopSlot(current) {
+      stopEntered()
+      await stopping
+      return { ok: true, runtime: { ...current.runtime, stopped: true } }
+    },
+    startSlotReady() {
+      started = true
+      return { ok: true, rust_ok: true }
+    },
+  })
+  const running = installKernelTargets({ projectRoot: root, targets: target('cli-node'), ops: life.ops })
+  await entered
+  assert.deepEqual(
+    listActiveKernelInstalls().map(({ id, kernel, phase }) => ({ id, kernel, phase })),
+    [{ id: vm.id, kernel: 'cli-node', phase: 'kernel_stop_failed' }],
+  )
+  const cancel = cancelKernelInstall(vm.id)
+  assert.equal(cancel.ok, true, JSON.stringify(cancel))
+  releaseStop()
+  const result = await running
+  assert.equal(result.ok, false)
+  assert.equal(result.items[0].code, 'kernel_install_cancelled')
+  assert.equal(result.items[0].stopped, true)
+  assert.equal(started, false, 'a cancelled install must not start the slot')
+  const saved = getVm(root, vm.id)
+  assert.equal(saved.kernel_operation.phase, 'failed')
+  assert.equal(saved.kernel_operation.code, 'kernel_install_cancelled')
+  assert.equal(saved.schedulable, false, 'a stopped slot stays under maintenance for review')
+  assert.deepEqual(listActiveKernelInstalls(), [])
+  assert.equal(cancelKernelInstall(vm.id).code, 'kernel_install_not_running')
+})
+
+test('a kernel start failure keeps the runtime cause on the result and the install record', async (t) => {
+  const { root, vm } = fixture(t)
+  const result = await installKernelTargets({
+    projectRoot: root,
+    targets: target('cli-node'),
+    ops: lifecycle(root, {
+      // Container came up; the kernel behind it did not. The cause lives on boot.rust.
+      startSlotReady: () => ({
+        ok: true,
+        rust_ok: false,
+        rust: {
+          ok: false,
+          code: 'kernel_health_timeout',
+          error: 'Legacy telemetry process did not stop',
+          rust: { ok: false, reason: 'legacy_telemetry_stop_failed' },
+        },
+      }),
+    }).ops,
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.items[0].code, 'kernel_health_timeout', JSON.stringify(result))
+  assert.equal(result.items[0].error, 'Legacy telemetry process did not stop')
+  const operation = getVm(root, vm.id).kernel_operation
+  assert.equal(operation.phase, 'failed')
+  assert.equal(operation.code, 'kernel_start_failed', 'the phase stays the record code')
+  assert.equal(operation.failure.code, 'kernel_health_timeout')
+  assert.equal(operation.failure.error, 'Legacy telemetry process did not stop')
+  assert.equal(operation.failure.reason, 'legacy_telemetry_stop_failed')
+  assert.ok(Date.parse(operation.failure.at) > 0)
+})
+
+test('a start failure without runtime detail still reports the generic phase', async (t) => {
+  const { root, vm } = fixture(t)
+  const result = await installKernelTargets({
+    projectRoot: root,
+    targets: target('cli-node'),
+    ops: lifecycle(root, { startSlotReady: () => ({ ok: true, rust_ok: false }) }).ops,
+  })
+  assert.equal(result.items[0].code, 'kernel_start_failed')
+  assert.equal(result.items[0].error, '内核重启或健康检查失败')
+  assert.equal(getVm(root, vm.id).kernel_operation.failure.reason, null)
+})
+
+test('CRAG install preflight rejects a non-amd64 slot with crag_v2_arch_mismatch before stopping', async (t) => {
+  const { root, vm } = fixture(t)
+  fs.rmSync(path.join(root, 'share/crag/kernels/v2/arm64'), { recursive: true, force: true })
+  if (!fs.existsSync(path.join(root, 'share/crag/kernels/v2/amd64/manifest.json'))) {
+    seedEncryptedPackage(root, { arch: 'amd64' })
+  }
+  const armVmFile = path.join(root, 'vms', `${vm.id}.json`)
+  const armRecord = { ...JSON.parse(fs.readFileSync(armVmFile, 'utf8')), runtime: { type: 'docker', arch: 'arm64' } }
+  fs.writeFileSync(armVmFile, JSON.stringify(armRecord))
+  const before = fs.readFileSync(armVmFile)
+  const result = await installKernelTargets({
+    projectRoot: root,
+    targets: target('crag'),
+    ops: {
+      describeKernelCatalog: undefined,
+      stopSlot() {
+        assert.fail('arch mismatch preflight must not stop the slot')
+      },
+    },
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.items[0].code, 'crag_v2_arch_mismatch')
+  assert.equal(result.items[0].stopped, false)
+  assert.deepEqual(fs.readFileSync(armVmFile), before)
+})
+
+test('reinstalling CRAG preserves native telemetry settings when telemetry_disabled is false or true', async (t) => {
+  const { root, vm, home } = fixture(t, {
+    dataplane: 'crag',
+    crag_kernel_version: 'v2',
+    seed_policy: { telemetry_disabled: false, claude_setting: 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1' },
+  })
+  activateFixture(root, vm)
+  const settingsFile = path.join(home, '.claude', 'settings.json')
+  fs.writeFileSync(
+    settingsFile,
+    JSON.stringify({
+      env: {
+        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+        DISABLE_TELEMETRY: '1',
+        CLAUDE_CODE_DISABLE_TELEMETRY: '1',
+        CUSTOM: 'keep-across-reinstall',
+      },
+    }),
+  )
+  const seenOpts = []
+  const life = lifecycle(root, {
+    initializeSlotSeedFiles(project, candidate, _host, opts) {
+      seenOpts.push(opts)
+      return initializeSlotSeedFiles(project, candidate, slotHost({ ...candidate, node_id: null }), opts)
+    },
+  })
+  const onResult = await installKernelTargets({ projectRoot: root, targets: target('crag'), ops: life.ops })
+  assert.equal(onResult.ok, true, JSON.stringify(onResult))
+  assert.equal(seenOpts[0]?.cragNativeTelemetry, true)
+  const onSettings = JSON.parse(fs.readFileSync(settingsFile, 'utf8'))
+  assert.equal(onSettings.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, undefined)
+  assert.equal(onSettings.env.DISABLE_TELEMETRY, undefined)
+  assert.equal(onSettings.env.CLAUDE_CODE_DISABLE_TELEMETRY, undefined)
+  assert.equal(onSettings.env.DO_NOT_TRACK, undefined)
+  assert.equal(onSettings.env.CUSTOM, 'keep-across-reinstall')
+
+  // When telemetry_disabled is true, reinstalling CRAG must write CLAUDE_CODE_DISABLE_TELEMETRY='1'.
+  const updated = getVm(root, vm.id)
+  updated.seed_policy = { ...updated.seed_policy, telemetry_disabled: true }
+  fs.writeFileSync(path.join(root, 'vms', `${vm.id}.json`), JSON.stringify(updated))
+  const offResult = await installKernelTargets({ projectRoot: root, targets: target('crag'), ops: life.ops })
+  assert.equal(offResult.ok, true, JSON.stringify(offResult))
+  const offSettings = JSON.parse(fs.readFileSync(settingsFile, 'utf8'))
+  assert.equal(offSettings.env.DISABLE_TELEMETRY, '1')
+  assert.equal(offSettings.env.CLAUDE_CODE_DISABLE_TELEMETRY, '1')
+  assert.equal(offSettings.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, undefined)
 })

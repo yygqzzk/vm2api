@@ -1,7 +1,8 @@
 import { constants } from 'node:fs'
 import { open } from 'node:fs/promises'
 
-const ROOT = 'https://crag.fkcodex.com'
+const ROOT = 'https://www.vm2api.org'
+const CALLBACK_ORIGINS = ['https://crag.fkcodex.com', ROOT]
 const MAX_RESPONSE = 64 * 1024
 // Catalog descriptions can use the full published 128-plan limit with UTF-8 copy.
 const MAX_PLANS_RESPONSE = 384 * 1024
@@ -30,6 +31,34 @@ export class ShopError extends Error {
 
 const invalidReply = () => new ShopError(502, 'shop_invalid_reply', 'Invalid response from CRAG shop')
 
+const LAYOUT_COLUMNS = [1, 2, 3]
+const LAYOUT_DENSITY = ['regular', 'compact']
+const LAYOUT_ORDERS = ['below', 'side']
+const FEATURED_LABEL_MAX = 12
+
+// presentation.layout only affects how the buyer page is arranged, so a field the
+// panel cannot interpret degrades to the buyer-page default instead of failing the
+// whole catalog: a layout value crag-auth adds before this panel knows about it must
+// never take the plans, prices or checkout down with it. Unknown keys are dropped the
+// same way the copy whitelist drops them.
+function publicLayout(value) {
+  const layout = {}
+  if (LAYOUT_COLUMNS.includes(value.plan_columns)) layout.plan_columns = value.plan_columns
+  if (LAYOUT_DENSITY.includes(value.card_density)) layout.card_density = value.card_density
+  if (LAYOUT_ORDERS.includes(value.orders_position)) layout.orders_position = value.orders_position
+  if (typeof value.show_monthly_price === 'boolean') layout.show_monthly_price = value.show_monthly_price
+  // Membership in the published plan list is decided by the page that renders the
+  // badge; here only the shape is checked so a hidden plan's sku is not silently lost.
+  if (isSku(value.featured_sku)) layout.featured_sku = value.featured_sku
+  if (
+    typeof value.featured_label === 'string' &&
+    value.featured_label.trim().length > 0 &&
+    [...value.featured_label].length <= FEATURED_LABEL_MAX
+  )
+    layout.featured_label = value.featured_label
+  return layout
+}
+
 export function publicPlan(value) {
   if (!object(value)) throw invalidReply()
   const { sku, term, amount_minor, slot_limit } = value
@@ -49,6 +78,14 @@ export function publicPlan(value) {
   if (value.renewable !== undefined) {
     if (typeof value.renewable !== 'boolean') throw invalidReply()
     plan.renewable = value.renewable
+  }
+  if (value.product !== undefined) {
+    if (value.product !== 'crag-v2' && value.product !== 'craggemini') throw invalidReply()
+    plan.product = value.product
+  }
+  if (value.stackable !== undefined) {
+    if (typeof value.stackable !== 'boolean') throw invalidReply()
+    plan.stackable = value.stackable
   }
   return plan
 }
@@ -160,8 +197,9 @@ function checkout(value, order, receipt) {
     fields.device !== 'pc' ||
     fields.sign_type !== 'MD5' ||
     !/^[0-9a-f]{32}$/.test(fields.sign) ||
-    fields.notify_url !== `${ROOT}/shop/epay/notify` ||
-    fields.return_url !== `${ROOT}/shop/return`
+    !CALLBACK_ORIGINS.some(
+      (origin) => fields.notify_url === `${origin}/shop/epay/notify` && fields.return_url === `${origin}/shop/return`,
+    )
   )
     throw invalidReply()
   return { url: value.url, data: Object.fromEntries(FORM_KEYS.map((key) => [key, fields[key]])) }
@@ -191,6 +229,18 @@ const commerceErrors = new Map([
   ['coupon_unavailable', [409, 'shop_coupon_unavailable', 'Coupon unavailable']],
   ['renewal_unavailable', [409, 'shop_renewal_unavailable', 'Current plan cannot be renewed']],
 ])
+
+/** Shorten any order id in a path so a log line cannot carry a usable one.
+ *
+ * The order id is what the buyer holds as proof of a purchase: it is never sent
+ * outbound, and the Authority's `claim-by-order` accepts it as grounds for moving
+ * a subscription. A readable log must not hand one out. Eight hex digits are kept
+ * because that is enough to match a row in `crag_shop_orders` while querying it,
+ * and far too little to guess the rest.
+ */
+function auditPath(path) {
+  return path.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g, (id) => `${id.slice(0, 8)}~`)
+}
 
 function supplierError(status, operation) {
   if (status === 404 && ['create', 'quote'].includes(operation)) {
@@ -291,7 +341,32 @@ export function createShopSupplier(fetchImpl = globalThis.fetch) {
       }
       return value
     } catch (err) {
-      if (err instanceof ShopError) throw err
+      const shop = err instanceof ShopError ? err : null
+      // Every supplier failure collapses into one of a handful of codes, and the
+      // catch below flattens anything unrecognised into a single `shop_unavailable`
+      // -- a timeout, a DNS failure, a TLS error and a malformed reply all arrive
+      // looking identical. Without a line here a failed checkout leaves nothing at
+      // all: five orders stalled between 2026-11-16 and 11-20 with their amount
+      // columns still NULL, proving `create` threw, and the reason is gone for good
+      // because nothing recorded it.
+      //
+      // `status` is 0 when no response arrived, which is what separates "the
+      // supplier refused" from "we never reached it"; `cause` is the error's class
+      // name, which separates a timeout from a network fault from a parse fault.
+      // Nothing else is logged: the receipt and the pilot token are credentials, the
+      // body carries purchase details, and the path's order id is the buyer's proof
+      // for that order -- `claim-by-order` accepts it -- so it is truncated.
+      console.warn(
+        JSON.stringify({
+          event: 'crag-shop-supplier',
+          operation,
+          path: auditPath(path),
+          status: response?.status ?? 0,
+          code: shop?.code ?? 'shop_unavailable',
+          ...(shop ? {} : { cause: err?.name ?? 'Error' }),
+        }),
+      )
+      if (shop) throw shop
       throw new ShopError(503, 'shop_unavailable', 'CRAG shop unavailable; try again later')
     } finally {
       if (response?.body && !response.body.locked) void response.body.cancel().catch(() => {})
@@ -386,6 +461,7 @@ export function createShopSupplier(fetchImpl = globalThis.fetch) {
           if (typeof value.presentation[key] !== 'string') throw invalidReply()
           result.presentation[key] = value.presentation[key]
         }
+        if (object(value.presentation.layout)) result.presentation.layout = publicLayout(value.presentation.layout)
       }
       return result
     },

@@ -27,8 +27,8 @@ import { resolveInferenceEngine } from '../vm/slot-engine.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
 import { dockerRequest } from '../cluster/docker-remote.mjs'
 import { clusterManager, vmNodeId } from '../cluster/placement.mjs'
-import { vmTimeoutTracker } from '../pool/failover-runner.mjs'
-import { clearUnschedulable } from '../vm/vm-registry.mjs'
+import { TIMEOUT_FAULT_PREFIX, vmTimeoutTracker } from '../pool/failover-runner.mjs'
+import { clearStaleRuntimeMaintenanceHold, clearUnschedulable } from '../vm/vm-registry.mjs'
 import path from 'node:path'
 import { checkCragLicense } from '../vm/crag-license.mjs'
 import { withCragRuntimeAdmission } from '../vm/slot-runtime-admission.mjs'
@@ -308,9 +308,37 @@ export function createKernelWatchdog({
           vm.unschedulable = null
         }
       }
+      // A control-plane restart can kill a withSlotMaintenance cutover mid-flight
+      // and leak its operation-scoped hold onto a healthy slot. Live cutovers keep
+      // the watchdog held off (withSlotMaintenance calls watchdog.hold), so a stale
+      // slot-runtime: hold visible here belongs to an operation that is gone.
+      const heldAt = Date.parse(vm.schedule_hold?.at || '') || 0
+      if (
+        vm.schedule_hold?.reason === 'maintenance' &&
+        String(vm.schedule_hold?.detail?.tag || '').startsWith('slot-runtime:') &&
+        heldAt > 0 &&
+        now() - heldAt >= STALE_RUNTIME_LOCK_MS &&
+        home &&
+        path.resolve(home, '..').endsWith(path.join('/vms', vm.id))
+      ) {
+        const lifted = clearStaleRuntimeMaintenanceHold(path.resolve(home, '../../..'), vm.id, {
+          tag: vm.schedule_hold.detail.tag,
+          minAgeMs: STALE_RUNTIME_LOCK_MS,
+          now: now(),
+        })
+        if (lifted) {
+          console.warn(`[kernel-watchdog] ${vm.id} kernel healthy; stale slot-runtime maintenance hold lifted`)
+          vm.schedule_hold = null
+        }
+      }
       // Healthy again after a fault means someone fixed it: start a fresh budget.
       // Plain recovery keeps past attempts so a crash loop stays bounded by the window.
-      if (kernelFaults.delete(vm.id)) {
+      // A healthy process says nothing about inference that keeps hanging: a
+      // repeat timeout trip stays faulted until its hold runs out.
+      const timeoutHeld =
+        String(kernelFaults.get(vm.id) || '').startsWith(TIMEOUT_FAULT_PREFIX) &&
+        (vmTimeoutTracker?.faultHoldUntil?.(vm.id, now()) || 0) > now()
+      if (!timeoutHeld && kernelFaults.delete(vm.id)) {
         restarts.delete(vm.id)
         faultRetryAt.delete(vm.id)
         vmTimeoutTracker?.reset?.(vm.id)

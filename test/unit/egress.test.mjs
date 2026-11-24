@@ -17,6 +17,7 @@ import {
   hasBoundExit,
   inspectEgressNetwork,
   inspectEgressProcess,
+  inspectEgressProcessAsync,
   iptablesPlan,
   isLocalEgressProxy,
   localEgressProxyUrl,
@@ -35,6 +36,9 @@ import {
   startProxyEgress,
   runExclusiveProxyEgress,
   waitPortReleased,
+  proxyDnsEmptyTypes,
+  sharedDnsEmptyTypes,
+  memberEndpoint,
 } from '../../src/lib/vm/egress.mjs'
 import { hostProxyUrlForVm } from '../../src/lib/vm/slot-host.mjs'
 
@@ -160,7 +164,8 @@ test('egress reload waits for the previous process to exit before spawning', {
       return false
     }
   })
-  const replacement = await fx.start({ proxyUrl: 'socks5h://192.0.2.2:1080' })
+  // A listen change cannot be reloaded by SIGHUP, so it replaces the process.
+  const replacement = await fx.start({ listenHost: '127.0.0.2' })
   assert.equal(replacement.ok, true)
   assert.notEqual(replacement.pid, original.pid)
   assert.equal(egressPidActive(original.pid), false, 'old egress must exit before spawn returns')
@@ -224,7 +229,7 @@ test('an egress helper can be reused, replaced and stopped only by its own proxy
   assert.equal(inspectEgressProcess(fx.root, 'px-other').ok, false)
   assert.equal(stopEgressProcess(fx.root, 'px-other').ok, true)
   assert.equal(inspectEgressProcess(fx.root, fx.base.proxyId).ok, true)
-  const replacement = await fx.start({ proxyUrl: 'socks5h://192.0.2.2:1080' })
+  const replacement = await fx.start({ listenHost: '127.0.0.2' })
   assert.equal(replacement.reused, false)
   assert.notEqual(replacement.pid, original.pid)
   await waitForProcess(() => !fs.existsSync(`/proc/${original.pid}`))
@@ -296,7 +301,16 @@ test('redundant separators in an egress config path do not change its owner', {
   const fx = egressFixture(t)
   fs.writeFileSync(
     fx.configPath,
-    JSON.stringify({ proxy_url: fx.base.proxyUrl, listen_tcp: '127.0.0.1:0', listen_dns: '127.0.0.1:0' }),
+    // The reuse check compares this against the config `startEgressProcess`
+    // would generate, `proxy_id` included, so seed the whole body. Leaving a
+    // field out makes the helper look misconfigured and tests config drift
+    // instead of the separator this case is about.
+    JSON.stringify({
+      proxy_id: fx.base.proxyId,
+      proxy_url: fx.base.proxyUrl,
+      listen_tcp: '127.0.0.1:0',
+      listen_dns: '127.0.0.1:0',
+    }),
   )
   const child = spawn(egressBin, ['-config', fx.dir + '//egress.json'], { stdio: 'ignore' })
   const closed = once(child, 'close')
@@ -622,7 +636,7 @@ test('egress config carries dns_upstream only when configured', async () => {
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-test('egress readiness checks the exact listener without opening a connection', async (t) => {
+test('egress readiness requires the helper listener without opening a connection', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'egress-listen-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   let accepted = 0
@@ -636,7 +650,11 @@ test('egress readiness checks the exact listener without opening a connection', 
   const dir = egressRunDir(root, proxyId)
   fs.mkdirSync(dir, { recursive: true })
   const config = path.join(dir, 'egress.json')
-  fs.writeFileSync(config, JSON.stringify({ proxy_url: 'socks5h://192.0.2.1:1080', listen_tcp: '127.0.0.1:0' }))
+  const helperPort = await reservePort()
+  fs.writeFileSync(
+    config,
+    JSON.stringify({ proxy_url: 'socks5h://192.0.2.1:1080', listen_tcp: `127.0.0.1:${helperPort}` }),
+  )
   const helper = spawn(egressBin, ['-config', config], { stdio: ['ignore', 'ignore', 'pipe'] })
   const closed = once(helper, 'close')
   let helperLog = ''
@@ -651,31 +669,59 @@ test('egress readiness checks the exact listener without opening a connection', 
   // exec precedes config loading. Wait for Serve before overwriting the file
   // so the helper cannot read the probe's deliberately incomplete config.
   await waitForProcess(() => helperLog.includes('kin-egress ready'))
+  assert.equal(egressListening(root, proxyId).ok, true)
   const port = listener.address().port
   fs.writeFileSync(config, JSON.stringify({ listen_tcp: `127.0.0.1:${port}` }))
-  assert.equal(egressListening(root, proxyId).ok, true)
+  assert.equal(egressListening(root, proxyId, 100).reason, 'not_listening')
   await new Promise((resolve) => setImmediate(resolve))
   assert.equal(accepted, 0, 'readiness must not enter the transparent forwarding path')
-  fs.writeFileSync(config, JSON.stringify({ listen_tcp: `127.0.0.2:${port}` }))
-  assert.equal(egressListening(root, proxyId, 100).reason, 'not_listening')
+
+  const originalPath = process.env.PATH
+  fs.writeFileSync(path.join(root, 'ss'), '#!/bin/sh\nexit 1\n', { mode: 0o755 })
+  process.env.PATH = `${root}:${originalPath}`
+  try {
+    const unknown = egressListening(root, proxyId)
+    assert.equal(unknown.ok, false)
+    assert.equal(unknown.pending, true)
+    assert.equal(unknown.reason, 'egress_listener_probe_unavailable')
+    assert.equal((await waitPortReleased('127.0.0.1', port)).error, 'egress_listener_probe_unavailable')
+  } finally {
+    process.env.PATH = originalPath
+  }
 })
 
-test('DNS override changes restart the helper and disabling clears the override', async (t) => {
+test('DNS override and proxy changes reload the running helper in place', async (t) => {
   const fx = egressFixture(t, 'px-dns-override')
   const original = await fx.start()
   assert.equal(original.ok, true)
   await waitForProcess(() => inspectEgressProcess(fx.root, 'px-dns-override').ok)
   assert.equal((await fx.start()).reused, true)
-  const enabled = await fx.start({ dnsEmptyTypes: [64, 65] })
+  const enabled = await fx.start({ dnsEmptyTypes: [64, 65], proxyUrl: 'socks5h://192.0.2.2:1080' })
   assert.equal(enabled.ok, true)
-  assert.equal(enabled.reused, false)
-  assert.notEqual(enabled.pid, original.pid)
-  assert.deepEqual(JSON.parse(fs.readFileSync(fx.configPath, 'utf8')).dns_empty_types, [64, 65])
-  await waitForProcess(() => inspectEgressProcess(fx.root, 'px-dns-override').ok)
-  assert.equal((await fx.start({ dnsEmptyTypes: [64, 65] })).reused, true)
-  const disabled = await fx.start()
-  assert.equal(disabled.reused, false)
+  assert.equal(enabled.reused, true)
+  assert.equal(enabled.reloaded, true)
+  assert.equal(enabled.pid, original.pid)
+  const cfg = JSON.parse(fs.readFileSync(fx.configPath, 'utf8'))
+  assert.deepEqual(cfg.dns_empty_types, [64, 65])
+  assert.equal(cfg.proxy_url, 'socks5h://192.0.2.2:1080')
+  assert.equal(fs.statSync(fx.configPath).mode & 0o777, 0o600)
+  // The helper survived SIGHUP (an old binary would have exited).
+  await new Promise((resolve) => setTimeout(resolve, 200))
+  assert.equal(egressPidActive(original.pid), true)
+  assert.equal((await fx.start({ dnsEmptyTypes: [64, 65], proxyUrl: 'socks5h://192.0.2.2:1080' })).reloaded, undefined)
+  const disabled = await fx.start({ proxyUrl: 'socks5h://192.0.2.2:1080' })
+  assert.equal(disabled.reloaded, true)
   assert.equal(JSON.parse(fs.readFileSync(fx.configPath, 'utf8')).dns_empty_types, undefined)
+})
+
+test('a helper without a recorded binary fingerprint is restarted, never sent SIGHUP', async (t) => {
+  const fx = egressFixture(t, 'px-legacy')
+  const original = await fx.start()
+  await waitForProcess(() => inspectEgressProcess(fx.root, 'px-legacy').ok)
+  fs.rmSync(path.join(fx.dir, 'egress.binfp'))
+  const next = await fx.start({ proxyUrl: 'socks5h://192.0.2.3:1080' })
+  assert.equal(next.reused, false)
+  assert.notEqual(next.pid, original.pid)
 })
 
 test('runExclusiveProxyEgress runs overlapping work for one proxy serially', async () => {
@@ -749,4 +795,108 @@ test('waitPortReleased returns at once for a free port without blocking the even
 test('egress wait loops do not shell out to python3', () => {
   const src = fs.readFileSync(path.join(import.meta.dirname, '../../src/lib/vm/egress.mjs'), 'utf8')
   assert.equal(src.includes('python3'), false)
+})
+
+test('the SVCB/HTTPS override is read off the proxy a helper serves', () => {
+  assert.deepEqual(proxyDnsEmptyTypes({ id: 'px-1', dns_disable_svcb_https: true }), [64, 65])
+  assert.deepEqual(proxyDnsEmptyTypes({ id: 'px-1', dns_disable_svcb_https: false }), [])
+  // Anything other than a real `true` leaves DNS alone: a row predating the
+  // column, a missing proxy, a truthy-but-not-boolean value.
+  for (const proxy of [{ id: 'px-1' }, null, undefined, { dns_disable_svcb_https: 1 }]) {
+    assert.deepEqual(proxyDnsEmptyTypes(proxy), [], JSON.stringify(proxy ?? null))
+  }
+})
+
+test('a member upstream is matched by host:port, however its URL was serialized', () => {
+  assert.equal(memberEndpoint('socks5h://10.0.0.1:1080'), '10.0.0.1:1080')
+  // Scheme and credentials must not change the key: the same outlet reaches
+  // this code both as socks5:// from the store and socks5h:// from a binding.
+  assert.equal(memberEndpoint('socks5://user:pass@10.0.0.1:1080'), '10.0.0.1:1080')
+  assert.equal(memberEndpoint('socks5h://10.0.0.1'), '10.0.0.1:1080')
+  assert.equal(memberEndpoint('socks5h://[2001:db8::1]:1080'), '[2001:db8::1]:1080')
+  for (const bad of ['', '   ', null, undefined, 'not a url']) {
+    assert.equal(memberEndpoint(bad), '', JSON.stringify(bad ?? null))
+  }
+})
+
+test('a shared helper blocks SVCB/HTTPS only when every outlet on the node asks for it', () => {
+  const a = 'socks5h://10.0.0.1:1080'
+  const b = 'socks5h://10.0.0.2:1080'
+  const both = new Set(['10.0.0.1:1080', '10.0.0.2:1080'])
+  const onlyA = new Set(['10.0.0.1:1080'])
+
+  assert.deepEqual(sharedDnsEmptyTypes([{ proxyUrl: a }, { proxyUrl: b }], both), [64, 65])
+  // One outlet left alone keeps the whole helper off — it must never have
+  // HTTP/3 stripped because a co-tenant asked for it.
+  assert.deepEqual(sharedDnsEmptyTypes([{ proxyUrl: a }, { proxyUrl: b }], onlyA), [])
+  assert.deepEqual(sharedDnsEmptyTypes([{ proxyUrl: a }], onlyA), [64, 65])
+
+  // The node side hands over the route table it already built.
+  assert.deepEqual(sharedDnsEmptyTypes([{ proxy_url: a }, { proxy_url: b }], both), [64, 65])
+  assert.deepEqual(sharedDnsEmptyTypes([{ proxy_url: a }, { proxy_url: b }], onlyA), [])
+
+  // No routable member: nothing to decide, so no override.
+  assert.deepEqual(sharedDnsEmptyTypes([], both), [])
+  assert.deepEqual(sharedDnsEmptyTypes([{ proxyUrl: '' }], both), [])
+})
+
+test('startProxyEgress derives dns_empty_types from its proxy unless told otherwise', {
+  skip: process.platform !== 'linux',
+}, async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'egress-dns-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const runDocker = (args) =>
+    args[0] === 'network' && args[1] === 'inspect' ? { ok: true, stdout: '172.31.251.0/24|127.0.0.1' } : { ok: true }
+  const opts = { runDocker, runIptables: () => ({ ok: true }), dnsUpstream: '', bin: egressBin }
+
+  const started = []
+  for (const [id, blocked] of [
+    ['px-dns-on', true],
+    ['px-dns-off', false],
+  ]) {
+    const proxy = { id, url: 'socks5h://192.0.2.3:1080', dns_disable_svcb_https: blocked }
+    const result = await startProxyEgress(root, proxy, opts)
+    if (result.pid) started.push(result.pid)
+    assert.equal(result.ok, true, JSON.stringify(result))
+    const cfg = JSON.parse(fs.readFileSync(path.join(egressRunDir(root, id), 'egress.json'), 'utf8'))
+    // The key is omitted entirely when nothing is blocked, which is how
+    // kin-egress tells "leave DNS alone" from "empty these types".
+    assert.deepEqual(cfg.dns_empty_types, blocked ? [64, 65] : undefined, id)
+  }
+  for (const pid of started) {
+    t.after(() => {
+      try {
+        process.kill(pid, 'SIGKILL')
+      } catch {}
+    })
+  }
+  for (const id of ['px-dns-on', 'px-dns-off']) stopEgressProcess(root, id)
+})
+
+test('the async egress probe returns the same verdict as the sync one (#1495)', async () => {
+  // The watchdog probe moved off the event loop, so there are now two paths to
+  // the same health rules. Pin that they agree: a drift here would make the
+  // watchdog restart helpers the panel calls healthy, or vice versa.
+  const reply = (stdout, ok = true, stderr = '') => ({ ok, stdout, stderr })
+  const cases = [
+    ['running', reply('true|false|4242|cfgsha|binsha|')],
+    ['restarting', reply('false|true|4242|cfgsha|binsha|')],
+    ['stopped', reply('false|false|0|cfgsha|binsha|')],
+    ['absent', reply('', false, 'Error: No such object: kin-cp-egress-px-a')],
+    ['inspect broken', reply('', false, 'Cannot connect to the Docker daemon')],
+  ]
+  for (const [label, r] of cases) {
+    const opts = { runtime: 'container', bin: '/nonexistent/kin-egress' }
+    const sync = inspectEgressProcess('/unused', 'px-a', { ...opts, runDocker: () => r })
+    const async_ = await inspectEgressProcessAsync('/unused', 'px-a', {
+      ...opts,
+      runDocker: async () => r,
+    })
+    assert.deepEqual(async_, sync, label)
+  }
+  // The process runtime has no docker call to move, so it is shared outright.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-eg-async-'))
+  const sync = inspectEgressProcess(dir, 'px-none', { runtime: 'process' })
+  assert.deepEqual(await inspectEgressProcessAsync(dir, 'px-none', { runtime: 'process' }), sync)
+  fs.rmSync(dir, { recursive: true, force: true })
 })

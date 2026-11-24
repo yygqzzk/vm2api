@@ -32,13 +32,24 @@ import { SlotIdentity } from '@/components/platform-chip'
 import { QueryGate } from '@/components/query-gate'
 import { meQueryOptions } from '@/features/auth/queries'
 import { VmTestResultsDialog } from '@/features/fork/test-reports/panel'
-import { geminiInventoryOptions } from '@/features/import/gemini-environments'
+import {
+  GeminiStartupStatus,
+  geminiInventoryOptions,
+  geminiPayloadIssue,
+} from '@/features/import/gemini-environments'
 import { usageQueryOptions } from '@/features/overview/queries'
+import { proxiesQueryOptions } from '@/features/proxies/queries'
+import { GeminiMaintenanceLink } from '@/features/settings/gemini-maintenance-link'
 import { planDeleteActiveVm } from '@/features/vm/active-vm'
 import { CreateVmDialog } from '@/features/vm/create-vm-dialog'
-import { DeleteActiveVmHint } from '@/features/vm/delete-active-hint'
+import {
+  DeleteActiveVmHint,
+  NodeGoneDeleteOption,
+} from '@/features/vm/delete-active-hint'
 import {
   completeVmDeletion,
+  useNodeGone,
+  vmDeletePath,
   type VmDeleteResult,
 } from '@/features/vm/delete-vm'
 import { FleetPulse } from '@/features/vm/fleet-pulse'
@@ -59,13 +70,14 @@ import {
   type VmKindFilter,
   type VmSortKey,
 } from '@/features/vm/vm-table'
+import { resetNotice } from './reset-start-copy'
 
 const SORT_CHIPS = [
   ['status', '状态'],
   ['name', '名称'],
   ['remain', '5H 剩余'],
-  ['today', '今日花费'],
-  ['cost7', '7D 费用'],
+  ['today', '今日花费 · 北京时间'],
+  ['cost7', '7 天窗口费用'],
   ['total', '总计费用'],
   ['cache', '缓存命中'],
 ] as const
@@ -118,6 +130,7 @@ export function VmListPage() {
   const vmsQ = useQuery(vmsListQueryOptions(5000))
   const isAdmin = me.data?.role === 'admin'
   const gemini = useQuery({ ...geminiInventoryOptions(), enabled: isAdmin })
+  const proxies = useQuery({ ...proxiesQueryOptions(), enabled: isAdmin })
   usePoolSeatStream()
   const usage = useQuery({
     ...usageQueryOptions(5000),
@@ -158,6 +171,8 @@ export function VmListPage() {
   const [resetInput, setResetInput] = useState('')
   const [deleteTarget, setDeleteTarget] = useState<Vm | null>(null)
   const [deleteInput, setDeleteInput] = useState('')
+  const [forceDelete, setForceDelete] = useState(false)
+  const nodeGone = useNodeGone(deleteTarget)
   const [createOpen, setCreateOpen] = useState(false)
   const [testResultsOpen, setTestResultsOpen] = useState(false)
   const resetVm = useMutation({
@@ -166,8 +181,9 @@ export function VmListPage() {
         method: 'POST',
         body: JSON.stringify({ mode }),
       }),
-    onSuccess: async (_data, { mode }) => {
-      toast.success(mode === 'keep' ? '已保留原数据重建' : '已按新特征重建')
+    onSuccess: async (data, { mode }) => {
+      const notice = resetNotice(mode, undefined, data)
+      toast[notice.level](notice.message)
       setResetTarget(null)
       setResetInput('')
       await qc.invalidateQueries({ queryKey: vmsListQueryOptions().queryKey })
@@ -175,19 +191,28 @@ export function VmListPage() {
     onError: (error: Error) => toast.error(error.message),
   })
   const deleteVm = useMutation({
-    mutationFn: async ({ id, switchTo }: { id: string; switchTo?: string }) => {
+    mutationFn: async ({
+      id,
+      switchTo,
+      force,
+    }: {
+      id: string
+      switchTo?: string
+      force?: boolean
+    }) => {
       if (switchTo) {
         await api(`/api/panel/vms/${encodeURIComponent(switchTo)}/activate`, {
           method: 'POST',
         })
       }
-      return api<VmDeleteResult>(`/api/panel/vms/${encodeURIComponent(id)}`, {
+      return api<VmDeleteResult>(vmDeletePath(id, force), {
         method: 'DELETE',
       })
     },
     onSuccess: async (data, { id, switchTo }) => {
       setDeleteTarget(null)
       setDeleteInput('')
+      setForceDelete(false)
       await completeVmDeletion(
         qc,
         data,
@@ -197,10 +222,21 @@ export function VmListPage() {
     onError: (error: Error) => toast.error(error.message),
   })
   const vms: Vm[] = vmsQ.data?.items || []
-  const slots =
-    isAdmin && gemini.data?.available
-      ? [...vms, ...gemini.data.environments.map(geminiSlot)]
-      : vms
+  const geminiInventory = isAdmin ? gemini.data : undefined
+  const geminiNeedsMaintenance =
+    gemini.isError ||
+    (geminiInventory &&
+      (!geminiInventory.available ||
+        !!geminiPayloadIssue(geminiInventory) ||
+        !!geminiInventory.oauth_runtime_issue))
+  const slots = geminiInventory?.available
+    ? [
+        ...vms,
+        ...geminiInventory.environments.map((environment) =>
+          geminiSlot(environment, geminiInventory, proxies.data?.proxies)
+        ),
+      ]
+    : vms
   const poolQueue = vmsQ.data?.pool_queue
   const accounts = usage.data?.accounts
   const canCreate =
@@ -245,6 +281,9 @@ export function VmListPage() {
               </Link>
             </Button>
           ) : null}
+          {isAdmin && kind !== 'gemini' && geminiNeedsMaintenance ? (
+            <GeminiMaintenanceLink />
+          ) : null}
           {canCreate ? (
             <Button onClick={() => setCreateOpen(true)}>创建</Button>
           ) : null}
@@ -267,6 +306,18 @@ export function VmListPage() {
         error={vmsQ.error}
         skeleton={<VmListSkeleton />}
       >
+        {isAdmin && kind === 'gemini' && gemini.isError ? (
+          <div className='mb-3 space-y-1'>
+            <p role='alert' className='text-sm text-destructive'>
+              读取 Gemini 环境失败，可前往设置诊断宿主服务。
+            </p>
+            <GeminiMaintenanceLink />
+          </div>
+        ) : kind === 'gemini' && geminiInventory ? (
+          <div className='mb-3'>
+            <GeminiStartupStatus inventory={geminiInventory} />
+          </div>
+        ) : null}
         <FleetPulse
           className='mb-3'
           vms={scoped}
@@ -403,6 +454,7 @@ export function VmListPage() {
             perms.remove
               ? (vm) => {
                   setDeleteInput('')
+                  setForceDelete(false)
                   setDeleteTarget(vm)
                 }
               : undefined
@@ -509,6 +561,7 @@ export function VmListPage() {
           if (!open) {
             setDeleteTarget(null)
             setDeleteInput('')
+            setForceDelete(false)
           }
         }}
         title='删除'
@@ -521,7 +574,11 @@ export function VmListPage() {
                   · {deleteTarget.id}
                 </span>
               </p>
-              <DeleteActiveVmHint target={deleteTarget} vms={vms} />
+              <DeleteActiveVmHint
+                target={deleteTarget}
+                vms={vms}
+                force={forceDelete && !!nodeGone}
+              />
             </>
           ) : (
             ''
@@ -537,10 +594,16 @@ export function VmListPage() {
             deleteVm.mutate({
               id: deleteTarget.id,
               switchTo: deleteSwitchId,
+              force: forceDelete && !!nodeGone,
             })
           }
         }}
       >
+        <NodeGoneDeleteOption
+          gone={nodeGone}
+          checked={forceDelete}
+          onCheckedChange={setForceDelete}
+        />
         <Input
           autoFocus
           autoComplete='off'
@@ -559,6 +622,7 @@ export function VmListPage() {
               deleteVm.mutate({
                 id: deleteTarget.id,
                 switchTo: deleteSwitchId,
+                force: forceDelete && !!nodeGone,
               })
             }
           }}

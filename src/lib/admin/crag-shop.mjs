@@ -17,12 +17,19 @@ import {
 const ROOT = '/api/panel/crag-shop'
 const DEVICE_ROOT = `${ROOT}/device`
 const ORDER_PATH =
-  /^\/api\/panel\/crag-shop(?:\/device)?\/orders\/([^/]+)(\/(?:claim|resume|cancel|apply|apply-renewal|retry-activation))?$/
+  /^\/api\/panel\/crag-shop(?:\/device)?\/orders\/([^/]+)(\/(?:claim|resume|cancel|apply|apply-renewal|retry-activation|recover))?$/
 const DEVICE_COOKIE = 'kin_crag_device_checkout'
 const MAX_BODY = 4096
 const PAGE_SIZE = 100
 const ACTIVATION_WINDOW = 24 * 60 * 60
 const ACTIVATION_LEASE = 120
+// Supplier order states before money arrives. ORDER_STATES is ordered, so everything
+// up to 'paid' is still unpaid; the supplier protocol has no expired or cancelled state.
+const UNPAID_STATES = ORDER_STATES.slice(0, ORDER_STATES.indexOf('paid'))
+// How long a checkout link is worth waiting for. The supplier never reports an order as
+// expired, so an unpaid order older than this is closed locally — but only after the
+// supplier confirms it is still unpaid, so a late payment is never dropped.
+const PAYMENT_WINDOW = 30 * 60
 const nowSeconds = () => Math.floor(Date.now() / 1000)
 
 export const isCragShopPath = (pathname) => pathname === ROOT || pathname.startsWith(`${ROOT}/`)
@@ -40,7 +47,23 @@ export function cragShopRoute(method, pathname) {
     if (match[2]) {
       const action = match[2].slice(1)
       if (method !== 'POST') return null
-      if (action === 'resume' || action === 'cancel' || (device ? action === 'apply' : action !== 'apply'))
+      // 'recover' re-binds a device order to the browser asking for it, so it only exists
+      // on the anonymous side. A panel buyer's orders are owned by the account and are
+      // never reachable from a different browser to begin with.
+      //
+      // 'claim' is now open to the device side too. It hands back a redeemable secret on
+      // an anonymous page, which is why it was withheld -- but withholding it left a
+      // device buyer with no way to move a subscription whose order id the Authority
+      // never recorded, and the entitlement is theirs. Reaching it still needs the
+      // checkout cookie that owns the order, a same-origin POST, and the per-device rate
+      // limit, so it is no more reachable than applying the order already was.
+      if (
+        action === 'resume' ||
+        action === 'cancel' ||
+        (device
+          ? action === 'apply' || action === 'recover' || action === 'claim'
+          : action !== 'apply' && action !== 'recover')
+      )
         return action
       return null
     }
@@ -54,6 +77,12 @@ export function buyerOwner(req) {
 }
 
 export function sessionBuyerOwner(session, record, configuredAdmin) {
+  // The id comparison is what keeps a session from inheriting a different buyer: `record`
+  // is looked up by username, so a deleted and re-registered account gets a new id, and a
+  // session still carrying the old one must not reach the new account's orders. A session
+  // created before this field existed therefore cannot be trusted either — it names no
+  // buyer at all. Such a session is refused here and reported as `shop_session_stale`, so
+  // the buyer is told to sign in again rather than being told to sign in while signed in.
   if (record?.enabled && record.id && session.buyer?.id === record.id) return `panel:${record.id}`
   if (
     !record &&
@@ -97,6 +126,106 @@ const unavailableDevice = () =>
   failure(503, 'shop_device_unavailable', 'Cannot verify the host device for CRAG checkout')
 const unavailableStorage = () =>
   failure(503, 'shop_private_storage_unavailable', 'CRAG shop private storage is unavailable')
+
+// Only public, actionable subscription failures may cross the anonymous device
+// checkout boundary. An error never carries the vendor response, the voucher, or
+// local paths -- exporting the voucher is a separate, deliberate request that has
+// to present the checkout cookie owning the order, so a failure path must not
+// become a second way to reach it.
+const deviceApplyErrors = new Map([
+  [
+    'crag_subscription_invalid_redemption_receipt',
+    [409, 'The local redemption confirmation could not be verified. Ask the administrator to reconcile this order.'],
+  ],
+  [
+    'crag_subscription_host_package_changed',
+    [409, 'The CRAG package changed during redemption. Ask the administrator to recover the original redemption.'],
+  ],
+  [
+    'crag_subscription_recovery_unverified',
+    [409, 'The original redemption result is not confirmed. Ask the administrator to reconcile it.'],
+  ],
+  [
+    'crag_subscription_sync_pending',
+    [409, 'A host redemption is pending. Continue the original redemption from host subscriptions.'],
+  ],
+  [
+    'crag_subscription_busy',
+    [409, 'Another host subscription operation is in progress. Check this order again shortly.'],
+  ],
+  [
+    'crag_subscription_authority_unavailable',
+    [503, 'The authorization service did not confirm the result. Check this order before retrying.'],
+  ],
+  [
+    'auth_forbidden',
+    [502, 'The authorization service rejected this host credential. Ask the administrator to check the request ID.'],
+  ],
+  [
+    'host_redeem_conflict',
+    [409, 'This voucher does not match the host subscription. Ask the administrator to check this order.'],
+  ],
+  ['redeem_unavailable', [409, 'The original voucher could not be redeemed. Check this order with the supplier.']],
+  [
+    'payload_key_unknown',
+    [
+      409,
+      'The authorization service no longer offers the CRAG package key this redemption recorded. Ask the administrator to reconcile this order.',
+    ],
+  ],
+  [
+    'issuer_mismatch',
+    [
+      409,
+      'The CRAG issuer this redemption recorded does not match the authorization service. Ask the administrator to reconcile this order.',
+    ],
+  ],
+])
+const authorityRequestId = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i
+const ACTIVATION_ERROR_RECOVERIES = new Set(['not_activated', 'host_id_collision', 'failed'])
+const TERMINAL_ACTIVATION_ERRORS = new Set([
+  'shop_admin_required',
+  'crag_subscription_target_changed',
+  'issuer_mismatch',
+  'host_redeem_conflict',
+  'redeem_unavailable',
+  'host_binding_conflict',
+  'slot_limit_reached',
+  'payload_key_unknown',
+  'payload_key_conflict',
+  'auth_forbidden',
+  'host_subscription_inactive',
+  'not_found',
+  'request_conflict',
+  'invalid_request',
+])
+const KNOWN_ACTIVATION_ERROR_CODES = new Set([
+  ...TERMINAL_ACTIVATION_ERRORS,
+  'renewal_unavailable',
+  'host_transfer_cooldown',
+])
+const isActivationErrorCode = (value) =>
+  typeof value === 'string' &&
+  /^[a-z][a-z0-9_]{1,63}$/.test(value) &&
+  (KNOWN_ACTIVATION_ERROR_CODES.has(value) || /^(?:crag_subscription|crag_slot|license|shop)_[a-z0-9_]+$/.test(value))
+
+function sanitizeActivationFailure(error) {
+  const code = isActivationErrorCode(error?.code) ? error.code : null
+  const recovery = code && ACTIVATION_ERROR_RECOVERIES.has(error?.recovery) ? error.recovery : null
+  const requestId =
+    typeof error?.authorityRequestId === 'string' && authorityRequestId.test(error.authorityRequestId)
+      ? error.authorityRequestId
+      : null
+  return { code, recovery, requestId }
+}
+
+function deviceApplyFailure(error) {
+  const publicError = deviceApplyErrors.get(error?.code)
+  if (!publicError) return null
+  const result = failure(publicError[0], error.code, publicError[1])
+  if (authorityRequestId.test(error.authorityRequestId ?? '')) result.authorityRequestId = error.authorityRequestId
+  return result
+}
 
 function hostCheckoutError(error) {
   switch (error?.code) {
@@ -187,49 +316,72 @@ function createInput(body) {
   }
 }
 
-function view(row) {
-  const { order_id, request_id, sku, payment_method, status, created_at, term, amount_minor, slot_limit, reserved_at } =
-    row
+// An order closed on this side. closed_at carries the decision for everything the 060
+// CHECK forbids marking in dispatch_state (anything past 'reserved'); the dispatch_state
+// arm keeps orders cancelled before that column existed reading as closed.
+const isClosed = (row) => row?.closed_at != null || row?.dispatch_state === 'cancelled'
+const normalizeSlotLimit = (value) => (typeof value === 'string' && /^[1-9]\d*$/.test(value) ? Number(value) : value)
+
+function view(row, activationEnabled = true) {
+  const { order_id, request_id, sku, payment_method, status, created_at, term, amount_minor, reserved_at } = row
+  const slot_limit = normalizeSlotLimit(row.slot_limit)
   const result = {
     order_id,
     request_id,
     sku,
     payment_method,
-    status: row.dispatch_state === 'cancelled' ? 'cancelled' : status,
+    status: isClosed(row) ? 'cancelled' : status,
     created_at: created_at ?? reserved_at,
     term,
     amount_minor,
     slot_limit,
   }
-  if (row.dispatch_state === 'cancelled') return result
-  if (row.dispatch_state === 'unsent') result.cancelable = true
+  if (isClosed(row)) return result
+  // An unsent order is cancelable outright. A submitted one is offered only while the
+  // locally known state is unpaid; the cancel route re-checks with the supplier before
+  // it writes, because the local status can lag behind a payment.
+  if (row.dispatch_state === 'unsent' || (row.dispatch_state === 'submitted' && UNPAID_STATES.includes(status)))
+    result.cancelable = true
   for (const key of ['expected_amount_minor', 'months', 'subtotal_minor', 'discount_minor', 'remaining']) {
     if (row[key] != null) result[key] = row[key]
   }
   if (row.renewable != null) result.renewable = !!row.renewable
   const vm_id = row.activation_vm_id
-  result.activation = row.owner.startsWith('device:')
-    ? {
-        state:
-          row.activation_phase === 'active'
-            ? 'active'
-            : status === 'fulfilled'
-              ? 'ready_to_apply'
-              : 'awaiting_fulfillment',
-      }
-    : !vm_id
-      ? { state: 'manual' }
-      : {
-          vm_id,
-          state:
-            row.activation_phase === 'active'
-              ? 'active'
-              : row.activation_next_at == null
-                ? 'needs_attention'
-                : status === 'fulfilled'
-                  ? 'activating'
-                  : 'awaiting_fulfillment',
-        }
+  if (row.owner.startsWith('device:')) {
+    result.activation = {
+      state:
+        row.activation_phase === 'active'
+          ? 'active'
+          : status === 'fulfilled'
+            ? 'ready_to_apply'
+            : 'awaiting_fulfillment',
+    }
+  } else if (!vm_id) {
+    result.activation = { state: 'manual' }
+  } else {
+    const activation = {
+      vm_id,
+      state:
+        row.activation_phase === 'active'
+          ? 'active'
+          : row.activation_next_at == null
+            ? 'needs_attention'
+            : status !== 'fulfilled'
+              ? 'awaiting_fulfillment'
+              : activationEnabled
+                ? 'activating'
+                : 'needs_attention',
+    }
+    if (row.activation_phase !== 'active') {
+      if (typeof row.activation_error_code === 'string' && /^[a-z][a-z0-9_]{1,63}$/.test(row.activation_error_code))
+        activation.error_code = row.activation_error_code
+      if (ACTIVATION_ERROR_RECOVERIES.has(row.activation_error_recovery))
+        activation.recovery = row.activation_error_recovery
+      if (typeof row.activation_request_id === 'string' && authorityRequestId.test(row.activation_request_id))
+        activation.authority_request_id = row.activation_request_id
+    }
+    result.activation = activation
+  }
   return result
 }
 
@@ -237,7 +389,58 @@ function findOrder(db, owner, orderId) {
   return db.prepare('SELECT * FROM crag_shop_orders WHERE owner = ? AND order_id = ?').get(owner, orderId)
 }
 
+// Re-bind a device order to the browser asking for it.
+//
+// A device order's owner is sha256(host_id:cookie_token), so losing the checkout cookie
+// hid the order from its own buyer and blocked delivery — a paid order became permanently
+// undeliverable, because applying it also matches on owner. The order id is a randomUUID
+// the buyer was given, and it is the whole of what proves the order is theirs: it is held
+// only by that buyer, and it never leaves this gateway, because every outbound reference
+// uses the HMAC from `deriveOrderReceipt` instead.
+//
+// `device_host` is a provenance record, not a second factor, and recovery deliberately
+// does not compare it. `deviceIdentity()` resolves this installation's own machine id, so
+// the column holds the same constant for every device order in one database: comparing it
+// can never tell two anonymous buyers apart — what distinguishes them is the cookie token,
+// which is already inside `owner`. The one thing a comparison did catch was this gateway's
+// own identity changing, and that is exactly when it must not refuse: an identity change
+// invalidates every device order's owner digest at once, leaving recovery as the only way
+// back, so rejecting the rows that happen to carry the older host turned "recoverable" into
+// "permanently undeliverable" for them while pre-column NULL rows stayed recoverable. It
+// was not guarding where the entitlement lands either — `apply` redeems against the live
+// `hostId` regardless of this column. Migration 066's own comment still describes the
+// stricter rule; it cannot be corrected in place, because `database.mjs` verifies applied
+// migrations by SHA-256 and editing the text would fail the checksum on every deployment
+// that has already run it. This comment is the correction.
+function recoverDeviceOrder(db, orderId, hostId, owner) {
+  const row = db.prepare('SELECT * FROM crag_shop_orders WHERE order_id = ?').get(orderId)
+  // A panel buyer's order belongs to their account and must never be pullable out of it
+  // by an anonymous caller. Report it exactly like a missing order, so this route cannot
+  // be used to learn which order ids exist.
+  if (!row || !row.owner.startsWith('device:')) throw missingOrder()
+  if (row.owner === owner) return row
+  try {
+    durable(db, () =>
+      db
+        .prepare('UPDATE crag_shop_orders SET owner = ?, device_host = ? WHERE order_id = ? AND owner = ?')
+        .run(owner, hostId, orderId, row.owner),
+    )
+  } catch (error) {
+    // UNIQUE(owner, request_id): this browser already holds a different order reserved
+    // under the same request id, so one of the two would have to be dropped. Say so
+    // instead of surfacing a constraint error as an unexplained failure.
+    const errCode = String(error?.code || error?.pgCode || '')
+    if (errCode === '23505' || errCode.startsWith('SQLITE_CONSTRAINT'))
+      throw failure(409, 'shop_order_recover_conflict', 'This browser already holds an order from the same checkout')
+    throw error
+  }
+  const current = findOrder(db, owner, orderId)
+  if (!current) throw missingOrder()
+  return current
+}
+
 function durable(db, work) {
+  if (db?.engine === 'postgres') return work()
   // The installation-wide default is WAL/NORMAL. Flush before external effects.
   const { synchronous } = db.prepare('PRAGMA synchronous').get()
   if (synchronous < 2) db.exec('PRAGMA synchronous = FULL')
@@ -248,7 +451,7 @@ function durable(db, work) {
   }
 }
 
-async function reserve(db, owner, input, pinTarget) {
+async function reserve(db, owner, input, pinTarget, deviceHost = null) {
   const find = db.prepare('SELECT * FROM crag_shop_orders WHERE owner = ? AND request_id = ?')
   let row = find.get(owner, input.request_id)
   let existing = true
@@ -259,8 +462,9 @@ async function reserve(db, owner, input, pinTarget) {
       db
         .prepare(`INSERT INTO crag_shop_orders
                   (order_id, owner, request_id, sku, payment_method, reserved_at, purchase_json, expected_amount_minor,
-                   activation_vm_id, activation_fingerprint, activation_next_at, activation_deadline, dispatch_state)
-                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unsent') ON CONFLICT(owner, request_id) DO NOTHING`)
+                   activation_vm_id, activation_fingerprint, activation_next_at, activation_deadline, dispatch_state,
+                   device_host)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unsent', ?) ON CONFLICT(owner, request_id) DO NOTHING`)
         .run(
           randomUUID(),
           owner,
@@ -274,6 +478,7 @@ async function reserve(db, owner, input, pinTarget) {
           fingerprint,
           fingerprint ? now : null,
           fingerprint ? now + ACTIVATION_WINDOW : null,
+          deviceHost,
         ),
     )
     existing = inserted.changes === 0
@@ -342,7 +547,7 @@ function reflectOrder(db, owner, order) {
     row.created_at !== created_at ||
     row.term !== term ||
     row.amount_minor !== amount_minor ||
-    row.slot_limit !== slot_limit ||
+    normalizeSlotLimit(row.slot_limit) !== slot_limit ||
     optional.some((key) => order[key] !== undefined && row[key] !== order[key])
   ) {
     throw failure(502, 'shop_invalid_reply', 'Invalid response from CRAG shop')
@@ -363,6 +568,7 @@ export function createCragShopHandler({
   activationEnabled = true,
   supplier = createShopSupplier(),
 }) {
+  const project = (row) => view(row, activationEnabled)
   function deviceIdentity() {
     let hostId
     try {
@@ -380,6 +586,33 @@ export function createCragShopHandler({
     } catch {
       throw unavailableStorage()
     }
+  }
+
+  function reconcileDeviceOrder(db, row, hostId, { tolerant = false } = {}) {
+    if (
+      !row.owner.startsWith('device:') ||
+      row.status !== 'fulfilled' ||
+      row.activation_phase === 'active' ||
+      !row.redemption_sha256 ||
+      isClosed(row)
+    )
+      return row
+    try {
+      if (!subscription.isRedemptionApplied(hostId, row.redemption_sha256)) return row
+    } catch (error) {
+      // One order's unverifiable receipt must not hide every other order. A listing
+      // keeps the stored state; the order's own routes still report the exact reason.
+      if (tolerant) return row
+      throw hostCheckoutError(error) ?? deviceApplyFailure(error) ?? error
+    }
+    durable(db, () =>
+      db
+        .prepare(`UPDATE crag_shop_orders SET activation_phase = 'active'
+      WHERE owner = ? AND order_id = ? AND redemption_sha256 = ? AND status = 'fulfilled'
+        AND closed_at IS NULL`)
+        .run(row.owner, row.order_id, row.redemption_sha256),
+    )
+    return findOrder(db, row.owner, row.order_id)
   }
 
   function requireAdmin(req) {
@@ -424,6 +657,52 @@ export function createCragShopHandler({
     }
   }
 
+  let expiring = false
+  // Close checkout links nobody paid. Independent of the activation poll: an order
+  // outliving its payment window is part of the order lifecycle, not of activation,
+  // so it must keep working with activation turned off. One order per tick keeps the
+  // supplier re-reads spread out.
+  async function pollOrderExpiry() {
+    if (expiring) return
+    expiring = true
+    try {
+      const db = getDb()
+      const row = db
+        .prepare(`SELECT * FROM crag_shop_orders
+        WHERE dispatch_state = 'submitted' AND status IN ('reserved', 'pending')
+          AND closed_at IS NULL
+          AND reserved_at IS NOT NULL AND reserved_at <= ?
+        ORDER BY reserved_at, order_id LIMIT 1`)
+        .get(nowSeconds() - PAYMENT_WINDOW)
+      if (!row) return
+      // A reserved order never returned a checkout form, so no payment link ever
+      // reached the buyer. Anything else has one, so ask the supplier before closing:
+      // a paid order is left alone, and an unreachable supplier is retried next tick
+      // rather than closed on a guess.
+      if (row.status !== 'reserved') {
+        // Derive the receipt outside the catch below: it reads local private storage,
+        // and a failure there is not the supplier being unreachable. Letting it throw
+        // surfaces the real fault in the poll log instead of looking like a deferral.
+        const receipt = deriveOrderReceipt(receiptKey(db), row.order_id)
+        let current = row
+        try {
+          current = reflectOrder(db, row.owner, await supplier.status(row, receipt))
+        } catch (error) {
+          if (!(error instanceof ShopError) || error.code !== 'shop_order_not_found') return
+        }
+        if (!UNPAID_STATES.includes(current.status)) return
+      }
+      durable(db, () =>
+        db
+          .prepare(`UPDATE crag_shop_orders SET closed_at = ?, activation_next_at = NULL
+          WHERE order_id = ? AND closed_at IS NULL AND dispatch_state = 'submitted'`)
+          .run(nowSeconds(), row.order_id),
+      )
+    } finally {
+      expiring = false
+    }
+  }
+
   let processing = false
   async function pollActivation() {
     if (!activationEnabled || processing) return
@@ -435,6 +714,7 @@ export function createCragShopHandler({
       const row = db
         .prepare(`SELECT * FROM crag_shop_orders
         WHERE dispatch_state = 'submitted' AND activation_vm_id IS NOT NULL
+          AND closed_at IS NULL
           AND activation_next_at IS NOT NULL AND activation_next_at <= ?
         ORDER BY activation_next_at, order_id LIMIT 1`)
         .get(now)
@@ -465,9 +745,20 @@ export function createCragShopHandler({
           .prepare(`UPDATE crag_shop_orders SET activation_next_at = ?
         WHERE order_id = ? AND activation_next_at = ?`)
           .run(next, row.order_id, lease)
+      const recordFailure = (next, error) => {
+        const { code, recovery, requestId } = sanitizeActivationFailure(error)
+        return durable(db, () =>
+          db
+            .prepare(`UPDATE crag_shop_orders
+          SET activation_next_at = ?, activation_error_code = ?, activation_error_recovery = ?, activation_request_id = ?
+          WHERE order_id = ? AND activation_next_at = ?`)
+            .run(next, code, recovery, requestId, row.order_id, lease),
+        )
+      }
       const delay = Math.min(300, 5 * 2 ** Math.min(row.activation_attempts, 6))
-      const reschedule = () =>
-        finish(nowSeconds() >= row.activation_deadline ? null : Math.min(nowSeconds() + delay, row.activation_deadline))
+      const nextRetryAt = () =>
+        nowSeconds() >= row.activation_deadline ? null : Math.min(nowSeconds() + delay, row.activation_deadline)
+      const reschedule = () => finish(nextRetryAt())
 
       if (now >= row.activation_deadline) return finish(null)
       try {
@@ -495,7 +786,12 @@ export function createCragShopHandler({
             const currentDb = dbForLease()
             durable(currentDb, () =>
               currentDb
-                .prepare(`UPDATE crag_shop_orders SET activation_phase = 'redeemed' WHERE order_id = ?`)
+                .prepare(`UPDATE crag_shop_orders
+                  SET activation_phase = 'redeemed',
+                      activation_error_code = NULL,
+                      activation_error_recovery = NULL,
+                      activation_request_id = NULL
+                  WHERE order_id = ?`)
                 .run(row.order_id),
             )
           },
@@ -504,26 +800,24 @@ export function createCragShopHandler({
         durable(currentDb, () =>
           currentDb
             .prepare(`UPDATE crag_shop_orders
-          SET activation_phase = 'active', activation_next_at = NULL WHERE order_id = ?`)
+          SET activation_phase = 'active',
+              activation_next_at = NULL,
+              activation_error_code = NULL,
+              activation_error_recovery = NULL,
+              activation_request_id = NULL
+          WHERE order_id = ?`)
             .run(row.order_id),
         )
       } catch (error) {
         if (getDb() !== db) return
-        if (
-          [
-            'shop_admin_required',
-            'crag_subscription_target_changed',
-            'issuer_mismatch',
-            'host_redeem_conflict',
-            'redeem_unavailable',
-            'host_binding_conflict',
-            'slot_limit_reached',
-            'payload_key_unknown',
-            'payload_key_conflict',
-          ].includes(error?.code)
-        )
-          finish(null)
-        else reschedule()
+        if (error?.code === 'shop_activation_superseded') {
+          reschedule()
+          return
+        }
+        const terminal =
+          TERMINAL_ACTIVATION_ERRORS.has(error?.code) &&
+          !(error?.code === 'auth_forbidden' && error?.recovery === 'unavailable')
+        recordFailure(terminal ? null : nextRetryAt(), error)
       }
     } finally {
       processing = false
@@ -537,7 +831,14 @@ export function createCragShopHandler({
       let owner = buyerOwner(req)
       const ok = (data) => json(res, 200, { ok: true, data })
       if (!device && route === 'plans') return ok(await supplier.plans({ allowPilot: !!owner }))
-      if (!device && !owner) throw failure(403, 'shop_login_required', 'Sign in to the panel to access CRAG shop')
+      if (!device && !owner) {
+        // A valid panel session with no buyer binding is not the same as not being signed
+        // in, and "sign in" is advice such a user cannot act on — they already are. The
+        // binding is written at sign-in, so signing in again is what actually fixes it.
+        if (!req.apiKeyKind && req.panelUser)
+          throw failure(403, 'shop_session_stale', 'Sign in again to refresh this panel session')
+        throw failure(403, 'shop_login_required', 'Sign in to the panel to access CRAG shop')
+      }
       if (!route) throw missingOrder()
       const originRequired = req.method === 'POST' || (device && (req.headers.origin || req.headers['sec-fetch-site']))
       if (originRequired && !sameOriginPost(req, publicBaseUrl)) {
@@ -561,9 +862,17 @@ export function createCragShopHandler({
           return ok(await supplier.plans(supplierOptions))
         }
         if (!token) {
+          // Only 'plans' mints a checkout identity. A request that merely arrived without
+          // the cookie — SameSite=Strict drops it after a cross-site navigation — must not
+          // be handed a new one here, or a browser that still holds a valid identity would
+          // have it replaced and lose the orders it owns.
           if (route === 'list') return ok({ orders: [], next_offset: null })
           if (route === 'quote' || route === 'create')
             throw failure(409, 'shop_device_checkout_required', 'Open the device checkout before creating an order')
+          // Recovery needs an identity to re-bind the order to, and reloading the checkout
+          // page mints one. Say that instead of reporting the order as missing.
+          if (route === 'recover')
+            throw failure(409, 'shop_device_checkout_required', 'Reload the device checkout before recovering an order')
           throw missingOrder()
         }
         hostId = deviceIdentity()
@@ -592,7 +901,12 @@ export function createCragShopHandler({
                                  ORDER BY reserved_at DESC, order_id DESC LIMIT ? OFFSET ?`)
           .all(owner, PAGE_SIZE + 1, Number(offset))
         const next_offset = rows.length > PAGE_SIZE ? Number(offset) + PAGE_SIZE : null
-        return ok({ orders: rows.slice(0, PAGE_SIZE).map(view), next_offset })
+        return ok({
+          orders: rows
+            .slice(0, PAGE_SIZE)
+            .map((row) => project(device ? reconcileDeviceOrder(db, row, hostId, { tolerant: true }) : row)),
+          next_offset,
+        })
       }
       if (route === 'create') {
         const input = createInput(await readInput(req, readRawBody, false))
@@ -607,12 +921,18 @@ export function createCragShopHandler({
             coupon_digest: createHmac('sha256', key).update('CRAG-SHOP-COUPON\0').update(coupon).digest('hex'),
           }),
         })
-        const { row, existing } = await reserve(db, owner, { ...input, purchase_json }, (id) => pinTarget(owner, id))
-        if (row.dispatch_state === 'cancelled') return ok(view(row))
+        const { row, existing } = await reserve(
+          db,
+          owner,
+          { ...input, purchase_json },
+          (id) => pinTarget(owner, id),
+          device ? hostId : null,
+        )
+        if (isClosed(row)) return ok(project(row))
         const receipt = deriveOrderReceipt(key, row.order_id)
         const result = (reply) => {
           const current = reflectOrder(db, owner, reply.order)
-          return ok({ ...view(current), ...(current.status === 'pending' && reply.form ? reply.form : {}) })
+          return ok({ ...project(current), ...(current.status === 'pending' && reply.form ? reply.form : {}) })
         }
         if (existing && row.dispatch_state !== 'unsent') {
           try {
@@ -637,48 +957,102 @@ export function createCragShopHandler({
         const dispatch = durable(db, () =>
           db
             .prepare(`UPDATE crag_shop_orders SET dispatch_state = 'submitted'
-            WHERE owner = ? AND order_id = ? AND dispatch_state <> 'cancelled'`)
+            WHERE owner = ? AND order_id = ? AND closed_at IS NULL AND dispatch_state <> 'cancelled'`)
             .run(owner, row.order_id),
         )
-        if (!dispatch.changes) return ok(view(findOrder(db, owner, row.order_id)))
+        if (!dispatch.changes) return ok(project(findOrder(db, owner, row.order_id)))
         const { order, form } = await supplier.create(row, receipt, proof, input.purchase, supplierOptions)
         const current = reflectOrder(db, owner, order)
-        return ok({ ...view(current), ...(current.status === 'pending' && form ? form : {}) })
+        return ok({ ...project(current), ...(current.status === 'pending' && form ? form : {}) })
       }
       const orderId = ORDER_PATH.exec(url.pathname)?.[1]
       if (!orderId || !isOrderId(orderId)) throw missingOrder()
-      const row = findOrder(db, owner, orderId)
+      if (route === 'recover') {
+        const body = await readInput(req, readRawBody, true)
+        if (Object.keys(body).length !== 0) throw badBody()
+        // Reconcile tolerantly: an order recovered after it was already applied should
+        // report that, but one unverifiable receipt must not make the recovery itself fail.
+        const recovered = reconcileDeviceOrder(db, recoverDeviceOrder(db, orderId, hostId, owner), hostId, {
+          tolerant: true,
+        })
+        return ok(project(recovered))
+      }
+      let row = findOrder(db, owner, orderId)
       if (!row) throw missingOrder()
+      if (device) row = reconcileDeviceOrder(db, row, hostId)
       if (['claim', 'resume', 'cancel', 'apply', 'apply-renewal', 'retry-activation'].includes(route)) {
         const input = await readInput(req, readRawBody, true)
         if (Object.keys(input).length !== 0) throw badBody()
       }
       if (route === 'cancel') {
+        // The supplier protocol has no cancel endpoint and no expired state, so a
+        // submitted order stays 'pending' there forever and has to be closed locally.
+        if (row.dispatch_state === 'submitted') {
+          if (!UNPAID_STATES.includes(row.status))
+            throw failure(409, 'shop_order_paid', 'This order was already paid and cannot be cancelled')
+          // 'reserved' means create never returned a checkout form, so the buyer never
+          // received a payment link and cannot have paid: close it without asking the
+          // supplier, which is what makes an order orphaned by a failed create
+          // cancelable even while the supplier is down. A 'pending' order does have a
+          // live payment link, so re-read it first — the local status can lag a payment
+          // and cancelling a paid order would keep the money while dropping the
+          // entitlement. An order the supplier no longer knows (404) is cancelable.
+          if (row.status !== 'reserved') {
+            let current = row
+            try {
+              const receipt = deriveOrderReceipt(receiptKey(db), row.order_id)
+              current = reflectOrder(db, owner, await supplier.status(row, receipt))
+            } catch (error) {
+              if (!(error instanceof ShopError) || error.code !== 'shop_order_not_found') throw error
+            }
+            if (!UNPAID_STATES.includes(current.status))
+              throw failure(409, 'shop_order_paid', 'This order was already paid and cannot be cancelled')
+          }
+        }
         durable(db, () =>
           db
-            .prepare(`UPDATE crag_shop_orders SET dispatch_state = 'cancelled', activation_next_at = NULL
-            WHERE owner = ? AND order_id = ? AND dispatch_state = 'unsent'`)
-            .run(owner, row.order_id),
+            .prepare(`UPDATE crag_shop_orders SET closed_at = ?, activation_next_at = NULL
+            WHERE owner = ? AND order_id = ? AND closed_at IS NULL
+              AND dispatch_state IN ('unsent', 'submitted')`)
+            .run(nowSeconds(), owner, row.order_id),
         )
         const current = findOrder(db, owner, orderId)
-        if (current.dispatch_state !== 'cancelled')
-          throw failure(409, 'shop_order_cannot_cancel', 'Only orders not sent to the supplier can be cancelled')
-        return ok(view(current))
+        if (!isClosed(current)) throw failure(409, 'shop_order_cannot_cancel', 'This order can no longer be cancelled')
+        return ok(project(current))
       }
-      if (row.dispatch_state === 'cancelled') {
-        if (route === 'status') return ok(view(row))
+      if (isClosed(row)) {
+        if (route === 'status') return ok(project(row))
         throw failure(409, 'shop_order_cancelled', 'This order was cancelled')
       }
-      if (row.dispatch_state === 'unsent' && route === 'status') return ok(view(row))
+      if (row.dispatch_state === 'unsent' && route === 'status') return ok(project(row))
       if (route === 'apply') {
-        if (row.activation_phase === 'active') return ok(view(row))
+        if (row.activation_phase === 'active') return ok(project(row))
         const receipt = deriveOrderReceipt(receiptKey(db), row.order_id)
         const current = row.status === 'fulfilled' ? row : reflectOrder(db, owner, await supplier.status(row, receipt))
         if (current.status !== 'fulfilled')
           throw failure(409, 'shop_claim_not_ready', 'The CRAG shop order has not been fulfilled')
         const { redemption_code } = await supplier.claim(row, receipt)
+        const digest = createHash('sha256').update(redemption_code).digest('hex')
+        if (row.redemption_sha256 && row.redemption_sha256 !== digest)
+          throw failure(
+            409,
+            'shop_redemption_changed',
+            'The supplier returned a different voucher for this order. Ask the administrator to reconcile it.',
+          )
+        const associated = durable(db, () =>
+          db
+            .prepare(`UPDATE crag_shop_orders SET redemption_sha256 = ?
+          WHERE owner = ? AND order_id = ? AND (redemption_sha256 IS NULL OR redemption_sha256 = ?)`)
+            .run(digest, owner, row.order_id, digest),
+        )
+        if (associated.changes !== 1)
+          throw failure(
+            409,
+            'shop_redemption_changed',
+            'The voucher association changed while applying this order. Check the original order before retrying.',
+          )
         try {
-          await subscription.redeemDeviceOrder(hostId, redemption_code)
+          await subscription.redeemDeviceOrder(hostId, redemption_code, row.order_id)
         } catch (error) {
           if (error?.code === 'crag_subscription_host_package_unready')
             throw failure(
@@ -688,28 +1062,38 @@ export function createCragShopHandler({
             )
           throw (
             hostCheckoutError(error) ??
+            deviceApplyFailure(error) ??
             failure(409, 'shop_device_apply_failed', 'Could not apply this order to the host; retry the same order')
           )
         }
-        db.prepare("UPDATE crag_shop_orders SET activation_phase = 'active' WHERE owner = ? AND order_id = ?").run(
-          owner,
-          row.order_id,
+        durable(db, () =>
+          db
+            .prepare(
+              "UPDATE crag_shop_orders SET activation_phase = 'active' WHERE owner = ? AND order_id = ? AND redemption_sha256 = ?",
+            )
+            .run(owner, row.order_id, digest),
         )
-        return ok(view(findOrder(db, owner, row.order_id)))
+        return ok(project(findOrder(db, owner, row.order_id)))
       }
       if (route === 'retry-activation') {
         requireActivationAdmin(owner)
         if (!row.activation_vm_id) throw failure(409, 'shop_activation_not_pinned', 'This order uses manual activation')
         if (!activationEnabled) throw failure(503, 'shop_activation_disabled', 'Automatic CRAG activation is disabled')
         const now = nowSeconds()
-        db.prepare(`UPDATE crag_shop_orders SET activation_next_at = ?, activation_deadline = ?, activation_attempts = 0
+        db.prepare(`UPDATE crag_shop_orders
+          SET activation_next_at = ?,
+              activation_deadline = ?,
+              activation_attempts = 0,
+              activation_error_code = NULL,
+              activation_error_recovery = NULL,
+              activation_request_id = NULL
           WHERE owner = ? AND order_id = ? AND activation_next_at IS NULL AND activation_phase <> 'active'`).run(
           now,
           now + ACTIVATION_WINDOW,
           owner,
           row.order_id,
         )
-        return ok(view(findOrder(db, owner, row.order_id)))
+        return ok(project(findOrder(db, owner, row.order_id)))
       }
       if (route === 'claim' && row.activation_vm_id)
         throw failure(409, 'shop_activation_pinned', 'This order uses automatic activation')
@@ -719,18 +1103,19 @@ export function createCragShopHandler({
         requireAdmin(req)
         if (row.sku !== 'renewal') throw failure(409, 'shop_not_renewal', 'Order is not a host subscription renewal')
       }
+      if (device && route === 'status' && row.activation_phase === 'active') return ok(project(row))
       // A queued order advances in the background. A paused unpaid order still supports manual refresh.
       if (
         route === 'status' &&
         row.activation_vm_id &&
         ((activationEnabled && row.activation_next_at != null) || row.status === 'fulfilled')
       )
-        return ok(view(row))
+        return ok(project(row))
       const receipt = deriveOrderReceipt(receiptKey(db), row.order_id)
       if (route === 'resume') {
         const { order, form } = await supplier.resume(row, receipt, supplierOptions)
         const current = reflectOrder(db, owner, order)
-        return ok({ ...view(current), ...(current.status === 'pending' && form ? form : {}) })
+        return ok({ ...project(current), ...(current.status === 'pending' && form ? form : {}) })
       }
       if (route === 'claim' || route === 'apply-renewal') {
         if (row.status === 'reserved') reflectOrder(db, owner, await supplier.status(row, receipt))
@@ -759,19 +1144,26 @@ export function createCragShopHandler({
       }
       try {
         const order = await supplier.status(row, receipt)
-        return ok(view(reflectOrder(db, owner, order)))
+        return ok(project(reflectOrder(db, owner, order)))
       } catch (err) {
         if (err instanceof ShopError && err.code === 'shop_order_not_found' && row.status === 'reserved') {
-          return ok(view(findOrder(db, owner, row.order_id) ?? row))
+          return ok(project(findOrder(db, owner, row.order_id) ?? row))
         }
         throw err
       }
     } catch (err) {
       const error =
         err instanceof ShopError ? err : failure(503, 'shop_unavailable', 'CRAG shop unavailable; try again later')
-      return json(res, error.status, { ok: false, error: { code: error.code, message: error.message } })
+      return json(res, error.status, {
+        ok: false,
+        error: {
+          code: error.code,
+          message: error.message,
+          ...(error.authorityRequestId && { details: { authority_request_id: error.authorityRequestId } }),
+        },
+      })
     }
   }
 
-  return Object.assign(handleCragShop, { pollActivation })
+  return Object.assign(handleCragShop, { pollActivation, pollOrderExpiry })
 }

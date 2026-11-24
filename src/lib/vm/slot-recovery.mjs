@@ -24,7 +24,7 @@ import {
   egressListening,
   ensureProxyEgress,
   hasBoundExit,
-  inspectEgressProcess,
+  inspectEgressProcessAsync,
   isLocalEgressProxy,
   localEgressStatus,
 } from './egress.mjs'
@@ -693,7 +693,15 @@ export function createSlotBridgeHealer({
   ops = {},
   logger = console,
 }) {
-  const egressAlive = ops.egressAlive || ((proxyId) => inspectEgressProcess(projectRoot, proxyId).ok)
+  const egressAlive =
+    ops.egressAlive ||
+    (async (proxyId) => {
+      // Async on purpose: the sync probe shells out to the docker CLI, and one
+      // call per bound proxy per tick stalled the loop long enough for direct
+      // link dials to pass their 3s deadline and be scored down (#1495).
+      const result = await inspectEgressProcessAsync(projectRoot, proxyId)
+      return result.ok || result.pending
+    })
   const startEgress = ops.ensureProxyEgress || ((proxy) => ensureProxyEgress(projectRoot, proxy))
   const getCluster = ops.cluster || cluster
   const lastAttempt = new Map()
@@ -727,7 +735,7 @@ export function createSlotBridgeHealer({
       if (isCodexVm(vm) || !hasBoundExit(proxy) || isLocalEgressProxy(proxy) || proxyBlockedReason(proxy)) continue
       if (seenProxies.has(proxy.id)) continue
       seenProxies.add(proxy.id)
-      if (egressAlive(proxy.id) || !due(`egress:${proxy.id}`)) continue
+      if ((await egressAlive(proxy.id)) || !due(`egress:${proxy.id}`)) continue
       const result = await startEgress(proxy)
       if (result?.ok) logger.warn(`[bridge-heal] kin-egress ${proxy.id} was down; restarted`)
       else logger.warn(`[bridge-heal] kin-egress ${proxy.id} restart failed: ${result?.error || 'unknown'}`)

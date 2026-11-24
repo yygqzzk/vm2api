@@ -4,7 +4,7 @@ import { defaultMaxTokensForModel } from './model-policy.mjs'
 /**
  * Sanitize Anthropic Messages body for official API.
  *
- * Credential-forwarding (sub2api-style): drop client-private / OpenAI leftover
+ * Credential forwarding: drop client-private and leftover OpenAI
  * keys, pass through unknown official fields such as output_config.
  */
 const DROP_TOP = new Set([
@@ -177,8 +177,22 @@ export function promoteContentToBlocks(content) {
 export function promoteSystemToBlocks(system) {
   if (system == null || system === '') return system
   if (typeof system === 'string') return [{ type: 'text', text: system }]
-  if (!Array.isArray(system)) return system
+  if (!Array.isArray(system)) return [canonicalSystemBlock(system, 'system')]
   return system.map((block) => (typeof block === 'string' ? { type: 'text', text: block } : block))
+}
+
+function canonicalSystemBlock(block, param) {
+  if (typeof block === 'string') return { type: 'text', text: block }
+  if ((block?.type === 'text' || block?.type === undefined) && typeof block?.text === 'string') {
+    return block.type === 'text' ? block : { ...block, type: 'text' }
+  }
+  const code = 'invalid_system_block'
+  const message = `${param}: must be a text block with a string text field`
+  throw Object.assign(new Error(message), {
+    status: 400,
+    code,
+    body: { type: 'error', error: { type: 'invalid_request_error', code, param, message } },
+  })
 }
 
 /**
@@ -208,23 +222,26 @@ export function canonicalizeClaudeMessagesShape(body, { preserveContentShape = f
   return out
 }
 
+export function reusableContentBlock(block) {
+  if (!block || typeof block !== 'object' || typeof block.type !== 'string' || !block.type) return false
+  for (const key of DROP_CONTENT_KEYS) {
+    if (Object.hasOwn(block, key)) return false
+  }
+  return (
+    block.type !== 'text' ||
+    (typeof block.text === 'string' && !!block.text.trim() && !mayRepairAutoModeReminder(block.text))
+  )
+}
+
 function reusableContent(content) {
   for (const block of content) {
-    if (!block || typeof block !== 'object' || typeof block.type !== 'string' || !block.type) return false
-    for (const key of DROP_CONTENT_KEYS) {
-      if (Object.hasOwn(block, key)) return false
-    }
-    if (
-      block.type === 'text' &&
-      (typeof block.text !== 'string' || !block.text.trim() || mayRepairAutoModeReminder(block.text))
-    )
-      return false
+    if (!reusableContentBlock(block)) return false
     if (block.type === 'tool_result' && Array.isArray(block.content) && !reusableContent(block.content)) return false
   }
   return true
 }
 
-function reusableHistory(messages) {
+export function canReuseCanonicalHistory(messages) {
   if (!Array.isArray(messages) || !messages.length) return false
   let previousRole = 'assistant'
   for (const message of messages) {
@@ -238,36 +255,36 @@ function reusableHistory(messages) {
 
 export function sanitizeAnthropicBody(
   body,
-  { preserveContentShape = false, onSystemBlock, reuseCanonicalHistory = false } = {},
+  { preserveContentShape = false, onSystemBlock, reuseCanonicalHistory = false, preserveConsecutiveUser = false } = {},
 ) {
   if (!body || typeof body !== 'object') return body
 
   const out = copyOfficialAnthropicFields(body)
   applyStructuredOutput(out, body)
 
-  if (!preserveContentShape && Array.isArray(out.system)) {
-    out.system = out.system
-      .map((b, index) => {
-        let block = b && typeof b === 'object' ? b : null
-        if (typeof b === 'string') block = { type: 'text', text: b }
-        else if (typeof b?.text === 'string') {
-          block = { type: 'text', text: b.text }
-          if (b.cache_control) block.cache_control = b.cache_control
-        }
-        onSystemBlock?.(block, index)
-        return block
-      })
-      .filter(Boolean)
+  if (!preserveContentShape && out.system != null && typeof out.system !== 'string') {
+    const list = Array.isArray(out.system)
+    out.system = (list ? out.system : [out.system]).map((value, index) => {
+      const source = canonicalSystemBlock(value, list ? `system[${index}]` : 'system')
+      const block = { type: 'text', text: source.text }
+      if (source.cache_control) block.cache_control = source.cache_control
+      onSystemBlock?.(block, index)
+      return block
+    })
   }
 
-  const reuseHistory = reuseCanonicalHistory && !preserveContentShape && reusableHistory(out.messages)
+  const reuseHistory =
+    !preserveContentShape &&
+    (typeof reuseCanonicalHistory === 'function'
+      ? reuseCanonicalHistory(out.messages)
+      : reuseCanonicalHistory && canReuseCanonicalHistory(out.messages))
   if (reuseHistory) {
     if (Array.isArray(out.system)) out.system = stripIllegalContentFields(out.system)
   } else {
     if (reuseCanonicalHistory && Array.isArray(out.messages)) {
       out.messages = out.messages.map((message) => (message && typeof message === 'object' ? { ...message } : message))
     }
-    normalizeAnthropicMessages(out)
+    normalizeAnthropicMessages(out, { preserveConsecutiveUser })
     stripIllegalBodyContentFields(out)
   }
 
@@ -285,7 +302,7 @@ export function sanitizeAnthropicBody(
 }
 
 /**
- * Sub2API-style Messages repair before the Anthropic hop:
+ * Messages repair before the Anthropic hop:
  *   - leading system / developer turns (before the first user) lift into top-level system
  *   - mid-conversation role:system after a user turn is kept when the model/beta allow it
  *   - unknown roles (admin, tool, function, …) become user
@@ -303,7 +320,10 @@ export function sanitizeAnthropicBody(
  *     control which the per-message effort beta allows as the first entry
  *   - a system turn that cannot be kept still contributes its effort the same way
  */
-export function normalizeAnthropicMessages(body, { keepMidConversationSystem = true } = {}) {
+export function normalizeAnthropicMessages(
+  body,
+  { keepMidConversationSystem = true, preserveConsecutiveUser = false } = {},
+) {
   if (!body || !Array.isArray(body.messages)) return body
   repairAutoModeReminders(body)
 
@@ -348,7 +368,7 @@ export function normalizeAnthropicMessages(body, { keepMidConversationSystem = t
     mapped.push(keptAnthropicMessage(message, nextRole))
   }
 
-  const merged = mergeConsecutiveAnthropicMessages(mapped)
+  const merged = mergeConsecutiveAnthropicMessages(mapped, { preserveConsecutiveUser })
   if (merged.length && merged[0].role !== 'user' && !isEmptyEffortControl(merged[0])) {
     merged.unshift({ role: 'user', content: '.' })
   }
@@ -513,11 +533,17 @@ export function anthropicContentIsEmpty(content) {
   })
 }
 
-export function mergeConsecutiveAnthropicMessages(messages) {
+export function mergeConsecutiveAnthropicMessages(messages, { preserveConsecutiveUser = false } = {}) {
   const out = []
   for (const message of messages) {
     const last = out[out.length - 1]
-    if (!last || last.role !== message.role || messageHasTurnControls(last) || messageHasTurnControls(message)) {
+    if (
+      !last ||
+      last.role !== message.role ||
+      (preserveConsecutiveUser && message.role === 'user') ||
+      messageHasTurnControls(last) ||
+      messageHasTurnControls(message)
+    ) {
       out.push({ ...message })
       continue
     }

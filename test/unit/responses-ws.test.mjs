@@ -541,6 +541,191 @@ test('generate=false warmup is rejected when upstream is HTTP-only', async () =>
   }
 })
 
+test('generate=false warmup id continues on the same connection (#1358)', async () => {
+  const hops = []
+  const live = await listen({
+    routing: ENABLED,
+    requireAuth: allowAuth,
+    async handleProtocol(req, res) {
+      const body = await readJson(req)
+      hops.push(body)
+      const n = hops.length
+      const id = `resp_warm_${n}`
+      // A warmup hop settles without assistant output; only the follow-up generates.
+      const output =
+        body.generate === false
+          ? []
+          : [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'OK' }] }]
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.write(
+        `event: response.created\ndata: ${JSON.stringify({ type: 'response.created', response: { id, output: [] } })}\n\n`,
+      )
+      res.write(
+        `event: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', response: { id, output } })}\n\n`,
+      )
+      res.end()
+    },
+  })
+  let ws = null
+  try {
+    const opened = await openWs(live.url, { authorization: 'Bearer sk-test' })
+    assert.equal(opened.ok, true)
+    ws = opened.ws
+    ws.send(
+      JSON.stringify({
+        type: 'response.create',
+        model: 'gpt-5.4',
+        input: 'This is a protocol test.',
+        generate: false,
+        store: false,
+      }),
+    )
+    const warm = await nextFrame(ws, (frame) => frame.type === 'error' || frame.type === 'response.completed')
+    assert.equal(warm.type, 'response.completed', `warmup hop failed: ${JSON.stringify(warm.error)}`)
+    assert.equal(warm.response.id, 'resp_warm_1')
+    assert.equal(hops.length, 1)
+    assert.equal(hops[0].generate, false)
+    ws.send(
+      JSON.stringify({
+        type: 'response.create',
+        model: 'gpt-5.4',
+        previous_response_id: 'resp_warm_1',
+        input: 'Reply with exactly the word OK.',
+      }),
+    )
+    const frame = await nextFrame(ws, (event) => event.type === 'error' || event.type === 'response.completed')
+    assert.equal(frame.type, 'response.completed', `expected a generated hop, got ${JSON.stringify(frame.error)}`)
+    assert.equal(frame.response.id, 'resp_warm_2')
+    assert.equal(hops.length, 2)
+    // The hop sent upstream carries the expanded history, never the opaque id.
+    assert.equal(hops[1].previous_response_id, undefined)
+    assert.deepEqual(
+      hops[1].input.map((item) => item.type),
+      ['message', 'message'],
+    )
+    assert.equal(hops[1].input[0].content, 'This is a protocol test.')
+    assert.equal(hops[1].input[1].content, 'Reply with exactly the word OK.')
+  } finally {
+    // Close the socket first: server.close() never settles while one is open.
+    if (ws && ws.readyState === ws.OPEN) {
+      ws.close()
+      await once(ws, 'close')
+    }
+    await live.close()
+  }
+})
+
+test('warmup output is replayed in order before the follow-up input (#1358)', async () => {
+  const hops = []
+  const live = await listen({
+    routing: ENABLED,
+    requireAuth: allowAuth,
+    async handleProtocol(req, res) {
+      const body = await readJson(req)
+      hops.push(body)
+      const n = hops.length
+      const id = `resp_pre_${n}`
+      const output =
+        body.generate === false
+          ? [{ type: 'reasoning', id: 'rs_warm', summary: [{ type: 'summary_text', text: 'primed' }] }]
+          : [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'OK' }] }]
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.write(
+        `event: response.created\ndata: ${JSON.stringify({ type: 'response.created', response: { id, output: [] } })}\n\n`,
+      )
+      res.write(
+        `event: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', response: { id, output } })}\n\n`,
+      )
+      res.end()
+    },
+  })
+  let ws = null
+  try {
+    const opened = await openWs(live.url, { authorization: 'Bearer sk-test' })
+    assert.equal(opened.ok, true)
+    ws = opened.ws
+    ws.send(
+      JSON.stringify({ type: 'response.create', model: 'gpt-5.4', input: 'prime', generate: false, store: false }),
+    )
+    const warm = await nextFrame(ws, (frame) => frame.type === 'error' || frame.type === 'response.completed')
+    assert.equal(warm.type, 'response.completed', `warmup hop failed: ${JSON.stringify(warm.error)}`)
+    ws.send(
+      JSON.stringify({
+        type: 'response.create',
+        model: 'gpt-5.4',
+        previous_response_id: 'resp_pre_1',
+        input: 'go',
+      }),
+    )
+    const frame = await nextFrame(ws, (event) => event.type === 'error' || event.type === 'response.completed')
+    assert.equal(frame.type, 'response.completed', `expected a generated hop, got ${JSON.stringify(frame.error)}`)
+    assert.deepEqual(
+      hops[1].input.map((item) => item.type),
+      ['message', 'reasoning', 'message'],
+    )
+    assert.equal(hops[1].input[1].id, 'rs_warm')
+  } finally {
+    if (ws && ws.readyState === ws.OPEN) {
+      ws.close()
+      await once(ws, 'close')
+    }
+    await live.close()
+  }
+})
+
+test('a warmup id from another connection is still unknown (#1358)', async () => {
+  const hops = []
+  const live = await listen({
+    routing: ENABLED,
+    requireAuth: allowAuth,
+    async handleProtocol(req, res) {
+      const body = await readJson(req)
+      hops.push(body)
+      const id = 'resp_scoped'
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.write(
+        `event: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', response: { id, output: [] } })}\n\n`,
+      )
+      res.end()
+    },
+  })
+  let first = null
+  let second = null
+  try {
+    first = await openWs(live.url, { authorization: 'Bearer sk-test' })
+    assert.equal(first.ok, true)
+    first.ws.send(
+      JSON.stringify({ type: 'response.create', model: 'gpt-5.4', input: 'warm', generate: false, store: false }),
+    )
+    const warm = await nextFrame(first.ws, (frame) => frame.type === 'error' || frame.type === 'response.completed')
+    assert.equal(warm.type, 'response.completed', `warmup hop failed: ${JSON.stringify(warm.error)}`)
+    first.ws.close()
+    await once(first.ws, 'close')
+    second = await openWs(live.url, { authorization: 'Bearer sk-test' })
+    assert.equal(second.ok, true)
+    second.ws.send(
+      JSON.stringify({
+        type: 'response.create',
+        model: 'gpt-5.4',
+        previous_response_id: 'resp_scoped',
+        input: 'again',
+      }),
+    )
+    const frame = await nextFrame(second.ws, (event) => event.type === 'error')
+    assert.equal(frame.error.code, 'previous_response_not_found')
+    assert.equal(hops.length, 1)
+  } finally {
+    for (const opened of [first, second]) {
+      const ws = opened?.ws
+      if (ws && ws.readyState === ws.OPEN) {
+        ws.close()
+        await once(ws, 'close')
+      }
+    }
+    await live.close()
+  }
+})
+
 test('unknown control events are protocol errors, not a fake completed', async () => {
   const hops = []
   const live = await listen({
@@ -909,7 +1094,7 @@ test('real handleProtocol: interrupt after hop finish bills once without duplica
   }
 })
 
-test('real handleProtocol: Codex spend fills the managed key USD quota and the next request is refused', async () => {
+test('real handleProtocol: a Codex incomplete response reaches WebSocket and its usage counts toward quota', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-responses-ws-key-quota-'))
   writeGptVm(root, 'vm-gpt-a')
   const keys = new ApiKeyStore({ dataDir: fs.mkdtempSync(path.join(root, 'keys-')) })
@@ -934,13 +1119,16 @@ test('real handleProtocol: Codex spend fills the managed key USD quota and the n
     codexOps: {
       streamCodexKernel: async ({ onEvent }) => {
         hops += 1
-        await onEvent(
-          `data: ${JSON.stringify({
-            type: 'response.completed',
-            response: { id: `resp_quota_${hops}`, status: 'completed', output: [], usage },
-          })}\n\n`,
-        )
-        return { ok: true, status: 200, terminalState: 'verified', usage }
+        const response = {
+          id: `resp_quota_${hops}`,
+          status: 'incomplete',
+          incomplete_details: { reason: 'max_output_tokens' },
+          output: [],
+          usage,
+        }
+        await onEvent(`data: ${JSON.stringify({ type: 'response.incomplete', response })}`)
+        await onEvent('')
+        return { ok: true, status: 200, body: response, terminalState: 'incomplete', usage }
       },
     },
   })
@@ -954,8 +1142,12 @@ test('real handleProtocol: Codex spend fills the managed key USD quota and the n
   let opened = null
   try {
     opened = await openWs(live.url, { authorization: 'Bearer sk-test' })
+    const terminal = nextFrame(opened.ws, (frame) => frame.type === 'response.incomplete')
     opened.ws.send(JSON.stringify({ type: 'response.create', model: 'gpt-5.4', input: 'first' }))
+    const frame = await terminal
+    assert.equal(frame.response.incomplete_details.reason, 'max_output_tokens')
     await waitFinish(1)
+    assert.equal(finishCalls[0].final_state, 'incomplete')
     const spent = keys.getById(key.id)
     assert.equal(spent.requests, 1)
     assert.equal(spent.tokens_in, 100_000)

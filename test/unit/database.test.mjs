@@ -101,7 +101,7 @@ test('migration 005 adds protocol usage alignment columns', () => {
     assert.ok(cols('accounts').includes(c), `accounts missing ${c}`)
     assert.ok(cols('api_keys').includes(c), `api_keys missing ${c}`)
   }
-  // scheduling window columns now live on accounts (sub2api SSOT merge)
+  // The accounts table is the source of truth for scheduling windows.
   const accCols = cols('accounts')
   for (const c of [
     'rate_limited_at',
@@ -501,4 +501,36 @@ test('migration 042 adds image generation columns; old rows and prompt totals st
     },
   )
   db.close()
+})
+
+test('migration 067 upgrades pre-067 crag_shop_orders in place with NULL activation failure columns and idempotent checksums', () => {
+  const src = path.resolve('src/lib/db/migrations')
+  const oldDir = path.join(tmp, 'before067')
+  fs.mkdirSync(oldDir)
+  for (const file of fs.readdirSync(src)) {
+    if (file.endsWith('.sql') && file < '067') fs.copyFileSync(path.join(src, file), path.join(oldDir, file))
+  }
+  const db = new DatabaseSync(':memory:')
+  try {
+    applyMigrations(db, { migrationsDir: oldDir })
+    db.prepare(`INSERT INTO crag_shop_orders
+      (order_id, owner, request_id, sku, payment_method, reserved_at, status, created_at, term, amount_minor, slot_limit,
+       activation_vm_id, activation_fingerprint)
+      VALUES ('legacy-pinned', 'panel:admin', 'req-067', 'quarter', 'alipay', 1, 'fulfilled', 1, '3m', 59900, 10,
+              'vm-1', ?)`).run('a'.repeat(64))
+    const applied = applyMigrations(db, { migrationsDir: src })
+    assert.ok(applied.includes('067_crag_shop_activation_error.sql'))
+    assert.deepEqual(applyMigrations(db, { migrationsDir: src }), [])
+    const row = db
+      .prepare(
+        'SELECT activation_error_code, activation_error_recovery, activation_request_id FROM crag_shop_orders WHERE order_id = ?',
+      )
+      .get('legacy-pinned')
+    assert.deepEqual(
+      { ...row },
+      { activation_error_code: null, activation_error_recovery: null, activation_request_id: null },
+    )
+  } finally {
+    db.close()
+  }
 })

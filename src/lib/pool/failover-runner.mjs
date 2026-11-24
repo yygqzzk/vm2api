@@ -7,8 +7,10 @@ import {
 } from './upstream-error-policy.mjs'
 import { listQuotaFromHeaders } from './quota-window.mjs'
 import { flattenSearchResultHistory, searchHistoryFingerprint } from '../protocol/request-rectifier.mjs'
+import { MIN_THINKING_BUDGET } from '../protocol/thinking.mjs'
 import {
   CLIENT_POOL_BUSY_MESSAGE,
+  CLIENT_POOL_FABLE_RATE_LIMITED_MESSAGE,
   CLIENT_POOL_RATE_LIMITED_MESSAGE,
   clientCancelledResult,
   isClientCancelledResult,
@@ -24,14 +26,24 @@ import { kernelFaults } from '../transport/rust-kernel-client.mjs'
 import { resolveOfficialCcInference } from '../vm/slot-engine.mjs'
 import { attachFailureDecision, AttemptCoordinator } from './unit-decision.mjs'
 import { SOFT_COOLDOWN_REASONS } from './pool-scheduler.mjs'
+import { PoisonRequestGuard } from './poison-request-guard.mjs'
 
 // Seat wait for the one-shot repair hop when the rejected hop already spent the deadline.
 const REPAIR_HOP_WAIT_MS = 30_000
 const SEARCH_REPAIR_IDLE_MS = 60 * 60 * 1000
 const SEARCH_REPAIR_LIMIT = 512
 
+// A slot whose kernel is healthy but whose inference keeps hanging trips the
+// timeout circuit again right after the watchdog clears it. The first trip
+// stays short (one watchdog tick) so a pool-wide upstream stall cannot park
+// every slot; a repeat within the window holds the fault 15/30/60 minutes.
+const TIMEOUT_TRIP_WINDOW_MS = 2 * 60 * 60_000
+const TIMEOUT_HOLD_BASE_MS = 15 * 60_000
+const TIMEOUT_HOLD_MAX_MS = 60 * 60_000
+
 export const vmTimeoutTracker = {
   counts: new Map(),
+  trips: new Map(),
   recordTimeout(vmId, threshold = 3) {
     if (!vmId) return false
     const entry = this.counts.get(vmId) || { count: 0, lastAt: 0 }
@@ -40,14 +52,49 @@ export const vmTimeoutTracker = {
     this.counts.set(vmId, entry)
     return entry.count >= threshold
   },
-  recordSuccess(vmId) {
-    if (vmId) this.counts.delete(vmId)
+  /** The circuit opened for this VM: remember when, for the repeat-trip hold. */
+  recordTrip(vmId, now = Date.now()) {
+    if (!vmId) return 0
+    const recent = (this.trips.get(vmId) || []).filter((at) => now - at < TIMEOUT_TRIP_WINDOW_MS)
+    recent.push(now)
+    this.trips.set(vmId, recent)
+    return recent.length
   },
+  /**
+   * Trips still inside the window. Prunes the aged-out ones so they cannot be
+   * counted later: only recordTrip writes the filtered list back, and it is not
+   * called while the circuit is already open.
+   */
+  tripCount(vmId, now = Date.now()) {
+    if (!vmId) return 0
+    const recent = (this.trips.get(vmId) || []).filter((at) => now - at < TIMEOUT_TRIP_WINDOW_MS)
+    if (recent.length) this.trips.set(vmId, recent)
+    else this.trips.delete(vmId)
+    return recent.length
+  },
+  /** Until when a healthy kernel must not clear this VM's timeout fault (0 = no hold). */
+  faultHoldUntil(vmId, now = Date.now()) {
+    const recent = (this.trips.get(vmId) || []).filter((at) => now - at < TIMEOUT_TRIP_WINDOW_MS)
+    if (recent.length < 2) return 0
+    const holdMs = Math.min(TIMEOUT_HOLD_MAX_MS, TIMEOUT_HOLD_BASE_MS * 2 ** (recent.length - 2))
+    return recent[recent.length - 1] + holdMs
+  },
+  recordSuccess(vmId) {
+    if (!vmId) return
+    this.counts.delete(vmId)
+    this.trips.delete(vmId)
+  },
+  /** Clears the consecutive count only: trip history survives a fault reset and ends on a real success. */
   reset(vmId) {
     if (vmId) this.counts.delete(vmId)
-    else this.counts.clear()
+    else {
+      this.counts.clear()
+      this.trips.clear()
+    }
   },
 }
+
+export const TIMEOUT_FAULT_PREFIX = 'consecutive_timeouts:'
 
 const DEFAULTS = {
   max_account_switches: 10,
@@ -58,11 +105,29 @@ const DEFAULTS = {
   // so the queue cannot sit forever. 0 disables the cap. Long enough that a
   // normal generation still runs serially; keepalive covers the Cloudflare wait.
   session_queue_timeout_ms: 900_000,
+  // A conversation whose request keeps hitting the kernel's silent-CLI watchdog is refused for a while
+  // instead of being replayed every few minutes. 0 disables it.
+  poison_request_threshold: 2,
+  poison_request_window_ms: 30 * 60_000,
+  poison_request_quarantine_ms: 10 * 60_000,
+  // Different sessions that must go silent on one VM before requests that large are kept off it.
+  poison_request_vm_sessions: 2,
   delivery_mode: 'realtime',
   max_same_account_retries: 1,
   same_account_retry_delay_ms: 500,
   same_account_retry_max_hop_ms: 10_000,
   signature_repair: false,
+  // A conversation that already had a session pin when the request arrived
+  // stays on the account its first attempt ran on: a failed attempt retries
+  // that account or returns its error, it never replays the transcript on
+  // another account. Off by default (upstream behaviour).
+  keep_session_home: false,
+  // keep_session_home: pause between retries of a home kernel that had no free slot.
+  home_slot_busy_retry_ms: 2000,
+  // keep_session_home: once the request has run this long, a busy home kernel
+  // answers 529 session_home_slot_busy instead of being retried until
+  // total_retry_deadline_ms. 0 keeps waiting until the deadline (upstream behaviour).
+  home_slot_busy_max_wait_ms: 0,
 }
 
 function clone(value) {
@@ -122,6 +187,7 @@ export function poolOverloadedError(details = {}) {
     status: 529,
     via: 'pool-failover',
     terminalState: 'exhausted',
+    ...(details.reason === 'subagent_limit' && { poolReason: details.reason }),
     retryAfterSec: Number.isFinite(retryMs) && retryMs > 0 ? Math.max(1, Math.ceil(retryMs / 1000)) : 1,
     body: {
       type: 'error',
@@ -139,6 +205,7 @@ const CAPACITY_SELECTION_REASONS = new Set([
   'all_accounts_busy',
   'pool_wait_queue_full',
   'pool_queue_timeout',
+  'subagent_limit',
   'pool_overload_cooldown',
 ])
 
@@ -148,6 +215,7 @@ const CAPACITY_SELECTION_REASONS = new Set([
  */
 function poolRateLimitedError(details = {}) {
   const retryMs = Number(details.retry_after_ms ?? details.soonest_available_ms)
+  const fableLimited = details.reason === 'pool_fable_rate_limited'
   return {
     ok: false,
     status: 429,
@@ -158,8 +226,8 @@ function poolRateLimitedError(details = {}) {
       type: 'error',
       error: {
         type: 'rate_limit_error',
-        code: 'pool_rate_limited',
-        message: CLIENT_POOL_RATE_LIMITED_MESSAGE,
+        code: fableLimited ? 'pool_fable_rate_limited' : 'pool_rate_limited',
+        message: fableLimited ? CLIENT_POOL_FABLE_RATE_LIMITED_MESSAGE : CLIENT_POOL_RATE_LIMITED_MESSAGE,
         details,
       },
     },
@@ -243,11 +311,12 @@ function selectedUsage(selected, accountQuota = null) {
 function classifyAttempt(
   result,
   selected,
-  { model, repaired, oauth401CooldownMs, signatureRepair },
+  { model, requestBody, repaired, oauth401CooldownMs, signatureRepair },
   accountQuota = null,
 ) {
   return classifyUpstreamResult(result, {
     model,
+    requestBody,
     repaired,
     hasRefresh: selectedHasRefresh(selected),
     oauth401CooldownMs,
@@ -331,9 +400,25 @@ function hasKernelFailureCode(result) {
   return Object.hasOwn(KERNEL_FAILURE_STATUS, String(result?.body?.error?.code || ''))
 }
 
+/**
+ * The provider answered 429 before anything reached the caller. The native
+ * stream path tags every failed hop 'incomplete', so when all accounts were
+ * rate limited the caller got a generic 502 incomplete_response and a gateway
+ * in front read it as a broken upstream. The 429 (with its retry-after) is the
+ * complete answer.
+ */
+function isUncommittedRateLimitAnswer(result) {
+  if (result.committed || Number(result.status) !== 429) return false
+  return result.body?.type === 'error' || !!result.body?.error
+}
+
 function isUnfinishedLastResult(result, policy) {
   if (!result) return false
   if (policy?.reason === 'incomplete_assistant') return true
+  if (isUncommittedRateLimitAnswer(result)) return false
+  // An upstream entitlement answer is a complete answer even when the kernel
+  // tags the hop incomplete; the caller needs its message, not a generic 502.
+  if (policy?.reason === 'fable_credits_required' || policy?.reason === 'fable_plan_denied') return false
   if (hasKernelFailureCode(result)) return false
   if (result.terminalState === 'incomplete') return true
   return isIncompleteAssistantMessage(result)
@@ -375,6 +460,71 @@ function permanentOAuthRevoke(policy) {
 
 function isCredentialDeath(policy) {
   return policy?.action === 'disable' || policy?.reason === 'oauth_no_refresh' || policy?.reason === 'oauth_revoked'
+}
+
+/**
+ * The kernel's job watchdog gave up after 180s without one CLI frame. The slot itself may be fine,
+ * so this says something about the request rather than the seat.
+ */
+function isSilentCliTimeout(policy, result) {
+  if ((policy?.reason !== 'provider_timeout' && policy?.reason !== 'worker_timeout') || result?.committed) return false
+  const text = `${result?.error?.message || ''} ${result?.body?.error?.message || ''} ${result?.message || ''}`
+  return /no CLI frame/i.test(text)
+}
+
+function quarantinedResult({ failures, retryAfterSec }) {
+  const minutes = Math.max(1, Math.ceil(retryAfterSec / 60))
+  return {
+    ok: false,
+    status: 400,
+    via: 'pool-failover',
+    terminalState: 'rejected',
+    finalState: 'rejected',
+    attemptCount: 0,
+    body: {
+      type: 'error',
+      error: {
+        type: 'invalid_request_error',
+        code: ErrorCode.REQUEST_QUARANTINED,
+        message:
+          `This conversation's last request made the worker go silent ${failures} times in a row (no output for 180s), ` +
+          `so it is refused for about ${minutes} min instead of waiting again. ` +
+          'Rewind to before the last tool result (Esc Esc or /rewind) or start a new session. ' +
+          `此对话的最近一次请求已让 worker 连续 ${failures} 次无输出（180 秒），约 ${minutes} 分钟内不再重试；` +
+          '请回退到上一次工具调用之前（Esc Esc 或 /rewind），或新开会话。',
+        details: { failures },
+      },
+    },
+  }
+}
+
+const kb = (bytes) => Math.round(bytes / 1024)
+
+/** Every seat that could serve this request has been silent at this size; say so instead of waiting 180s again. */
+function oversizeForSlotResult({ requestBytes, ceilingBytes, retryAfterSec }) {
+  const minutes = Math.max(1, Math.ceil(retryAfterSec / 60))
+  return {
+    ok: false,
+    status: 400,
+    via: 'pool-failover',
+    terminalState: 'rejected',
+    finalState: 'rejected',
+    attemptCount: 0,
+    body: {
+      type: 'error',
+      error: {
+        type: 'invalid_request_error',
+        code: ErrorCode.REQUEST_TOO_LARGE_FOR_SLOT,
+        message:
+          `Requests of this size (about ${kb(requestBytes)} KB) are currently not answered by the worker that serves this key: ` +
+          `smaller ones were, larger ones went silent for 180s. It will be tried again in about ${minutes} min. ` +
+          'Rewind to an earlier point (Esc Esc or /rewind) or start a new session; /compact sends the whole conversation, so it is refused too. ' +
+          `当前为此 key 服务的 worker 不应答这个体积（约 ${kb(requestBytes)} KB）的请求：更小的请求正常，更大的会静默 180 秒。` +
+          `约 ${minutes} 分钟后再试；请回退到更早的位置（Esc Esc 或 /rewind）或新开会话，/compact 会发送整段对话，同样会被拒绝。`,
+        details: { request_kb: kb(requestBytes), silent_from_kb: kb(ceilingBytes), retry_after_sec: retryAfterSec },
+      },
+    },
+  }
 }
 
 /** Empty / thinking-only hop: replayable on another seat. Never a restart signal. */
@@ -433,6 +583,7 @@ function selectionFailure(selected, { excluded, lastPolicy, lastResult, hops }) 
   const reason = selected?.reason || 'no_eligible_accounts'
   const details = {
     excluded_accounts: [...excluded],
+    ...(selected?.selectionReason === 'subagent-fallback' && { selection_reason: 'subagent-fallback' }),
     reason,
     wait_ms: selected?.waitMs ?? selected?.wait_ms ?? 0,
     soonest_available_ms: selected?.soonest_available_ms ?? null,
@@ -446,7 +597,7 @@ function selectionFailure(selected, { excluded, lastPolicy, lastResult, hops }) 
     last_status: lastResult?.status ?? null,
   }
   if (CAPACITY_SELECTION_REASONS.has(reason)) return poolOverloadedError(details)
-  if (reason === 'pool_rate_limited') return poolRateLimitedError(details)
+  if (reason === 'pool_rate_limited' || reason === 'pool_fable_rate_limited') return poolRateLimitedError(details)
   if (reason === 'quota_guard_request_too_large') return quotaGuardTooLargeError(details)
   if (reason === ErrorCode.CLUSTER_SLOT_RECONNECTING) {
     return {
@@ -513,10 +664,29 @@ export class FailoverRunner {
     this.onSchedulePause = onSchedulePause
     this.sessionTails = new Map()
     this.searchRepairs = new Map()
+    this.poisonGuard = new PoisonRequestGuard()
+    this.applyPoisonConfig()
   }
 
   reloadConfig(config = {}) {
     this.config = { ...DEFAULTS, ...(config || {}) }
+    this.applyPoisonConfig()
+  }
+
+  applyPoisonConfig() {
+    this.poisonGuard.threshold = Number(this.config.poison_request_threshold) || 0
+    this.poisonGuard.windowMs = Number(this.config.poison_request_window_ms) || 0
+    this.poisonGuard.quarantineMs = Number(this.config.poison_request_quarantine_ms) || 0
+    this.poisonGuard.vmSessions = Math.max(1, Number(this.config.poison_request_vm_sessions) || 2)
+  }
+
+  /** A hop ended in the kernel's silent-CLI watchdog: remember the request so its retries can be refused. */
+  noteSilentTimeout(stickyKey, canonicalBody, selected, policy, result) {
+    if (!stickyKey || !isSilentCliTimeout(policy, result)) return
+    this.poisonGuard.recordSilentTimeout(stickyKey, canonicalBody, {
+      vm_id: selected?.vmId,
+      account_id: selected?.accountId,
+    })
   }
 
   noteUnitHealth(selected, policy, result) {
@@ -542,8 +712,12 @@ export class FailoverRunner {
         if (isTimeout && ttft == null) {
           const tripped = vmTimeoutTracker.recordTimeout(vmId, 3)
           if (tripped) {
-            const fault = `consecutive_timeouts: VM ${vmId} had 3 consecutive silent inference timeouts`
-            console.error(`[vm-circuit] ${fault}; marking kernel fault to prevent routing`)
+            // In-flight hangs that land after the circuit opened are the same incident.
+            const trips = kernelFaults.has(vmId) ? vmTimeoutTracker.tripCount(vmId) : vmTimeoutTracker.recordTrip(vmId)
+            const holdUntil = vmTimeoutTracker.faultHoldUntil(vmId)
+            const fault = `${TIMEOUT_FAULT_PREFIX} VM ${vmId} had 3 consecutive silent inference timeouts`
+            const hold = holdUntil ? `, trip ${trips} in 2h, held until ${new Date(holdUntil).toISOString()}` : ''
+            console.error(`[vm-circuit] ${fault}; marking kernel fault to prevent routing${hold}`)
             kernelFaults.set(vmId, fault)
           }
         }
@@ -623,7 +797,17 @@ export class FailoverRunner {
 
   async run(args = {}) {
     const sessionKey = String(args.stickyKey || '')
-    if (!sessionKey) return this.runOnce(args)
+    // Before queueing behind the session's hung turn: a refused retry must cost nothing.
+    const quarantined = args.pinVmId ? null : this.poisonGuard.check(sessionKey, args.canonicalBody)
+    if (quarantined) return quarantinedResult(quarantined)
+    const subagent = args.rootSessionId ? this.scheduler?.trackSubagent?.(args) : null
+    if (args.rootSessionId) args = { ...args, subagent }
+    // A batch member key is a placement group, not a conversation: its requests
+    // are independent sessionless calls, so they run side by side up to the
+    // member's concurrency instead of queueing behind each other. Only the
+    // protocol layer says so (args.batchMember); the key text is caller-shaped.
+    if (!sessionKey || args.batchMember === true)
+      return subagent ? this.runOnce(args).finally(subagent.close) : this.runOnce(args)
     const previous = this.sessionTails.get(sessionKey) || Promise.resolve()
     let releaseTurn
     const turn = new Promise((resolve) => {
@@ -645,6 +829,7 @@ export class FailoverRunner {
       }
       throw error
     } finally {
+      subagent?.close()
       releaseTurn()
       // Drop the chain only after this tail settles. A timeout or cancel
       // releases our turn early, while the holder is still running; deleting
@@ -662,6 +847,7 @@ export class FailoverRunner {
     model,
     stickyKey = null,
     stickyKeys = null,
+    batchMember = false,
     seatKey = null,
     stickyDeviceId = null,
     stream = false,
@@ -674,12 +860,17 @@ export class FailoverRunner {
     pinVmId = null,
     familyKey = null,
     familyVmId = null,
+    rootSessionId = null,
+    summarySession = null,
+    subagent,
     deviceKey = null,
     skipSessionSeat = false,
     ownerScope = null,
     keyScope = null,
     countUsage = true,
     quotaRequest = null,
+    // false: never wait for a seat; a full pool fails at once (x-kin-queue: off).
+    allowQueue = true,
   } = {}) {
     if (!this.scheduler) throw new Error('FailoverRunner requires a scheduler')
     if (typeof callAttempt !== 'function') throw new Error('FailoverRunner requires callAttempt')
@@ -732,6 +923,10 @@ export class FailoverRunner {
     })
     const bindAll = (account, opts) => {
       if (!this.stickyRouter || !account) return
+      // keep_pin_on_model_gate: the pinned home only could not serve this
+      // model, so this request borrows the account. No session, family or
+      // device pin follows it; the next turn goes home.
+      if (lastSelected?.stickyBorrowed === true && lastSelected.accountId === account.accountId) return
       const sessionId = account.sessionId || (account.accountId === outboundSessionAccountId ? outboundSessionId : '')
       const payload = { accountId: account.accountId, vmId: account.vmId }
       const slotIndex = account.slotIndex != null ? account.slotIndex : pinnedSlot
@@ -759,7 +954,7 @@ export class FailoverRunner {
           pinBaseline.set(key, this.stickyRouter.resolve?.(key) || null)
         }
       }
-      if (familyKey && account.vmId && !pinMoved(familyKey)) {
+      if (familyKey && account.vmId && lastSelected?.selectionReason !== 'subagent-fallback' && !pinMoved(familyKey)) {
         this.stickyRouter.bind?.(familyKey, { accountId: account.accountId, vmId: account.vmId }, { countHit: false })
         pinBaseline.set(familyKey, this.stickyRouter.resolve?.(familyKey) || null)
       }
@@ -814,6 +1009,66 @@ export class FailoverRunner {
     }
     // A unit that just failed replayably waits behind every other free seat.
     let avoid = null
+    // keep_session_home: the continuing conversation's account for this
+    // request is the one its first attempt ran on.
+    const keepHome = this.config.keep_session_home === true && !pinVmId && !!stickyKey && batchMember !== true
+    const continuing = !subagent && keepHome && !!this.stickyRouter?.resolve?.(stickyKey)?.accountId
+    let homeAccountId = null
+    let homeRetryPending = false
+    let subagentSlotDeadline = null
+    const switchUnit = (unit, policy) => {
+      budget.noteSwitch(unit.accountId, unit.vmId, { spill: policy.reason === 'slot_busy' })
+      if (unit.isSubagent) {
+        unit.release()
+        subagent?.close()
+        familyVmId = null
+        subagentSlotDeadline = null
+      }
+    }
+    const isHome = (unit) => continuing && !!homeAccountId && unit?.accountId === homeAccountId
+    const retryOrStay = (unit) => {
+      if (isHome(unit) || unit?.isSubagent) {
+        homeRetryPending = true
+        return null
+      }
+      return new Set([unit.accountId, unit.vmId])
+    }
+    // The home kernel had no free slot: nothing ran, so wait for it instead of
+    // spilling the transcript to another account. The request deadline bounds it.
+    const waitHomeSlot = (unit, policy) => {
+      if ((!isHome(unit) && !unit?.isSubagent) || policy?.reason !== 'slot_busy') return false
+      homeRetryPending = 'slot_busy'
+      return true
+    }
+    // x-kin-queue: off — the home kernel being full is the pool being full for this
+    // conversation: answer 529 now rather than wait for the slot.
+    // home_slot_busy_max_wait_ms bounds the same wait for every request.
+    const homeSlotRefused = (unit, policy) => {
+      if (policy?.reason !== 'slot_busy') return null
+      this.scheduler?.noteKernelSlotBusy?.(unit)
+      if (unit?.isSubagent) {
+        subagentSlotDeadline ??= unit.slotWaitDeadlineMs
+        if (allowQueue && Date.now() < subagentSlotDeadline) return null
+        releaseStickySlots()
+        return {
+          ...poolOverloadedError({ reason: 'pool_queue_timeout', attempt_count: budget.hops }),
+          ...attribution(),
+        }
+      }
+      if (!isHome(unit)) return null
+      const maxWait = Number(this.config.home_slot_busy_max_wait_ms) || 0
+      const waitedOut = maxWait > 0 && Date.now() - startedAt >= maxWait
+      if (allowQueue && !waitedOut) return null
+      releaseStickySlots()
+      return {
+        ...poolOverloadedError({ reason: 'session_home_slot_busy', attempt_count: budget.hops }),
+        ...attribution(),
+      }
+    }
+    const keptHome = () => {
+      releaseStickySlots()
+      return preferLastResult(lastResult, lastPolicy, null, { ...attribution(), session_home_kept: true })
+    }
 
     for (;;) {
       const attemptNo = budget.hops + 1
@@ -834,6 +1089,8 @@ export class FailoverRunner {
         )
       }
       let selected = null
+      // Seats that stopped answering requests of this size: skip them, unless an operator pinned one for diagnosis.
+      const sizeRefused = pinVmId ? [] : this.poisonGuard.refusedVms(canonicalBody)
       try {
         currentDeviceVmId = deviceKey ? this.stickyRouter?.resolve?.(deviceKey)?.vmId || null : null
         const selectArgs = {
@@ -841,12 +1098,15 @@ export class FailoverRunner {
           stickyKey,
           stickyKeys: bindKeys,
           seatKey,
-          excluded,
+          excluded: sizeRefused.length ? new Set([...excluded, ...sizeRefused.map((r) => r.vmId)]) : excluded,
           spilled,
           signal,
           deadline: repairPending ? Math.max(deadline, Date.now() + REPAIR_HOP_WAIT_MS) : deadline,
           pinVmId,
           familyVmId,
+          rootSessionId,
+          summarySession,
+          subagent,
           deviceVmId: currentDeviceVmId,
           deviceKey,
           skipSessionSlot: skipSessionSeat,
@@ -858,13 +1118,31 @@ export class FailoverRunner {
             preserveMessageCache: quotaRequest?.preserveMessageCache,
           },
         }
+        if (homeRetryPending) {
+          const waitMs =
+            homeRetryPending === 'slot_busy'
+              ? Number(this.config.home_slot_busy_retry_ms ?? 2000)
+              : this.config.same_account_retry_delay_ms
+          homeRetryPending = false
+          await sleepWithSignal(Math.min(waitMs, (subagentSlotDeadline ?? Infinity) - Date.now()), signal)
+        }
+        if (subagentSlotDeadline != null) {
+          selectArgs.deadline = Math.min(selectArgs.deadline, subagentSlotDeadline)
+          if (Date.now() >= subagentSlotDeadline) {
+            releaseStickySlots()
+            return {
+              ...poolOverloadedError({ reason: 'pool_queue_timeout', attempt_count: budget.hops }),
+              ...attribution(),
+            }
+          }
+        }
         if (avoid) {
           const elsewhere = await this.scheduler.selectAndReserve({ ...selectArgs, avoid, allowWait: false })
           avoid = null
           if (elsewhere?.ok) selected = elsewhere
           else await sleepWithSignal(this.config.same_account_retry_delay_ms, signal)
         }
-        if (!selected) selected = await this.scheduler.selectAndReserve({ ...selectArgs, allowWait: true })
+        if (!selected) selected = await this.scheduler.selectAndReserve({ ...selectArgs, allowWait: allowQueue })
       } catch (error) {
         if (error?.code === 'selection_cancelled') {
           return { ...clientCancelledResult(), via: 'pool-failover', ...attribution() }
@@ -908,7 +1186,11 @@ export class FailoverRunner {
           releaseStickySlots()
           return preferLastResult(lastResult, lastPolicy, null, { ...attribution(), account_cap: accountCap })
         }
-        if (selected?.familyGated && familyKey && familyVmId) {
+        if (continuing && selected?.ok) {
+          if (!homeAccountId) homeAccountId = selected.accountId
+          else if (selected.accountId !== homeAccountId) return keptHome()
+        }
+        if (selected?.familyGated && selected.selectionReason !== 'subagent-fallback' && familyKey && familyVmId) {
           // The family home left the pool (quota, credential): the family moves
           // with the next bind. An exclusion this request made itself is not proof.
           const home = this.stickyRouter?.resolve?.(familyKey)
@@ -928,8 +1210,22 @@ export class FailoverRunner {
             ...attribution(),
           }
         }
+        if (
+          !selected?.ok &&
+          sizeRefused.length &&
+          !CAPACITY_SELECTION_REASONS.has(selected?.reason) &&
+          selected?.reason !== 'pool_rate_limited'
+        ) {
+          return { ...oversizeForSlotResult(sizeRefused[0]), ...attribution() }
+        }
         if (!selected?.ok) {
           const exhausted = selectionFailure(selected, { excluded, lastPolicy, lastResult, hops: budget.hops })
+          if (
+            selected?.reason === 'subagent_limit' ||
+            (selected?.isSubagent && selected.reason === 'pool_queue_timeout')
+          ) {
+            return { ...exhausted, ...attribution() }
+          }
           return preferLastResult(lastResult, lastPolicy, exhausted, attribution())
         }
         repairPending = false
@@ -1034,12 +1330,34 @@ export class FailoverRunner {
               selected,
               {
                 model,
+                requestBody,
                 repaired,
                 oauth401CooldownMs: this.config.oauth_401_cooldown_ms,
                 signatureRepair: signatureRepairEnabled(this.config) || attemptMeta?.foreignThinking === true,
               },
               this.scheduler?.accountQuota,
             )
+        if (policy.reason === 'thinking_incompatible' && !result?.committed) {
+          const upstreamMessage = String(result?.body?.error?.message || '').trim()
+          const detail = `thinking.budget_tokens must be at least ${MIN_THINKING_BUDGET} and less than max_tokens (got max_tokens=${requestBody?.max_tokens})`
+          const message = upstreamMessage ? `${upstreamMessage}; ${detail}` : detail
+          result = {
+            ...result,
+            ok: false,
+            status: 400,
+            body: {
+              type: 'error',
+              error: {
+                ...(result?.body?.error || {}),
+                type: 'invalid_request_error',
+                code: 'thinking_incompatible',
+                param: 'max_tokens',
+                message,
+                details: { ...(result?.body?.error?.details || {}), retryable: false },
+              },
+            },
+          }
+        }
         if (
           !pinVmId &&
           selected.accountId &&
@@ -1057,7 +1375,7 @@ export class FailoverRunner {
           this.searchRepairs.delete(repairKey)
           policy = { ...policy, action: 'stop' }
         }
-        // One writer for rate_limit_reset_at / overload_until (sub2api HandleUpstreamError).
+        // The rate limit service is the sole writer of rate_limit_reset_at / overload_until.
         const hardBlock =
           !result?.committed && !pinVmId
             ? this.rateLimitService?.handleUpstreamError?.({
@@ -1075,6 +1393,7 @@ export class FailoverRunner {
         gatewayOutcomeUnknown ||= gatewayRetryDecision(result) === 'outcome-unknown'
         lastPolicy = policy
         this.noteUnitHealth(selected, policy, result)
+        this.noteSilentTimeout(stickyKey, canonicalBody, selected, policy, result)
         if (attemptMeta?.sessionId) {
           bindAll(
             { accountId: selected.accountId, vmId: selected.vmId, sessionId: outboundSessionId },
@@ -1087,7 +1406,10 @@ export class FailoverRunner {
           )
         }
         notifyProxyFailure(this.onProxyFailure, selected, policy)
-        if (policy.reason === 'fable_plan_denied' && typeof this.onFablePlanDenied === 'function') {
+        if (
+          (policy.reason === 'fable_plan_denied' || policy.reason === 'fable_credits_required') &&
+          typeof this.onFablePlanDenied === 'function'
+        ) {
           try {
             this.onFablePlanDenied({ selected, policy })
           } catch {}
@@ -1110,7 +1432,8 @@ export class FailoverRunner {
         if (
           policy.reason === 'content_filter_refusal' ||
           policy.reason === 'usage_policy_refusal' ||
-          policy.reason === 'content_policy_refusal'
+          policy.reason === 'content_policy_refusal' ||
+          policy.reason === 'third_party_client'
         ) {
           this.scheduler.markSuccess(selected, { workerStatus: result.workerStatus || null, countUsage })
           bindAll({ accountId: selected.accountId, vmId: selected.vmId })
@@ -1123,6 +1446,7 @@ export class FailoverRunner {
           }
         }
         if (verifiedSuccess(result)) {
+          this.poisonGuard.recordSuccess(stickyKey, { vmId: selected.vmId, body: canonicalBody })
           if (repairKey && (knownSearchRepair || searchRepair?.key === repairKey)) {
             this.searchRepairs.delete(repairKey)
             while (this.searchRepairs.size >= SEARCH_REPAIR_LIMIT) {
@@ -1144,20 +1468,43 @@ export class FailoverRunner {
           return { ...result, ...attribution(), finalState: 'verified' }
         }
         if (policy.action === 'repair-and-retry' && !repaired && !result?.committed) {
+          let nextBody
+          try {
+            nextBody = repairAnthropicRequest(requestBody, policy)
+          } catch (repairError) {
+            if (repairError?.status === 400 && repairError?.body?.error) {
+              releaseStickySlots()
+              return {
+                ...result,
+                ok: false,
+                status: 400,
+                body: repairError.body,
+                ...attribution(),
+                finalState: 'invalid_request',
+                policy: attachFailureDecision({
+                  scope: 'request',
+                  action: 'stop',
+                  reason: repairError.body.error.code || 'invalid_request',
+                  cooldownUntil: null,
+                }),
+              }
+            }
+            throw repairError
+          }
           repaired = true
           repairPolicy = { action: policy.action, reason: policy.reason }
           repairPending = true
           if (policy.reason === 'search_repairable' && repairKey && fingerprint()) {
             searchRepair = { key: repairKey }
           }
-          requestBody = repairAnthropicRequest(requestBody, policy)
+          requestBody = nextBody
           continue
         }
         applyCooldown(this.scheduler, selected, policy, model, { diagnosticPin: !!pinVmId })
         if (policy.pauseSchedule) this.pauseUnit(selected, policy, result)
         if (!pinVmId && isCredentialDeath(policy)) {
           this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys })
-          if (familyKey) {
+          if (familyKey && (!selected.isSubagent || result.committed)) {
             releaseStickySlots()
             return { ...result, ...attribution(), finalState: result?.terminalState || 'rejected', policy }
           }
@@ -1173,12 +1520,16 @@ export class FailoverRunner {
           this.retireOutboundSession(selected, bindKeys)
           freshSlot = true
         }
+        const refusedHome = homeSlotRefused(selected, policy)
+        if (refusedHome) return refusedHome
         if (budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms)) {
           budget.noteSameUnit(selected.accountId)
-          avoid = new Set([selected.accountId, selected.vmId])
+          avoid = retryOrStay(selected)
           continue
         }
-        budget.noteSwitch(selected.accountId, selected.vmId, { spill: policy.reason === 'slot_busy' })
+        if (waitHomeSlot(selected, policy)) continue
+        if (isHome(selected)) return keptHome()
+        switchUnit(selected, policy)
       } catch (error) {
         if (attemptStarted === undefined) throw error
         const invalidRequest =
@@ -1186,9 +1537,12 @@ export class FailoverRunner {
           [
             'invalid_cache_control',
             'crag_prompt_too_large',
+            'image_too_large',
             'invalid_image_url',
             'invalid_kernel_request',
+            'unsupported_capability',
             'invalid_tool_schema',
+            'thinking_incompatible',
           ].includes(error.body?.error?.code)
         noteHop(invalidRequest ? { upstreamExecutions: 0 } : null)
         if (error?.code === 'response_sent') {
@@ -1273,6 +1627,7 @@ export class FailoverRunner {
         gatewayOutcomeUnknown ||= gatewayRetryDecision(result) === 'outcome-unknown'
         lastPolicy = policy
         this.noteUnitHealth(selected, policy, result)
+        this.noteSilentTimeout(stickyKey, canonicalBody, selected, policy, result)
         notifyProxyFailure(this.onProxyFailure, selected, policy)
         this.attemptsRepo?.complete?.(requestId, attemptNo, {
           upstreamStatus: 0,
@@ -1290,19 +1645,23 @@ export class FailoverRunner {
         applyCooldown(this.scheduler, selected, policy, model, { diagnosticPin: !!pinVmId })
         if (!pinVmId && isCredentialDeath(policy)) {
           this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys })
-          if (familyKey) {
+          if (familyKey && !selected.isSubagent) {
             releaseStickySlots()
             return { ...result, ...attribution(), finalState: result.terminalState, policy }
           }
         }
         policy = await this.recoverCredential(selected, policy)
         const hopMs = Date.now() - attemptStarted
+        const refusedHome = homeSlotRefused(selected, policy)
+        if (refusedHome) return refusedHome
         if (budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms)) {
           budget.noteSameUnit(selected.accountId)
-          avoid = new Set([selected.accountId, selected.vmId])
+          avoid = retryOrStay(selected)
           continue
         }
-        budget.noteSwitch(selected.accountId, selected.vmId, { spill: policy.reason === 'slot_busy' })
+        if (waitHomeSlot(selected, policy)) continue
+        if (isHome(selected)) return keptHome()
+        switchUnit(selected, policy)
       } finally {
         // Setup and attempt share the same permit lifetime.
         selected?.release?.()

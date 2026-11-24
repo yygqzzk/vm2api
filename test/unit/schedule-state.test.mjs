@@ -50,6 +50,7 @@ test('risk-audit and request-level codes never change the slot state', () => {
     'content_filter_refusal',
     'content_policy_refusal',
     'usage_policy_refusal',
+    ErrorCode.THIRD_PARTY_CLIENT,
     'invalid_request',
     'entitlement_required',
     'signature_repairable',
@@ -123,7 +124,7 @@ test('mutators keep the legacy trio in step', () => {
 
   applyScheduleOff(vm, true)
   assert.equal(vm.schedule_manual, true)
-  assert.equal(vm.schedule_disabled_reason, 'disabled')
+  assert.equal(vm.schedule_disabled_reason, 'organization_disabled', '调度关 never renames 不可调度')
   assert.equal(vm.unschedulable.reason, 'organization_disabled')
 
   applyScheduleOff(vm, false)
@@ -192,14 +193,26 @@ test('migration maps every legacy reason and is idempotent', () => {
   )
 })
 
-test('resolveSlotState: off > unschedulable > restricted > on', () => {
+test('resolveSlotState: unschedulable > off > restricted > on', () => {
   const now = 1_000_000
   const offAndBroken = { schedulable: false }
   applyUnschedulable(offAndBroken, 'organization_disabled')
   applyScheduleOff(offAndBroken, true)
   const off = resolveSlotState({ vm: offAndBroken, now })
-  assert.equal(off.schedule_state, 'off')
-  assert.equal(off.unschedulable_reason, 'organization_disabled', 'details keep the error under 调度关')
+  assert.equal(off.schedule_state, 'unschedulable', 'a dead slot must not hide under 调度关')
+  assert.equal(off.unschedulable_reason, 'organization_disabled')
+  assert.equal(offAndBroken.schedule_disabled_reason, 'organization_disabled')
+
+  // Operator turned it off first, then the grant died.
+  const offThenRevoked = { schedulable: true }
+  applyScheduleOff(offThenRevoked, true, { reason: 'seat-exp-20261118' })
+  assert.equal(resolveSlotState({ vm: offThenRevoked, now }).schedule_state, 'off')
+  applyUnschedulable(offThenRevoked, 'oauth_revoked', { refresh_error: 'oauth_revoked' })
+  const revoked = resolveSlotState({ vm: offThenRevoked, now })
+  assert.equal(revoked.schedule_state, 'unschedulable')
+  assert.equal(revoked.unschedulable_text, '凭证吊销')
+  assert.equal(offThenRevoked.schedule_disabled_reason, 'oauth_revoked')
+  assert.equal(offThenRevoked.schedule_off, true, 'operator intent is kept')
 
   const broken = { schedulable: true }
   applyUnschedulable(broken, 'organization_disabled', { status: 403 })
@@ -258,6 +271,50 @@ test('resolveSlotState: off > unschedulable > restricted > on', () => {
   assert.equal(resolveSlotState({ vm: { schedulable: true }, availability: { key: 'ok' } }).schedule_state, 'on')
 })
 
+test('resolveSlotState paints a spent kernel-recovery budget as 受限 · 内核故障', () => {
+  const now = Date.now()
+  const fault = resolveSlotState({
+    vm: { schedulable: true, status: 'running' },
+    availability: { key: 'ok', accept: true },
+    kernelFaulted: true,
+    now,
+  })
+  assert.equal(fault.schedule_state, 'restricted')
+  assert.equal(fault.restriction_reason, 'kernel_faulted')
+  assert.equal(fault.restriction_text, '内核故障')
+  assert.equal(fault.restriction_until, null, 'no wall-clock promise: the watchdog clears it by itself')
+  // Stronger verdicts keep their own reason.
+  const revoked = resolveSlotState({
+    vm: { schedulable: true, status: 'running', unschedulable: { reason: 'oauth_revoked', detail: null, at: now } },
+    availability: { key: 'ok' },
+    kernelFaulted: true,
+    now,
+  })
+  assert.equal(revoked.schedule_state, 'unschedulable')
+  assert.equal(revoked.unschedulable_reason, 'oauth_revoked')
+  const off = resolveSlotState({
+    vm: { schedulable: true, status: 'running', schedule_off: true },
+    availability: { key: 'ok' },
+    kernelFaulted: true,
+    now,
+  })
+  assert.equal(off.schedule_state, 'off', 'operator intent is kept; the fault only matters while scheduling')
+  // Seats still outrank the fault in the new_session band.
+  const seats = resolveSlotState({
+    vm: { schedulable: true, status: 'running' },
+    availability: { key: 'ok' },
+    kernelFaulted: true,
+    seats: { used: 4, max: 4 },
+    now,
+  })
+  assert.equal(seats.schedule_state, 'restricted')
+  assert.equal(
+    seats.restriction_reason,
+    'kernel_faulted',
+    'the kernel fault is the stronger verdict: seated or not, the CLI is down',
+  )
+})
+
 test('resolveSlotState does not call a down slot 调度开', () => {
   const stopped = resolveSlotState({
     vm: { schedulable: true, status: 'stopped' },
@@ -303,4 +360,33 @@ test('host memory pressure stays on the host, not on each slot', async (t) => {
   // Admission already filters by host memory in pool-scheduler; the slot row must not inherit it.
   assert.equal(resolveSlotState({ vm: { schedulable: true } }).schedule_state, 'on')
   assert.equal(resolveSlotState({ vm: { schedulable: true, node_id: 'node-a' } }).schedule_state, 'on')
+})
+
+test('a proxy hold left by a proxy the slot no longer uses says so (#1395)', () => {
+  const held = (tag, proxyId, message = 'proxy_probe_failed:proxy_auth_failed') => ({
+    id: 'vm-01',
+    status: 'running',
+    schedulable: false,
+    proxy: proxyId ? { id: proxyId } : null,
+    schedule_hold: { reason: 'proxy_cooldown', detail: { tag, message }, at: '2026-11-20T00:00:00.000Z' },
+  })
+  const textOf = (vm) => resolveSlotState({ vm, availability: { key: 'off' } }).restriction_text
+
+  // Re-binding and a probe each reconcile an automatic hold away, so a tag that
+  // is not the current exit means no automatic path will lift this one: a manual
+  // disable, or a message the reconcile does not recognise. Blaming "代理异常"
+  // there points the operator at an exit that is fine.
+  assert.equal(textOf(held('px-old', 'px-new', 'proxy_manually_disabled')), '历史代理遗留')
+  assert.equal(textOf(held('px-old', 'px-new', 'something_else')), '历史代理遗留')
+
+  // The current exit, an untagged legacy hold, and a slot with no exit are all
+  // still just a proxy fault.
+  assert.equal(textOf(held('px-new', 'px-new')), '代理异常')
+  assert.equal(textOf(held('', 'px-new')), '代理异常')
+  assert.equal(textOf(held('px-old', null)), '代理异常')
+
+  // Another subsystem's hold is untouched.
+  const maint = held('px-old', 'px-new')
+  maint.schedule_hold.reason = 'maintenance'
+  assert.equal(textOf(maint), '维护中')
 })

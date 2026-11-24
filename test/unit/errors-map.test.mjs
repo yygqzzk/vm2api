@@ -7,6 +7,7 @@ import {
   retryAfterSeconds,
   isWrapConnectionError,
   isUsagePolicyErrorMessage,
+  isThirdPartyClientMessage,
   isUnanswerablePromptMessage,
   makeRefusalGuardError,
   isAssistantMessageBody,
@@ -303,11 +304,14 @@ test('Claude Code AUP API Error is a non-retryable 400 policy rejection, not a l
   }
 })
 
-test('third-party extra-usage 400 and 503 are non-retryable refusals, not invalid requests', () => {
+test('third-party extra-usage 400 and 503 are non-retryable third_party_client errors, not refusals', () => {
   const msg =
     'HTTP 400: Third-party apps now draw from your extra usage, not your plan limits. Claim it at claude.ai/settings/usage.'
   assert.equal(isUsagePolicyErrorMessage(msg), false)
-  assert.equal(isUnanswerablePromptMessage(msg), true)
+  assert.equal(isUnanswerablePromptMessage(msg), false)
+  assert.equal(isThirdPartyClientMessage(msg), true)
+  assert.equal(isThirdPartyClientMessage('400 no third-party apps allowed on subscription'), true)
+  assert.equal(isThirdPartyClientMessage('Extra usage required for this model'), false)
   assert.equal(isUnanswerablePromptMessage('Extra usage required for this model'), false)
   for (const status of [400, 503]) {
     const mapped = mapUpstreamError(status, {
@@ -315,10 +319,14 @@ test('third-party extra-usage 400 and 503 are non-retryable refusals, not invali
       error: { type: 'invalid_request_error', code: 'upstream_invalid_request', message: msg },
     })
     assert.equal(mapped.status, 400)
-    assert.equal(mapped.body.error.code, 'refusal_guard')
-    assert.equal(mapped.body.error.type, 'policy_blocked')
+    assert.equal(mapped.body.error.code, 'third_party_client')
+    assert.equal(mapped.body.error.type, 'invalid_request_error')
     assert.equal(mapped.body.error.details.retryable, false)
-    assert.notEqual(mapped.body.error.code, 'upstream_invalid_request')
+    assert.equal(mapped.body.error.details.upstream_status, status)
+    assert.match(mapped.body.error.details.upstream_message, /Third-party apps now draw from/)
+    assert.match(mapped.body.error.message, /第三方客户端/)
+    assert.doesNotMatch(mapped.body.error.message, /改用|换用|渠道/)
+    assert.doesNotMatch(mapped.body.error.message, /usage policy/i)
   }
 })
 
@@ -357,6 +365,26 @@ test('kernel slot_busy on the last hop is pool capacity: 529 with Retry-After', 
   assert.ok(mapped.retryAfterSec >= 1)
 })
 
+test('managed CRAG queue rejections stay 529 but name the local kernel queue (#1213)', () => {
+  for (const [message, reason] of [
+    ['runtime queue timeout', 'runtime_queue_timeout'],
+    ['runtime queue is full', 'runtime_queue_full'],
+  ]) {
+    const mapped = mapUpstreamError(504, {
+      type: 'error',
+      error: { type: 'timeout_error', code: 'slot_busy', message },
+    })
+    assert.equal(mapped.status, 529)
+    assert.equal(mapped.body.error.code, 'pool_overloaded')
+    assert.deepEqual(mapped.body.error.details, { source: 'local_kernel_queue', reason })
+  }
+  const plain = mapUpstreamError(503, {
+    type: 'error',
+    error: { type: 'worker_error', code: 'slot_busy', message: 'rust kernel has no free slot' },
+  })
+  assert.equal(plain.body.error.details, undefined)
+})
+
 test('upstream 429 / 529 hand their Retry-After to the client; 529 always has one', () => {
   const limited = mapUpstreamError(
     429,
@@ -384,6 +412,104 @@ test('tool continuation conflicts and expiry retain their native client status',
   }
 })
 
+test('a terminal upstream verdict survives the relay so clients stop retrying (#1215)', () => {
+  // respond.mjs turns `details.retryable === false` into `x-should-retry: false`.
+  // The relay used to rebuild `details` from scratch, so the kernel's own verdict
+  // never reached the client and SDKs retried an expired continuation for hours.
+  const flagged = mapUpstreamError(410, {
+    error: {
+      type: 'invalid_request_error',
+      code: 'tool_turn_expired',
+      message: 'tool turn expired',
+      details: { retryable: false },
+    },
+  })
+  assert.equal(flagged.status, 410)
+  assert.equal(flagged.body.error.details.retryable, false)
+  assert.equal(flagged.body.error.details.upstream_status, 410)
+
+  // 410 Gone is terminal on its own: a continuation the kernel reports as gone
+  // never comes back, so the hint holds even when the body omits the flag.
+  for (const body of [
+    { error: { type: 'invalid_request_error', message: 'MCP continuation is no longer available' } },
+    { error: { message: 'MCP continuation is no longer available' } },
+  ]) {
+    const bare = mapUpstreamError(410, body)
+    assert.equal(bare.status, 410)
+    assert.equal(bare.body.error.details.retryable, false)
+  }
+
+  // A 409 conflict is not declared terminal by the panel, but an explicit
+  // upstream flag on one is still carried through.
+  const conflict = mapUpstreamError(409, { error: { type: 'invalid_request_error', message: 'tool_result replayed' } })
+  assert.equal(conflict.status, 409)
+  assert.equal(conflict.body.error.details.retryable, undefined)
+  const flaggedConflict = mapUpstreamError(409, {
+    error: { type: 'invalid_request_error', message: 'tool_result replayed', details: { retryable: false } },
+  })
+  assert.equal(flaggedConflict.body.error.details.retryable, false)
+
+  // The one 409 that is terminal on its own: CRAG says this submission's partial
+  // output cannot be replayed. The type alone carries the verdict, so the hint
+  // holds without a message or an explicit flag (#1518).
+  for (const body of [
+    {
+      error: {
+        type: 'partial_provider_output_nonretryable',
+        message: 'Provider output for this continuation was interrupted and cannot be replayed.',
+      },
+    },
+    { error: { type: 'partial_provider_output_nonretryable' } },
+  ]) {
+    const nonretryable = mapUpstreamError(409, body)
+    assert.equal(nonretryable.status, 409)
+    assert.equal(nonretryable.body.error.details.retryable, false)
+  }
+
+  // Safe diagnostic metadata from CRAG's partial-continuation 409 is preserved
+  // while unknown/nested fields are dropped and retryable stays false.
+  const detailedPartial = mapUpstreamError(409, {
+    error: {
+      type: 'partial_provider_output_nonretryable',
+      message:
+        'Provider output for this continuation was interrupted and cannot be replayed immediately. Wait 20s before retrying.',
+      details: {
+        retryable: true,
+        prior_reason: 'client_cancelled',
+        interrupted_at: 1795495209,
+        retry_after_sec: 20,
+        recovery_attempts: 1,
+        max_recoveries: 2,
+        recovery_exhausted: false,
+        internal_secret: 'must_not_leak',
+        nested: { nope: true },
+      },
+    },
+  })
+  assert.equal(detailedPartial.status, 409)
+  assert.equal(detailedPartial.body.error.details.retryable, false)
+  assert.equal(detailedPartial.body.error.details.prior_reason, 'client_cancelled')
+  assert.equal(detailedPartial.body.error.details.interrupted_at, 1795495209)
+  assert.equal(detailedPartial.body.error.details.retry_after_sec, 20)
+  assert.equal(detailedPartial.body.error.details.recovery_attempts, 1)
+  assert.equal(detailedPartial.body.error.details.max_recoveries, 2)
+  assert.equal(detailedPartial.body.error.details.recovery_exhausted, false)
+  assert.equal(detailedPartial.body.error.details.internal_secret, undefined)
+  assert.equal(detailedPartial.body.error.details.nested, undefined)
+
+  // Capacity errors keep the panel's own Retry-After policy: a client must still
+  // retry a 429/529, so no terminal hint is attached there.
+  const limited = mapUpstreamError(429, {
+    error: { type: 'rate_limit_error', message: 'slow down', details: { retryable: false } },
+  })
+  assert.equal(limited.status, 429)
+  assert.equal(limited.body.error.details.retryable, undefined)
+  const overloaded = mapUpstreamError(529, {
+    error: { type: 'overloaded_error', message: 'busy', details: { retryable: false } },
+  })
+  assert.equal(overloaded.body.error.details.retryable, undefined)
+})
+
 test('retryAfterSeconds reads delta seconds and HTTP dates', () => {
   const now = Date.parse('2026-10-06T00:00:00Z')
   assert.equal(retryAfterSeconds('2.2', now), 3)
@@ -401,6 +527,15 @@ test('pool-wide cooldowns: 529 overload cooldown is capacity, 429 cooldown is a 
   assert.equal(limited.status, 429)
   assert.equal(limited.body.error.type, 'rate_limit_error')
   assert.equal(limited.body.error.code, 'upstream_rate_limit')
+  assert.ok(limited.retryAfterSec >= 1)
+})
+
+test('Fable pool quota keeps its 429 and model-specific message at the client boundary', () => {
+  const limited = rewritePoolErrorForClient(null, { error: { code: 'pool_fable_rate_limited' } })
+  assert.equal(limited.status, 429)
+  assert.equal(limited.body.error.type, 'rate_limit_error')
+  assert.equal(limited.body.error.code, 'upstream_rate_limit')
+  assert.match(limited.body.error.message, /Fable/)
   assert.ok(limited.retryAfterSec >= 1)
 })
 

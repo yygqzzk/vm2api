@@ -4,7 +4,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { describeKernelCatalog, reserveKernelInstallCache } from '../admin/kernel-catalog.mjs'
 import { isCragPayloadTag } from '../admin/release-kernel.mjs'
 import { isReleaseTag } from '../admin/release.mjs'
-import { writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
+import { cancelRustKernelStart, writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
 import {
   applyHold,
   applyClearHold,
@@ -26,6 +26,8 @@ import { resolveKernelDataplane } from './slot-engine.mjs'
 import { withCragRuntimeAdmission } from './slot-runtime-admission.mjs'
 import { inspectInstalledCragEntry, officialCcUidGid, suspendVmRuntimeRestart } from './vm-runtime.mjs'
 import {
+  cragSlotArch,
+  cragV2PackageRoot,
   installedCragV2Root,
   materializeResolvedKernel,
   stageCragV2Tree,
@@ -37,7 +39,7 @@ import { pushKernelSelection } from '../cluster/remote-slot-files.mjs'
 import { accountIdOf } from '../pool/pool-scheduler.mjs'
 import { unitCircuit } from '../pool/unit-circuit.mjs'
 import { clearRustHealthCache } from '../transport/kernel-router.mjs'
-import { rustKernelHealth, rustKernelProcessUp } from '../transport/rust-kernel-client.mjs'
+import { rustKernelHealth, rustKernelReachable } from '../transport/rust-kernel-client.mjs'
 
 const PRODUCTS = new Set(['cli-node', 'crag'])
 const INTERRUPTED_COMMAND =
@@ -134,7 +136,8 @@ function manifestDigest(root) {
 function prepareCragRollback(projectRoot, vm, routing, licenseCheck) {
   const dest = installedCragV2Root(projectRoot, vm)
   if (!dest && vm.kernel_installation?.kernel !== 'crag') return null
-  const verified = dest && verifyCragV2Tree(dest, { allowPreviousClaude: true })
+  const slotArch = cragSlotArch(projectRoot, vm)
+  const verified = dest && verifyCragV2Tree(dest, { arch: slotArch, allowPreviousClaude: true })
   const grant = licenseCheck(projectRoot, vm, routing, { preferInstalled: true })
   if (!verified?.ok || !grant.ok || !inspectInstalledCragEntry(projectRoot, vm).ok) {
     throw Object.assign(new Error('Previous CRAG payload is not a verified rollback source'), {
@@ -151,7 +154,7 @@ function prepareCragRollback(projectRoot, vm, routing, licenseCheck) {
       fs.mkdirSync(path.dirname(out), { recursive: true })
       fs.copyFileSync(path.join(dest, rel), out)
     }
-    if (manifestDigest(pkg) !== digest || !verifyCragV2Tree(pkg).ok) {
+    if (manifestDigest(pkg) !== digest || !verifyCragV2Tree(pkg, { arch: slotArch }).ok) {
       throw Object.assign(new Error('CRAG rollback copy failed verification'), { code: 'crag_rollback_unverified' })
     }
     return { backup, pkg, dest, digest }
@@ -170,8 +173,10 @@ async function restoreCragRollback({ projectRoot, vm, rollback, routing, ops, bo
     const policy = await (ops.suspendVmRuntimeRestart || suspendVmRuntimeRestart)(current)
     if (!policy?.ok) return null
   }
-  if (!verifyCragV2Tree(rollback.pkg).ok || manifestDigest(rollback.pkg) !== rollback.digest) return null
-  const tree = stageCragV2Tree(rollback.pkg, rollback.dest)
+  const slotArch = cragSlotArch(projectRoot, vm)
+  if (!verifyCragV2Tree(rollback.pkg, { arch: slotArch }).ok || manifestDigest(rollback.pkg) !== rollback.digest)
+    return null
+  const tree = stageCragV2Tree(rollback.pkg, rollback.dest, { arch: slotArch })
   if (!tree.ok) return null
   tree.commit()
   const checked = (ops.checkCragLicense || checkCragLicense)(projectRoot, vm, routing, { preferInstalled: true })
@@ -200,11 +205,8 @@ async function restoreCragRollback({ projectRoot, vm, rollback, routing, ops, bo
       const health = await (ops.rustKernelHealth || rustKernelHealth)(exec, { requireInternalToken: true })
       if (
         health?.internalTokenAuthenticated === true &&
-        rustKernelProcessUp(health) &&
-        health.healthy !== false &&
-        health.license_valid !== false &&
-        health.recovering !== true &&
-        Number(health.cli_pid) > 0
+        rustKernelReachable(health) &&
+        (health.execution_mode === 'v2_process_pool' || Number(health.cli_pid) > 0)
       ) {
         const running = patchVmRecord(projectRoot, vm.id, (record) => markRunning(record, boot, projectRoot))
         if (running) return running
@@ -304,6 +306,34 @@ export function validateKernelTargets(projectRoot, targets) {
   return { ok: true }
 }
 
+const CANCELLED = 'kernel_install_cancelled'
+/** vmId → in-flight install, so an operator can abandon one without waiting on it. */
+const activeInstalls = new Map()
+
+/**
+ * Force-cancel one VM's install. Frees the kernel cache reservation at once so other
+ * VMs can install, aborts a pending kernel start, and stops the installer at its next
+ * checkpoint. A slot already stopped is left stopped under maintenance for review.
+ */
+export function cancelKernelInstall(vmId) {
+  const active = activeInstalls.get(String(vmId || ''))
+  if (!active) return { ok: false, code: 'kernel_install_not_running', error: '该虚拟机没有进行中的安装' }
+  active.control.cancelled = true
+  active.releaseCache?.()
+  cancelRustKernelStart(vmId)
+  return { ok: true, id: vmId, kernel: active.kernel, phase: active.phase() }
+}
+
+export function listActiveKernelInstalls() {
+  return [...activeInstalls.entries()].map(([id, active]) => ({
+    id,
+    kernel: active.kernel,
+    phase: active.phase(),
+    started_at: active.started_at,
+    cancelled: active.control.cancelled,
+  }))
+}
+
 /** Installation owns stop, replacement and verified restart under one record lock. */
 export async function installKernelTargets({
   projectRoot,
@@ -337,11 +367,22 @@ export async function installKernelTargets({
         let operationId = null
         let operationPersisted = false
         let interrupted = false
+        let bootFailure = null
         let clusterVm = false
         let rollback
         let releaseCache
         const inheritedSafetyHold = !!watchdog && safetyHolds.get(file) === watchdog
         let phase = 'kernel_preflight_failed'
+        const control = { cancelled: false }
+        const active = {
+          control,
+          kernel: target.kernel,
+          started_at: new Date().toISOString(),
+          phase: () => phase,
+          releaseCache: null,
+        }
+        activeInstalls.set(target.id, active)
+        const cancelled = () => (control.cancelled ? failure(target, CANCELLED, '安装已被强制取消', stopped) : null)
         try {
           // Hold inside the VM lock: another installer cannot release this hold early.
           // Drain a watchdog restart already past admission before touching the slot.
@@ -361,18 +402,61 @@ export async function installKernelTargets({
           }
           const unsupported = placementFailure(vm, target.kernel)
           if (unsupported) return failure(target, unsupported.code, unsupported.error)
+          const updateExisting = target.update_existing === true
+          if (
+            updateExisting &&
+            (target.kernel !== 'crag' ||
+              (!target.expected_tag && !target.payload_tag) ||
+              resolveKernelDataplane(vm, routing) !== 'crag' ||
+              !['running', 'stopped'].includes(vm.status))
+          ) {
+            return failure(target, 'crag_update_target_changed', '槽位不再是可更新的 CRAG 槽，请核对当前状态')
+          }
+          const keepStopped =
+            updateExisting && (resumeId ? vm.kernel_operation.keep_stopped === true : vm.status === 'stopped')
           if (target.expected_tag || target.payload_tag) {
             releaseCache = reserveKernelInstallCache(projectRoot, target.kernel)
             if (!releaseCache) {
               interrupted = Boolean(resumeId)
-              return failure(target, 'kernel_pull_busy', '正在重装同类内核，请稍后重试')
+              return failure(target, 'kernel_pull_busy', '正在重装同类内核，请稍后重试或强制取消进行中的安装')
             }
+            active.releaseCache = releaseCache
           }
           const desired = desiredVm(vm, target.kernel)
           const catalog = (ops.describeKernelCatalog || describeKernelCatalog)(projectRoot)
           const product = catalog.find((item) => item.id === target.kernel)
           if (!product?.ready)
             return failure(target, product?.code || 'kernel_package_missing', product?.error || '请先拉取所选内核')
+          if (target.kernel === 'crag' && !ops.describeKernelCatalog) {
+            const slotArch = cragSlotArch(projectRoot, desired)
+            let slotRoot = ''
+            try {
+              slotRoot = cragV2PackageRoot(projectRoot, slotArch)
+            } catch (error) {
+              return failure(target, error.code || 'kernel_cache_invalid', error.message || '内核缓存选择无效')
+            }
+            if (!slotRoot) {
+              let hasAmd64 = false
+              if (slotArch !== 'amd64') {
+                try {
+                  hasAmd64 = Boolean(cragV2PackageRoot(projectRoot, 'amd64'))
+                } catch {}
+              }
+              return failure(
+                target,
+                hasAmd64 ? 'crag_v2_arch_mismatch' : 'crag_v2_package_missing',
+                hasAmd64 ? '当前发行包仅支持 amd64' : '请先拉取所选内核',
+              )
+            }
+            const verifiedSlot = verifyCragV2Tree(slotRoot, { arch: slotArch })
+            if (!verifiedSlot.ok) {
+              return failure(
+                target,
+                verifiedSlot.code,
+                verifiedSlot.code === 'crag_v2_arch_mismatch' ? '当前发行包仅支持 amd64' : verifiedSlot.error,
+              )
+            }
+          }
           if (isKvmRuntime(vm) && target.kernel !== 'crag') {
             const crag = catalog.find((item) => item.id === 'crag')
             if (!crag?.ready)
@@ -397,7 +481,8 @@ export async function installKernelTargets({
           const checkTargetLicense = () => licenseCheck(projectRoot, desired, routing, { preferInstalled: false })
           const grant = target.kernel === 'crag' ? checkTargetLicense() : null
           const canAuthorizeInstall = (check) =>
-            ['license_required', 'license_crag_host_over_quota', 'license_binding_mismatch'].includes(check?.code) &&
+            (['license_required', 'license_crag_host_over_quota', 'license_binding_mismatch'].includes(check?.code) ||
+              (check?.code === 'license_payload_key_mismatch' && target.reissue === true)) &&
             !!(target.expected_tag || target.payload_tag) &&
             !resumeId &&
             typeof cragSubscription?.authorizeInstall === 'function'
@@ -422,6 +507,7 @@ export async function installKernelTargets({
                 kernel: target.kernel,
                 ...(target.expected_tag ? { expected_tag: target.expected_tag } : {}),
                 ...(target.payload_tag ? { payload_tag: target.payload_tag } : {}),
+                ...(updateExisting ? { update_existing: true, keep_stopped: keepStopped } : {}),
                 phase: 'pending',
                 recovery_attempts: resumeId ? (previous.recovery_attempts || 0) + 1 : 0,
                 previous_hold: previous ? previous.previous_hold : record.schedule_hold || null,
@@ -433,7 +519,25 @@ export async function installKernelTargets({
             operationPersisted = true
             phase = 'kernel_drain_failed'
             const drained = await waitForSlotDrain(poolScheduler, [target.id])
+            if (cancelled()) return cancelled()
             if (!drained.ok) return failure(target, phase, '在途请求未结束，未重启内核')
+            if (updateExisting && vm.status === 'running') {
+              // Never fall back to a local worker socket for a node slot.
+              const health =
+                !clusterVm || vm.runtime?.kernel_socket
+                  ? await (ops.rustKernelHealth || rustKernelHealth)(slotExec(projectRoot, vm), { timeoutMs: 3000 })
+                  : null
+              if (
+                health?.healthy !== true ||
+                health.runtime_variant !== 'crag-v2' ||
+                health.license_valid !== true ||
+                health.active_requests !== 0 ||
+                health.continuations !== 0 ||
+                health.queued !== 0
+              ) {
+                return failure(target, 'crag_slot_not_idle', 'CRAG 未确认空闲，未重启内核')
+              }
+            }
 
             const currentProduct = () =>
               (ops.describeKernelCatalog || describeKernelCatalog)(projectRoot).find(
@@ -458,7 +562,10 @@ export async function installKernelTargets({
             if (pendingGrant && !pendingGrant.ok) {
               if (!canAuthorizeInstall(pendingGrant)) return installLicenseFailure(target, pendingGrant)
               try {
-                await cragSubscription.authorizeInstall(desired)
+                // The panel already authorized this intent (`mayBindSubscription`);
+                // without passing it on, migrating a slot that holds an old grant
+                // is unreachable.
+                await cragSubscription.authorizeInstall(desired, { allowLegacyReissue: target.reissue === true })
               } catch (error) {
                 const code = error?.code || 'crag_subscription_install_failed'
                 const messages = {
@@ -494,6 +601,7 @@ export async function installKernelTargets({
                 })
               }
             }
+            if (cancelled()) return cancelled()
             phase = 'kernel_stop_failed'
             const halt = await (ops.stopSlot || stopSlot)(vm)
             if (!halt?.ok) {
@@ -511,7 +619,10 @@ export async function installKernelTargets({
             if (!halted) return failure(target, 'vm_not_found', '虚拟机记录已移除', true)
             stoppedPersisted = true
             phase = 'kernel_restart_policy_failed'
-            const policy = await (ops.suspendVmRuntimeRestart || suspendVmRuntimeRestart)(halted)
+            // The node's stop operation already disables restart on its own daemon.
+            const policy = clusterVm
+              ? { ok: true }
+              : await (ops.suspendVmRuntimeRestart || suspendVmRuntimeRestart)(halted)
             if (!policy?.ok)
               return failure(target, policy?.code || phase, policy?.error || '无法关闭容器自动重启', true)
             restartSuspended = true
@@ -561,7 +672,11 @@ export async function installKernelTargets({
               return failure(target, laid?.code || phase, laid?.error || '内核文件安装失败', true)
             }
             phase = 'kernel_seed_failed'
-            await (ops.initializeSlotSeedFiles || initializeSlotSeedFiles)(projectRoot, candidate, slotHost(candidate))
+            const candidateHost = slotHost(candidate)
+            await (ops.initializeSlotSeedFiles || initializeSlotSeedFiles)(projectRoot, candidate, candidateHost, {
+              routing,
+              cragNativeTelemetry: target.kernel === 'crag' && !candidateHost?.native,
+            })
             phase = 'kernel_config_failed'
             const config = (ops.writeKernelConfig || writeKernelConfig)(projectRoot, candidate, {
               routing,
@@ -572,9 +687,11 @@ export async function installKernelTargets({
             if (target.kernel === 'crag' && !baked) prepareNativeDirectories(config.runDir, owner)
             phase = 'kernel_selection_persist_failed'
             const saved = patchVmRecord(projectRoot, target.id, (record) => {
-              record.dataplane = candidate.dataplane
-              if (target.kernel === 'crag') record.crag_kernel_version = 'v2'
-              else delete record.crag_kernel_version
+              if (!updateExisting) {
+                record.dataplane = candidate.dataplane
+                if (target.kernel === 'crag') record.crag_kernel_version = 'v2'
+                else delete record.crag_kernel_version
+              }
               record.kernel_installation = {
                 kernel: target.kernel,
                 version: installedProduct.version ?? null,
@@ -583,6 +700,21 @@ export async function installKernelTargets({
               }
             })
             if (!saved) return failure(target, 'vm_not_found', '虚拟机记录已移除', true)
+            if (cancelled()) return cancelled()
+            if (keepStopped) {
+              patchVmRecord(projectRoot, target.id, clearInstallHold)
+              installed = true
+              return {
+                id: target.id,
+                kernel: target.kernel,
+                ok: true,
+                stopped: true,
+                restarted: false,
+                status: 'stopped',
+                version: installedProduct.version ?? null,
+                ...(installedProduct.payload_tag ? { payload_tag: installedProduct.payload_tag } : {}),
+              }
+            }
             phase = 'kernel_start_failed'
             bootAttempted = true
             const boot = await (ops.startSlotReady || startSlotReady)(saved, projectRoot, {
@@ -592,9 +724,18 @@ export async function installKernelTargets({
                 ...(!baked && { useInstalledCrag: true }),
               }),
             })
+            if (cancelled()) return cancelled()
             if (!healthy(boot) || (target.kernel === 'crag' && boot.rust?.skipped === true)) {
               interrupted = baked && INTERRUPTED_COMMAND.test(boot?.code || '')
-              return failure(target, boot?.code || phase, boot?.error || '内核重启或健康检查失败', true)
+              // A healthy container with a failed kernel carries its cause on boot.rust;
+              // keep it instead of collapsing every start failure into the generic phase.
+              bootFailure = {
+                code: boot?.code || boot?.rust?.code || phase,
+                error: boot?.error || boot?.rust?.error || '内核重启或健康检查失败',
+                reason: boot?.rust?.rust?.reason || boot?.rust?.reason || null,
+                at: new Date().toISOString(),
+              }
+              return failure(target, bootFailure.code, bootFailure.error, true)
             }
             phase = 'kernel_running_persist_failed'
             const running = patchVmRecord(projectRoot, target.id, (record) => markRunning(record, boot, projectRoot))
@@ -647,7 +788,9 @@ export async function installKernelTargets({
             if (thrown) throw thrown
             return result
           }
-          const result = await withCragRuntimeAdmission(desired, projectRoot, { routing, install: true }, run)
+          const result = keepStopped
+            ? await run()
+            : await withCragRuntimeAdmission(desired, projectRoot, { routing, install: true }, run)
           return result.id === target.id
             ? result
             : failure(
@@ -667,7 +810,9 @@ export async function installKernelTargets({
             stopped,
           )
         } finally {
+          if (activeInstalls.get(target.id) === active) activeInstalls.delete(target.id)
           releaseCache?.()
+          if (control.cancelled) phase = CANCELLED
           if (rollback && !stopped) {
             try {
               fs.rmSync(rollback.backup, { recursive: true, force: true })
@@ -682,6 +827,7 @@ export async function installKernelTargets({
                 if (record.kernel_operation?.id !== operationId) return
                 record.kernel_operation.phase = interrupted ? 'pending' : 'failed'
                 record.kernel_operation.code = phase
+                if (bootFailure) record.kernel_operation.failure = bootFailure
                 if (!stopped && !interrupted) clearInstallHold(record)
               })
             } catch {
@@ -741,6 +887,7 @@ export async function resumePendingKernelInstalls({
           kernel: pending.kernel,
           ...(pending.expected_tag ? { expected_tag: pending.expected_tag } : {}),
           ...(pending.payload_tag ? { payload_tag: pending.payload_tag } : {}),
+          ...(pending.update_existing ? { update_existing: true } : {}),
         },
       ],
       routing,

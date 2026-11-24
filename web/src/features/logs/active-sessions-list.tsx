@@ -36,11 +36,7 @@ function SessionListItem({
     <button
       type='button'
       onClick={() => onSelect(session.sessionId)}
-      title={
-        session.clientSessionId && session.clientSessionId !== session.sessionId
-          ? `出站 ${session.sessionId}\n客户端 ${session.clientSessionId}\n点击按此 Session 筛选日志`
-          : `出站 ${session.sessionId}\n点击按此 Session 筛选日志`
-      }
+      title={`Session ${session.sessionId}\n点击按此 Session 筛选日志`}
       className='group block w-full rounded-md px-3 py-2 text-left transition-colors hover:bg-muted/50'
     >
       <div className='flex items-center gap-2 text-sm'>
@@ -92,6 +88,11 @@ function SessionListItem({
           <span className='text-muted-foreground'>
             {session.requests} 次 · {formatTokenAmount(session.totalTokens)}
           </span>
+          {session.oneOff ? (
+            <span className='rounded bg-muted px-1 text-[10px] text-muted-foreground'>
+              一次性
+            </span>
+          ) : null}
           {session.totalCost > 0 ? (
             <span className='font-medium'>
               {formatCurrency(session.totalCost, 4)}
@@ -123,7 +124,9 @@ export function ActiveSessionsList({
           <Activity className='h-4 w-4 text-primary' />
           <h3 className='text-sm font-semibold'>活跃 Session</h3>
           <span className='text-xs text-muted-foreground'>
-            {data?.total ?? 0} 个 Session，{data?.minutes ?? 5} 分钟内
+            {(data?.total ?? 0) - (data?.oneOffTotal ?? 0)} 个 Session
+            {data?.oneOffTotal ? ` + ${data.oneOffTotal} 个一次性` : ''}，
+            {data?.minutes ?? 5} 分钟内
           </span>
         </div>
       </div>

@@ -3,7 +3,14 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { runtimeFileOwner } from '../oauth/oauth-credentials.mjs'
 import { resolveKernelDataplane } from './slot-engine.mjs'
-import { cragV2PackageRoot, installedCragV2Root, matchesCragIssuer, verifyCragV2Tree } from './wrap-cli-runtime.mjs'
+import {
+  cragSlotArch,
+  cragTargetArch,
+  cragV2PackageRoot,
+  installedCragV2Root,
+  matchesCragIssuer,
+  verifyCragV2Tree,
+} from './wrap-cli-runtime.mjs'
 import { workerPaths } from '../transport/go-worker-client.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 import { getVm, listVms } from './vm-registry.mjs'
@@ -55,7 +62,7 @@ const packageTrustCache = new Map()
 // public key and ids, so keep the bound well above any realistic host.
 const MAX_TRUST_ROOTS = 512
 const redeemingSlots = new Set()
-const DEVICE_ACTIVATION_URL = 'https://crag.fkcodex.com/v1/device-activation'
+const DEVICE_ACTIVATION_URL = 'https://www.vm2api.org/v1/device-activation'
 
 export class CragLicenseError extends Error {
   constructor(code, status = 403) {
@@ -395,9 +402,10 @@ function packageFingerprint(root) {
 }
 
 function trust(projectRoot, installedRoot, arch) {
+  const resolvedArch = arch || cragTargetArch(projectRoot)
   let canonicalRoot
   try {
-    const root = installedRoot ?? cragV2PackageRoot(projectRoot, arch)
+    const root = installedRoot ?? cragV2PackageRoot(projectRoot, resolvedArch)
     if (!root || fs.lstatSync(root).isSymbolicLink()) fail('license_unconfigured')
     canonicalRoot = fs.realpathSync(root)
     // Complete membership includes manifest, public key, ciphertext, bootstrap,
@@ -405,18 +413,21 @@ function trust(projectRoot, installedRoot, arch) {
     const fingerprint = packageFingerprint(canonicalRoot)
     const cached = packageTrustCache.get(canonicalRoot)
     const useInstalled = Boolean(installedRoot)
-    if (cached?.fingerprint === fingerprint && cached.useInstalled === useInstalled) {
-      if (useInstalled && !matchesCragIssuer(projectRoot, cached.authority.issuerId, cached.pem))
+    if (cached?.fingerprint === fingerprint && cached.useInstalled === useInstalled && cached.arch === resolvedArch) {
+      if (useInstalled && !matchesCragIssuer(projectRoot, cached.authority.issuerId, cached.pem, resolvedArch))
         fail('license_unconfigured')
       packageTrustCache.delete(canonicalRoot)
       packageTrustCache.set(canonicalRoot, cached)
       return cached.authority
     }
     packageTrustCache.delete(canonicalRoot)
-    const verified = verifyCragV2Tree(canonicalRoot, { arch, allowPreviousClaude: useInstalled })
+    const verified = verifyCragV2Tree(canonicalRoot, { arch: resolvedArch, allowPreviousClaude: useInstalled })
     if (!verified.ok) fail('license_unconfigured')
     const pem = fs.readFileSync(path.join(canonicalRoot, 'crag-license-public.pem'))
-    if (useInstalled && !matchesCragIssuer(projectRoot, verified.manifest.authorization.public_key_id, pem))
+    if (
+      useInstalled &&
+      !matchesCragIssuer(projectRoot, verified.manifest.authorization.public_key_id, pem, resolvedArch)
+    )
       fail('license_unconfigured')
     const authority = {
       publicKey: crypto.createPublicKey(pem),
@@ -425,7 +436,7 @@ function trust(projectRoot, installedRoot, arch) {
     }
     // A package changed during verification must not publish a mixed snapshot.
     if (packageFingerprint(canonicalRoot) !== fingerprint) fail('license_unconfigured')
-    packageTrustCache.set(canonicalRoot, { fingerprint, authority, useInstalled, pem })
+    packageTrustCache.set(canonicalRoot, { fingerprint, authority, useInstalled, pem, arch: resolvedArch })
     if (packageTrustCache.size > MAX_TRUST_ROOTS) packageTrustCache.delete(packageTrustCache.keys().next().value)
     return authority
   } catch {
@@ -438,7 +449,7 @@ function slotAuthority(projectRoot, vm, preferInstalled = true) {
   return trust(
     projectRoot,
     preferInstalled ? installedCragV2Root(projectRoot, vm) : undefined,
-    vm?.node_id ? 'amd64' : undefined,
+    vm ? cragSlotArch(projectRoot, vm) : cragTargetArch(projectRoot),
   )
 }
 
@@ -735,10 +746,10 @@ function subscriptionDevice(storage, ctx) {
   if (Object.keys(device).some((key) => device[key] !== ctx.device[key])) fail('license_binding_mismatch')
 }
 
-export function prepareCragSubscriptionBinding(projectRoot, vm) {
+export function prepareCragSubscriptionBinding(projectRoot, vm, { preferInstalled = true } = {}) {
   try {
     subscriptionSlot(vm)
-    slotAuthority(projectRoot, vm)
+    slotAuthority(projectRoot, vm, preferInstalled)
     if (isKvmRuntime(vm) && !vm.node_id) {
       kvmSubscriptionMachineId(vm)
       const machineFile = path.join(projectRoot, 'vms', vm.id, 'machine-id')
@@ -903,12 +914,19 @@ export function activateCragSubscriptionBinding(
   }
 }
 
-export function readCragSubscriptionReleaseCandidate(projectRoot, vm, hostId) {
+export function readCragSubscriptionReleaseCandidate(projectRoot, vm, hostId, { preferInstalled = true } = {}) {
   if (process.platform !== 'linux' || isCodexVm(vm)) return null
   const registration = storedRegistration(cragLicenseDirectory(projectRoot, vm))
   if (!selectsSubscription(registration)) return null
   subscriptionSlot(vm)
-  const permit = authenticateSubscription(registration, 'CRAGS1', slotAuthority(projectRoot, vm).publicKey)
+  // An explicit installation authenticates the old permit with the selected trusted
+  // issuer even when the installed tree is incomplete. Normal reads stay pinned to
+  // the installed package; callers must still match this digest to the signed roster.
+  const permit = authenticateSubscription(
+    registration,
+    'CRAGS1',
+    slotAuthority(projectRoot, vm, preferInstalled).publicKey,
+  )
   if (permit.version !== 1 || permit.product !== 'crag-v2' || permit.host_id !== hostId || permit.vm_id !== vm.id)
     fail('license_binding_mismatch')
   return sha(registration)
@@ -1071,7 +1089,16 @@ function universalCodeFromLocalSlots(projectRoot) {
 function sharedUniversalLicense(projectRoot, authority) {
   const stored = readUniversalCode(projectRoot)
   if (!stored) return null
-  return verifyCragUniversal(stored, authority())
+  try {
+    return verifyCragUniversal(stored, authority())
+  } catch (error) {
+    // A grant signed for another payload is not this installation's grant. Letting
+    // it propagate brands every slot that has no registration of its own with a
+    // failure that slot never had. Expiry and revocation are returned rather than
+    // thrown, so they still reach the caller with their real reason.
+    if (error?.code === 'license_payload_key_mismatch') return null
+    throw error
+  }
 }
 
 function withMachineCode(projectRoot, vm, license, initialize) {

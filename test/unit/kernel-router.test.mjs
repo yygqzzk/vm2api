@@ -18,6 +18,7 @@ import {
   rememberRustHealth,
   peekRustHealth,
 } from '../../src/lib/transport/kernel-router.mjs'
+import { bindPlacement, unbindPlacement } from '../../src/lib/cluster/placement.mjs'
 import { rustKernelBusy, rustKernelHealth, rustKernelReachable } from '../../src/lib/transport/rust-kernel-client.mjs'
 import { inferenceCodec } from '../../src/lib/transport/inference-codec.mjs'
 import {
@@ -233,6 +234,50 @@ async function kernelFixture(handler) {
 }
 
 const cragCapabilities = ['prompt_append', 'prompt_replace', 'model_directive', 'caller_cwd']
+
+unixTest('OAuth inference refuses an unreadable credential and repairs the relative alias once saved', async (t) => {
+  const previous = process.env.KIN_KERNEL_BIN
+  process.env.KIN_KERNEL_BIN = '/bin/true'
+  t.after(() => {
+    if (previous == null) delete process.env.KIN_KERNEL_BIN
+    else process.env.KIN_KERNEL_BIN = previous
+  })
+  let probes = 0
+  const fx = await kernelFixture((req, res) => {
+    if (req.url !== '/internal/health') {
+      res.writeHead(500)
+      return res.end()
+    }
+    probes++
+    res.end(JSON.stringify({ ok: true, engine: 'rust', ready_slots: 1 }))
+  })
+  t.after(() => fx.close())
+  fx.exec.vm.claude = { has_access: true, mode: 'oauth' }
+  const claudeDir = path.join(fx.exec.homeDir, '.claude')
+  const alias = path.join(claudeDir, '.credentials.json')
+  const source = path.join(claudeDir, 'credentials.json')
+  fs.mkdirSync(claudeDir)
+  fs.symlinkSync('/old/host/credentials.json', alias)
+  const opts = {
+    exec: fx.exec,
+    body: { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] },
+    routing: { inference: { health_ttl_ms: 0 } },
+  }
+  const failed = await dispatchCallInference(opts)
+  assert.equal(failed.status, 503)
+  assert.equal(failed.upstreamExecutions, 0)
+  assert.equal(failed.body.error.code, 'slot_oauth_unavailable')
+  assert.equal(probes, 0)
+  const stored = '{"claudeAiOauth":{"accessToken":"fixture-access"}}\n'
+  fs.writeFileSync(source, stored)
+  const prepared = await prepareInferenceHop(opts)
+  assert.equal(prepared.ready?.ok, true)
+  assert.equal(probes, 1)
+  assert.equal(fs.readlinkSync(alias), 'credentials.json')
+  assert.equal(fs.readFileSync(alias, 'utf8'), stored)
+  assert.equal(fs.readFileSync(source, 'utf8'), stored)
+})
+
 const cragHealth = (capabilities) => ({ ok: true, runtime_variant: 'crag-v2', ready_slots: 1, capabilities })
 
 function licenseCragFixture({ root, exec }) {
@@ -308,7 +353,12 @@ test('explicit CRAG checks the host quota before license and readiness', async (
     routing,
     ensureRust: () => assert.fail('quota denial must precede readiness'),
     admitCragInference: (input) => {
-      assert.deepEqual(input, { vm, routing })
+      const { slotWaitDeadlineMs, ...rest } = input
+      assert.deepEqual(rest, { vm, routing })
+      // Admission also carries the hop's wait budget so a busy subscription
+      // operation can be waited out instead of denying the slot (#1307). The
+      // deadline is read off the clock, so pin the contract, not the instant.
+      assert.equal(Number.isFinite(slotWaitDeadlineMs), true)
       return hostQuotaDenial
     },
   })
@@ -750,6 +800,7 @@ unixTest('recovering native worker does not poll beyond the original slot budget
       slotWaitDeadlineMs: Date.now() - 1,
     })
     assert.equal(result.body.error.code, 'slot_busy')
+    assert.equal(result.upstreamExecutions, 0)
     assert.equal(probes, 1)
   } finally {
     if (previous == null) delete process.env.KIN_KERNEL_BIN
@@ -757,6 +808,39 @@ unixTest('recovering native worker does not poll beyond the original slot budget
     await fx.close()
   }
 })
+
+unixTest(
+  'busy non-gateway-policy kernel honors zero slotWaitMs without polling and stamps upstreamExecutions:0',
+  async () => {
+    const previous = process.env.KIN_KERNEL_BIN
+    let probes = 0
+    const fx = await kernelFixture((req, res) => {
+      assert.equal(req.url, '/internal/health')
+      probes++
+      res.end(JSON.stringify({ ok: true, engine: 'rust', ready_slots: 0, cli_pid: 4321 }))
+    })
+    process.env.KIN_KERNEL_BIN = '/bin/true'
+    try {
+      const started = Date.now()
+      const result = await dispatchCallInference({
+        exec: fx.exec,
+        body: { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] },
+        routing: { inference: { engine: 'rust', health_ttl_ms: 0, slot_wait_ms: 30_000 } },
+        slotWaitMs: 0,
+        slotWaitDeadlineMs: Date.now(),
+      })
+      assert.equal(result.status, 503)
+      assert.equal(result.body.error.code, 'slot_busy')
+      assert.equal(result.upstreamExecutions, 0)
+      assert.equal(probes, 2)
+      assert.ok(Date.now() - started < 500)
+    } finally {
+      if (previous == null) delete process.env.KIN_KERNEL_BIN
+      else process.env.KIN_KERNEL_BIN = previous
+      await fx.close()
+    }
+  },
+)
 
 linuxTest('managed timeout SSE remains a timeout before and after downstream commit', async () => {
   const previous = process.env.KIN_KERNEL_BIN
@@ -1503,6 +1587,59 @@ test('writeKernelConfig points cc at cc-node and crag at native Claude', () => {
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
+test('writeKernelConfig creates the Claude config the native CLI reads', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-claude-setup-'))
+  const home = path.join(root, 'vms', 'vm-09', 'cli-home')
+  fs.mkdirSync(home, { recursive: true })
+  fs.writeFileSync(
+    path.join(home, '.claude.json'),
+    `${JSON.stringify({ hasCompletedOnboarding: true, userID: 'keep-me', machineID: 'machine-1' })}\n`,
+  )
+  try {
+    writeKernelConfig(root, { id: 'vm-09', dataplane: 'crag' }, { token: 'tok' })
+    const nested = JSON.parse(fs.readFileSync(path.join(home, '.claude', '.claude.json'), 'utf8'))
+    const outer = JSON.parse(fs.readFileSync(path.join(home, '.claude.json'), 'utf8'))
+    for (const doc of [nested, outer]) {
+      assert.equal(doc.hasCompletedOnboarding, true)
+      assert.equal(doc.theme, 'dark')
+      assert.equal(doc.projects['/run/kin/work'].hasTrustDialogAccepted, true)
+      assert.equal(doc.projects['/home/kincli'].hasTrustDialogAccepted, true)
+    }
+    assert.equal(outer.userID, 'keep-me')
+    assert.equal(outer.machineID, 'machine-1')
+    assert.equal(nested.userID, undefined)
+    const again = fs.readFileSync(path.join(home, '.claude', '.claude.json'))
+    writeKernelConfig(root, { id: 'vm-09', dataplane: 'crag' }, { token: 'tok' })
+    assert.deepEqual(fs.readFileSync(path.join(home, '.claude', '.claude.json')), again)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+test('root hands a new Claude home and config to the slot user', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-claude-owner-'))
+  const vm = { id: 'vm-09', dataplane: 'crag' }
+  const home = path.join(root, 'vms', vm.id, 'cli-home')
+  const owner = slotRuntimeOwner(vm)
+  const calls = []
+  const chown = mock.method(fs, 'chownSync', (file, uid, gid) => {
+    calls.push({ file, uid, gid })
+  })
+  const fchown = mock.method(fs, 'fchownSync', () => {})
+  const getuid = mock.method(process, 'getuid', () => 0)
+  try {
+    writeKernelConfig(root, vm, { token: 'tok' })
+    const nested = path.join(home, '.claude', '.claude.json')
+    const owned = calls.filter((call) => call.file === nested || String(call.file).startsWith(`${nested}.`))
+    assert.ok(owned.length > 0, JSON.stringify(calls.map((call) => call.file)))
+    assert.ok(owned.every((call) => call.uid === owner.uid && call.gid === owner.gid))
+    assert.equal(fs.statSync(path.join(home, '.claude')).mode & 0o777, 0o700)
+  } finally {
+    getuid.mock.restore()
+    chown.mock.restore()
+    fchown.mock.restore()
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
 
 test('saved or switched Claude kernel owns the executable despite a legacy global CLI override', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-cli-selection-'))
@@ -1600,6 +1737,46 @@ test('writeKernelConfig adds CRAG v2 fields for a local slot and a cluster Docke
     assert.equal(remote.claude_bin, '/opt/kin-live/crag-v2/claude-code-2.1.321/claude')
     assert.equal(remote.license_dir, '/run/kin/crag-license')
     assert.equal(remote.asset_dir, '/run/kin/crag-native-assets')
+    const remoteEnabled = JSON.parse(
+      fs.readFileSync(
+        writeKernelConfig(
+          root,
+          {
+            id: 'vm-09',
+            dataplane: 'crag',
+            crag_kernel_version: 'v2',
+            kernel: 'debian-12',
+            node_id: 'node-1',
+            seed_policy: { telemetry_disabled: false },
+          },
+          { token: 'tok', publish: false },
+        ).configPath,
+        'utf8',
+      ),
+    )
+    assert.equal(remoteEnabled.telemetry.enabled, true)
+    assert.equal(remoteEnabled.telemetry.dmi_dir, '/etc/kin-dmi')
+    assert.equal(remoteEnabled.telemetry.identity.enabled, true)
+    assert.equal(remoteEnabled.telemetry.identity.linux_distro_id, 'debian')
+    const remoteKvmEnabled = JSON.parse(
+      fs.readFileSync(
+        writeKernelConfig(
+          root,
+          {
+            id: 'vm-09-kvm',
+            dataplane: 'crag',
+            crag_kernel_version: 'v2',
+            kernel: 'debian-12',
+            node_id: 'node-1',
+            runtime: { type: 'kvm' },
+            seed_policy: { telemetry_disabled: false },
+          },
+          { token: 'tok', publish: false },
+        ).configPath,
+        'utf8',
+      ),
+    )
+    assert.equal(remoteKvmEnabled.telemetry.dmi_dir, undefined)
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
@@ -1842,6 +2019,8 @@ test('reconcileCliHopRuntime accepts Claude onboarding inside a cluster-node slo
   assert.ok(setup, JSON.stringify(calls))
   assert.deepEqual(setup.slice(0, 4), ['exec', '-u', '10001:987', 'kin-vm-node-onboard'])
   assert.match(setup.at(-1), /hasCompletedOnboarding/)
+  assert.match(setup.at(-1), /\.claude\/\.claude\.json/)
+  assert.match(setup.at(-1), /FileNotFoundError/)
   const second = await reconcileCliHopRuntime(exec, { runDockerExec })
   assert.deepEqual(second.actions, ['reap_zombies'])
   assert.equal(calls.filter((args) => args.includes('python3')).length, 1)
@@ -2573,6 +2752,52 @@ unixTest(
   },
 )
 
+unixTest('credential-free readiness accepts an idle CRAG v2 process pool with no live Claude process', async () => {
+  // Health a freshly installed CRAG v2 slot reports with prewarm off: healthy, no process yet.
+  const fx = await kernelFixture((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(
+      JSON.stringify({
+        ok: true,
+        engine: 'rust',
+        healthy: true,
+        ready_slots: 2,
+        cli_pid: 0,
+        execution_mode: 'v2_process_pool',
+      }),
+    )
+  })
+  try {
+    fs.writeFileSync(rustKernelPaths(fx.exec).configPath, JSON.stringify({ slots_per_worker: WRAP_SLOT_MAX }))
+    const ready = await ensureRustKernel(fx.exec, {
+      allowMissingCredential: true,
+      timeoutMs: 100,
+      runDockerExec: async () => ({ ok: true }),
+    })
+    assert.equal(ready.ok, true, JSON.stringify(ready))
+  } finally {
+    await fx.close()
+  }
+})
+
+unixTest('credential-free readiness still requires a live process outside the CRAG v2 pool', async () => {
+  const fx = await kernelFixture((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ ok: true, engine: 'rust', healthy: true, ready_slots: 1, cli_pid: 0 }))
+  })
+  try {
+    fs.writeFileSync(rustKernelPaths(fx.exec).configPath, JSON.stringify({ slots_per_worker: WRAP_SLOT_MAX }))
+    const ready = await ensureRustKernel(fx.exec, {
+      allowMissingCredential: true,
+      timeoutMs: 100,
+      runDockerExec: async () => ({ ok: true }),
+    })
+    assert.equal(ready.ok, false, JSON.stringify(ready))
+  } finally {
+    await fx.close()
+  }
+})
+
 unixTest('supervisor repairs a Max subscription from a VM summary without restarting the live kernel', async () => {
   const fx = await kernelFixture((_req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' })
@@ -2891,4 +3116,157 @@ test('native V2 idle reload distinguishes runnable ceiling from live tool waits'
     clearTimeout(timer)
     resetWrapRecycleState()
   }
+})
+
+// One health probe that is neither ready nor busy is re-probed briefly before the
+// request fails; a kernel that really stays down still fails and is logged.
+
+function withFakeKernelBin(t) {
+  const previous = process.env.KIN_KERNEL_BIN
+  process.env.KIN_KERNEL_BIN = '/bin/true'
+  t.after(() => {
+    if (previous == null) delete process.env.KIN_KERNEL_BIN
+    else process.env.KIN_KERNEL_BIN = previous
+  })
+}
+
+unixTest('a local kernel that is briefly neither ready nor busy is re-probed before failing', async (t) => {
+  withFakeKernelBin(t)
+  let probes = 0
+  const fx = await kernelFixture((req, res) => {
+    if (req.url !== '/internal/health') {
+      res.writeHead(500)
+      return res.end()
+    }
+    probes++
+    res.end(JSON.stringify({ ok: true, engine: 'rust', ready_slots: probes < 3 ? 0 : 1 }))
+  })
+  t.after(() => fx.close())
+  const prepared = await prepareInferenceHop({
+    exec: fx.exec,
+    body: { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] },
+    routing: { inference: { health_ttl_ms: 0, kernel_down_reprobe_ms: 2000 } },
+  })
+  assert.equal(prepared.ready?.ok, true)
+  assert.equal(prepared.ready?.reason, 'ready_after_reprobe')
+  assert.equal(probes, 3)
+})
+
+unixTest('a local kernel that stays down still fails, and what it reported is logged', async (t) => {
+  withFakeKernelBin(t)
+  const fx = await kernelFixture((req, res) => {
+    if (req.url !== '/internal/health') {
+      res.writeHead(500)
+      return res.end()
+    }
+    res.end(JSON.stringify({ ok: true, engine: 'rust', ready_slots: 0 }))
+  })
+  t.after(() => fx.close())
+  const warn = t.mock.method(console, 'warn', () => {})
+  const started = Date.now()
+  const prepared = await prepareInferenceHop({
+    exec: fx.exec,
+    body: { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] },
+    routing: { inference: { health_ttl_ms: 0, kernel_down_reprobe_ms: 700 } },
+  })
+  assert.equal(prepared.ready?.ok, false)
+  assert.equal(prepared.ready?.reason, 'kernel_unavailable')
+  assert.match(prepared.ready?.error || '', /rust kernel is down/)
+  assert.ok(Date.now() - started < 3000)
+  const logged = warn.mock.calls
+    .map((call) => String(call.arguments[0]))
+    .find((line) => line.includes('rust_kernel_down'))
+  assert.ok(logged, 'outage logged')
+  assert.match(logged, /"ready_slots":0/)
+  assert.match(logged, /"probes":[1-9]/)
+})
+
+unixTest('re-probe off (kernel_down_reprobe_ms: 0) keeps the immediate failure', async (t) => {
+  withFakeKernelBin(t)
+  let probes = 0
+  const fx = await kernelFixture((req, res) => {
+    if (req.url !== '/internal/health') {
+      res.writeHead(500)
+      return res.end()
+    }
+    probes++
+    res.end(JSON.stringify({ ok: true, engine: 'rust', ready_slots: 0 }))
+  })
+  t.after(() => fx.close())
+  const warn = t.mock.method(console, 'warn', () => {})
+  const prepared = await prepareInferenceHop({
+    exec: fx.exec,
+    body: { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] },
+    routing: { inference: { health_ttl_ms: 0, kernel_down_reprobe_ms: 0 } },
+  })
+  assert.equal(prepared.ready?.reason, 'kernel_unavailable')
+  assert.equal(probes, 1)
+  // Off really is the old behaviour: no re-probe ran, so no down-kernel line either.
+  const logged = warn.mock.calls
+    .map((call) => String(call.arguments[0]))
+    .filter((line) => line.includes('rust_kernel_down'))
+  assert.deepEqual(logged, [])
+})
+
+unixTest('a slot that goes offline during the re-probe reports reconnecting, not a down kernel', async (t) => {
+  withFakeKernelBin(t)
+  bindPlacement({ manager: { slotDataPath: () => 'offline' } })
+  t.after(() => unbindPlacement())
+  let probes = 0
+  let fx = null
+  fx = await kernelFixture((req, res) => {
+    if (req.url !== '/internal/health') {
+      res.writeHead(500)
+      return res.end()
+    }
+    probes++
+    // The first probe sees a local slot that is not ready yet; while the second
+    // probe is in flight the slot moves onto a node whose link is down.
+    if (probes === 2) fx.exec.vm.node_id = 'node-gone'
+    res.end(JSON.stringify({ ok: true, engine: 'rust', ready_slots: 0 }))
+  })
+  t.after(() => fx.close())
+  const warn = t.mock.method(console, 'warn', () => {})
+  const prepared = await prepareInferenceHop({
+    exec: fx.exec,
+    body: { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] },
+    routing: { inference: { health_ttl_ms: 0, kernel_down_reprobe_ms: 2000 } },
+  })
+  assert.equal(prepared.ready?.ok, false)
+  assert.equal(prepared.ready?.reason, 'cluster_slot_reconnecting')
+  assert.equal(probes, 2)
+  const logged = warn.mock.calls
+    .map((call) => String(call.arguments[0]))
+    .filter((line) => line.includes('rust_kernel_down'))
+  assert.deepEqual(logged, [])
+})
+
+unixTest('a re-probe of a kernel that stops answering stays inside the window it was given', async (t) => {
+  withFakeKernelBin(t)
+  let probes = 0
+  const fx = await kernelFixture((req, res) => {
+    if (req.url !== '/internal/health') {
+      res.writeHead(500)
+      return res.end()
+    }
+    probes++
+    // The first probe answers at once, so what this measures is the re-probe loop
+    // and not the health check that precedes it. Every later probe never answers,
+    // which is what a kernel too wedged to reply looks like from here.
+    if (probes === 1) res.end(JSON.stringify({ ok: true, engine: 'rust', ready_slots: 0 }))
+  })
+  t.after(() => fx.close())
+  t.mock.method(console, 'warn', () => {})
+  const started = Date.now()
+  const prepared = await prepareInferenceHop({
+    exec: fx.exec,
+    body: { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] },
+    // A health timeout far wider than the re-probe window. The loop condition only
+    // reserves the 250ms gap, so an unclamped probe spends the whole 8s here and
+    // hands 8s of latency to a request that was told it could wait 700ms.
+    routing: { inference: { health_ttl_ms: 0, kernel_down_reprobe_ms: 700, health_timeout_ms: 8000 } },
+  })
+  const elapsed = Date.now() - started
+  assert.equal(prepared.ready?.reason, 'kernel_unavailable')
+  assert.ok(elapsed < 2000, `re-probe overran its window: ${elapsed}ms`)
 })

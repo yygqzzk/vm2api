@@ -8,6 +8,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 import { ThinkingOwnerStore } from '../../src/lib/pool/thinking-owner.mjs'
 import { activateFixture, seedEncryptedPackage } from '../fixtures/crag-license.mjs'
+import { CRS_OFFICIAL_CLI_SYSTEM } from '../../src/lib/identity/crs-persona.mjs'
 
 // Unix socket 在 Windows 上不可用，和 go-worker-client.test.mjs 的 unixTest 保持一致。
 const unixTest = process.platform === 'win32' ? test.skip : test
@@ -16,7 +17,7 @@ const unixTest = process.platform === 'win32' ? test.skip : test
  * 假槽位 kernel：/internal/health 报告就绪，推理路由记下收到的 envelope 并回一段完整 SSE。
  * Body remains the worker envelope; headers must come from the CLI send boundary.
  */
-async function fakeKernel({ health = {} } = {}) {
+async function fakeKernel({ health = {}, tool } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-outbound-log-'))
   const runDir = path.join(root, 'vm-01', 'run')
   const homeDir = path.join(root, 'vm-01', 'cli-home')
@@ -63,10 +64,23 @@ async function fakeKernel({ health = {} } = {}) {
         usage: { input_tokens: 1, output_tokens: 0 },
       },
     })
-    send({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })
-    send({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'ok' } })
+    const issued = posted.length === 1 && tool
+    if (issued) {
+      send({ type: 'content_block_start', index: 0, content_block: { ...issued, input: {} } })
+      const input = JSON.stringify(issued.input)
+      for (const partial_json of [input.slice(0, 3), input.slice(3)]) {
+        send({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json } })
+      }
+    } else {
+      send({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })
+      send({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'ok' } })
+    }
     send({ type: 'content_block_stop', index: 0 })
-    send({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 1 } })
+    send({
+      type: 'message_delta',
+      delta: { stop_reason: issued ? 'tool_use' : 'end_turn' },
+      usage: { output_tokens: 1 },
+    })
     send({ type: 'message_stop' })
     res.end()
   })
@@ -115,7 +129,9 @@ function fakeResponse() {
       writes.push(String(chunk))
       return true
     },
-    end() {},
+    end(chunk) {
+      if (chunk != null) writes.push(String(chunk))
+    },
     finish() {
       listeners.finish?.()
     },
@@ -319,9 +335,15 @@ const ordinaryHealth = { runtime_variant: 'cli-node', capabilities: [] }
 const trustedCwd = '/synthetic/trusted-workspace'
 const publicCwd = '/synthetic/public-cwd-must-not-win'
 const cwdTag = (cwd) => `<cwd>\n${cwd}\n</cwd>`
+// The public handler relocates a non Claude Code caller's system (these
+// fixtures do not send official Claude Code headers) to the head of the first
+// user message before any hop renders (third-party-system.mjs). CRAG then
+// receives only the official identity line as its caller prompt. A valid <cwd>
+// declaration still becomes caller_cwd and is not relocated with the text.
+const identityPrompt = (mode) => ({ mode, text: CRS_OFFICIAL_CLI_SYSTEM })
 
-async function protocolKernelFixture(t, { health, staleHealth, preset = 'official_full', interceptRules }) {
-  const kernel = await fakeKernel({ health })
+async function protocolKernelFixture(t, { health, staleHealth, preset = 'official_full', interceptRules, tool }) {
+  const kernel = await fakeKernel({ health, tool })
   const previous = process.env.KIN_KERNEL_BIN
   t.after(async () => {
     if (previous === undefined) delete process.env.KIN_KERNEL_BIN
@@ -350,18 +372,28 @@ async function protocolKernelFixture(t, { health, staleHealth, preset = 'officia
   fs.writeFileSync(path.join(kernel.root, 'routing.json'), JSON.stringify(routing))
   const { handler, finished, preparedCandidates, request } = protocolHarness(kernel, routing, interceptRules)
   return {
-    async send(body, candidateHealth = staleHealth, { protocol = 'anthropic.messages', headers = {} } = {}) {
+    async send(
+      body,
+      candidateHealth = staleHealth,
+      { protocol = 'anthropic.messages', headers = {}, status = 200, keyId = 'key-1' } = {},
+    ) {
       kernel.selected.exec.workerStatus = structuredClone(candidateHealth)
       const postedBefore = kernel.posted.length
       const finishedBefore = finished.length
       const requestsBefore = kernel.requests.length
       const response = fakeResponse()
       const req = request(body)
+      req.apiKeyRecord.id = keyId
       Object.assign(req.headers, headers)
       if (protocol === 'openai.responses') req.url = '/v1/responses'
+      if (protocol === 'openai.chat') req.url = '/v1/chat/completions'
       await handler.handleProtocol(req, response, protocol, req.url)
       response.finish()
-      assert.equal(response.statusCode, 200, response.writes.join(''))
+      assert.equal(response.statusCode, status, response.writes.join(''))
+      if (status !== 200) {
+        assert.equal(kernel.posted.length, postedBefore)
+        return JSON.parse(response.writes.join(''))
+      }
       assert.deepEqual(preparedCandidates.at(-1), candidateHealth)
       assert.equal(kernel.posted.length, postedBefore + 1)
       assert.equal(finished.length, finishedBefore + 1)
@@ -377,13 +409,13 @@ async function protocolKernelFixture(t, { health, staleHealth, preset = 'officia
       const envelope = kernel.posted.at(-1)
       const extra = finished.at(-1)
       assert.deepEqual(JSON.parse(JSON.stringify(extra.outbound_body)), envelope.body)
-      assert.deepEqual(extra.worker_envelope_headers, envelope.headers)
+      assert.deepEqual(extra.worker_envelope_headers, envelope.headers ?? null)
       assert.equal(Object.hasOwn(envelope.body, 'caller_cwd'), false)
       assert.equal(Object.hasOwn(extra, 'caller_cwd'), false)
       assert.equal(Object.hasOwn(extra.outbound_body, 'caller_cwd'), false)
       assert.equal(JSON.stringify(envelope).includes(publicCwd), false)
       assert.equal(JSON.stringify(extra.outbound_body).includes(publicCwd), false)
-      return { envelope, extra }
+      return { envelope, extra, publicBody: response.writes.join('') }
     },
   }
 }
@@ -392,7 +424,7 @@ unixTest('native CRAG receives caller tool names and structured system cache blo
   const fixture = await protocolKernelFixture(t, {
     health: {
       ...printHealth,
-      capabilities: [...printCapabilities, 'generation_controls_v3', 'system_text_cache_v3'],
+      capabilities: [...printCapabilities, 'generation_controls_v3', 'system_text_cache_v3', 'linux_tui_native_queue'],
     },
     staleHealth: ordinaryHealth,
   })
@@ -413,11 +445,11 @@ unixTest('native CRAG receives caller tool names and structured system cache blo
       role: 'user',
       content: [
         { type: 'tool_result', tool_use_id: 'toolu_fixture', content: 'result' },
-        { type: 'text', text: 'Summarize it', cache_control: anchor },
+        { type: 'text', text: 'Summarize it', cache_control: { type: 'ephemeral' } },
       ],
     },
   ]
-  const { envelope } = await fixture.send({
+  const { envelope, extra } = await fixture.send({
     model: 'claude-sonnet-5-5',
     max_tokens: 32000,
     stream: true,
@@ -426,10 +458,17 @@ unixTest('native CRAG receives caller tool names and structured system cache blo
     messages,
     tool_choice: { type: 'auto' },
   })
+  assert.equal(Object.hasOwn(envelope, 'headers'), false)
+  assert.equal(extra.worker_envelope_headers, null)
   assert.deepEqual(envelope.body.tools, tools)
-  assert.deepEqual(envelope.body.system, system)
+  // The structured caller blocks keep their cache markers at the head of the first user turn;
+  // #1731 omits the relocated official identity placeholder from CRAG system.
+  assert.equal(envelope.body.system, undefined)
   assert.equal(envelope.body.crag_prompt, undefined)
-  assert.deepEqual(envelope.body.messages, messages)
+  assert.deepEqual(envelope.body.messages, [
+    { ...messages[0], content: [...system, ...messages[0].content] },
+    ...messages.slice(1),
+  ])
   assert.deepEqual(envelope.body.tool_choice, { type: 'auto' })
   assert.equal(envelope.body.max_tokens, 32000)
 })
@@ -438,7 +477,12 @@ unixTest('zero CRAG sends mixed Responses tools and structured system to the cap
   const fixture = await protocolKernelFixture(t, {
     health: {
       ...printHealth,
-      capabilities: [...printCapabilities, 'generation_controls_v3', 'provider_managed_tools_v1'],
+      capabilities: [
+        ...printCapabilities,
+        'generation_controls_v3',
+        'provider_managed_tools_v1',
+        'linux_tui_native_queue',
+      ],
     },
     staleHealth: ordinaryHealth,
     preset: 'zero',
@@ -461,14 +505,16 @@ unixTest('zero CRAG sends mixed Responses tools and structured system to the cap
     ordinaryHealth,
     { protocol: 'openai.responses' },
   )
+  assert.equal(Object.hasOwn(envelope, 'headers'), false)
   assert.equal(envelope.body.tools.length, 48)
   assert.deepEqual(envelope.body.tools[47], search)
-  assert.deepEqual(envelope.body.system, [{ type: 'text', text: 'Caller policy' }])
+  assert.deepEqual(envelope.body.system, [{ type: 'text', text: CRS_OFFICIAL_CLI_SYSTEM }])
+  assert.deepEqual(envelope.body.messages[0].content[0], { type: 'text', text: 'Caller policy' })
   assert.equal(envelope.body.crag_prompt, undefined)
 })
 
 for (const runtime of ['crag-v2', 'cli-node']) {
-  unixTest(`Codex Responses tool continuation is structured before ${runtime} dispatch`, async (t) => {
+  unixTest(`Three protocol entrances send structured tool continuation before ${runtime} dispatch`, async (t) => {
     const health =
       runtime === 'crag-v2'
         ? { ...printHealth, capabilities: [...printCapabilities, 'generation_controls_v3', 'system_text_cache_v3'] }
@@ -482,20 +528,24 @@ for (const runtime of ['crag-v2', 'cli-node']) {
         input: [
           { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Find it' }] },
           {
+            type: 'additional_tools',
+            role: 'developer',
+            tools: [{ type: 'function', name: 'fixture_lookup', parameters: { type: 'object' } }],
+          },
+          {
             type: 'function_call',
             id: 'fc_different',
             call_id: 'call_existing',
-            name: 'read_file',
+            name: 'fixture_lookup',
             arguments: '{"file":"sample"}',
           },
           { type: 'function_call_output', call_id: 'call_existing', output: 'Here it is' },
         ],
-        tools: [{ type: 'function', name: 'read_file', parameters: { type: 'object' } }],
       },
       ordinaryHealth,
       { protocol: 'openai.responses', headers: { 'user-agent': 'codex_cli_rs/0.0.0' } },
     )
-    const expectedName = runtime === 'crag-v2' ? 'read_file' : 'mcp__read_file'
+    const expectedName = runtime === 'crag-v2' ? 'fixture_lookup' : 'mcp__fixture_lookup'
     assert.equal(envelope.body.tools[0].name, expectedName)
     assert.deepEqual(envelope.body.tools[0].input_schema, { type: 'object' })
     assert.equal(envelope.body.max_tokens, 32000)
@@ -513,6 +563,47 @@ for (const runtime of ['crag-v2', 'cli-node']) {
     const result = blocks.find((block) => block.type === 'tool_result')
     assert.equal(result.tool_use_id, 'call_existing')
     assert.deepEqual(result.content, [{ type: 'text', text: 'Here it is' }])
+
+    const messages = [
+      { role: 'user', content: 'Find it' },
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [
+          {
+            type: 'function',
+            id: 'call_existing',
+            function: { name: 'fixture_lookup', arguments: '{"file":"sample"}' },
+          },
+        ],
+      },
+      { role: 'tool', tool_call_id: 'call_existing', content: 'Here it is' },
+    ]
+    const tools = [{ type: 'function', function: { name: 'fixture_lookup', parameters: { type: 'object' } } }]
+    for (const protocol of ['anthropic.messages', 'openai.chat']) {
+      const { envelope: converted } = await fixture.send(
+        { model: 'claude-sonnet-5-5', max_tokens: 32000, messages, tools },
+        ordinaryHealth,
+        { protocol },
+      )
+      const name = converted.body.tools[0].name
+      assert.match(name, /^(mcp__)?fixture_lookup$/)
+      assert.deepEqual(converted.body.tools[0].input_schema, { type: 'object' })
+      assert.ok(converted.body.messages.every((message) => message.role !== 'tool' && !message.tool_calls))
+      const history = converted.body.messages.flatMap((message) => message.content)
+      assert.deepEqual(
+        history.find((block) => block.type === 'tool_use'),
+        { ...blocks.find((block) => block.type === 'tool_use'), name },
+      )
+      assert.equal(history.find((block) => block.type === 'tool_result')?.tool_use_id, 'call_existing')
+    }
+    const invalid = await fixture.send(
+      { model: 'claude-sonnet-5-5', messages: messages.slice(0, 2), tools },
+      ordinaryHealth,
+      { status: 400 },
+    )
+    assert.equal(invalid.error.code, 'invalid_messages_conversion')
+    assert.equal(invalid.error.param, 'messages[1].tool_calls[0].id')
   })
 }
 
@@ -542,13 +633,14 @@ for (const stream of [false, true]) {
           }),
         )
         assert.equal(envelope.caller_cwd, trustedCwd)
-        assert.deepEqual(envelope.body.crag_prompt, { mode, text: 'caller guidance' })
+        assert.equal(envelope.body.crag_prompt, undefined)
+        assert.deepEqual(envelope.body.messages[0].content[0], { type: 'text', text: 'caller guidance' })
         assert.equal(envelope.body.crag_model.id, 'claude-haiku-4-5-20251001')
         assert.equal(Object.hasOwn(envelope.body, 'system'), false)
         assert.equal(JSON.stringify(envelope.body).includes(trustedCwd), false)
         assert.equal(JSON.stringify(extra.outbound_body).includes(trustedCwd), false)
         assert.equal(extra.official_cc_inference, 'crag-print')
-        assert.equal(extra.crag_print.prompt_mode, mode)
+        assert.equal(extra.crag_print.prompt_mode, 'default')
       },
     )
 
@@ -567,10 +659,14 @@ for (const stream of [false, true]) {
           }),
         )
         assert.equal(envelope.caller_cwd, trustedCwd)
-        assert.equal(envelope.body.crag_prompt.mode, mode)
-        assert.ok(envelope.body.crag_prompt.text.includes(history))
-        assert.equal(envelope.body.crag_prompt.text.split(trustedCwd).length - 1, 1)
-        assert.ok(extra.outbound_body.crag_prompt.text.includes(history))
+        assert.equal(envelope.body.crag_prompt, undefined)
+        // The declaration leaves with caller_cwd; the lifted history keeps its own copy.
+        assert.deepEqual(
+          envelope.body.messages[0].content.slice(0, 2).map((block) => block.text),
+          ['caller guidance', history],
+        )
+        assert.equal(JSON.stringify(envelope.body).split(trustedCwd).length - 1, 1)
+        assert.deepEqual(extra.outbound_body.messages[0].content[1].text, history)
         assert.equal(Object.hasOwn(envelope.body, 'system'), false)
         assert.equal(
           envelope.body.messages.some((message) => message.role === 'system'),
@@ -622,8 +718,9 @@ for (const stream of [false, true]) {
         assert.equal(Object.hasOwn(envelope.body, 'crag_model'), false)
         assert.equal(extra.official_cc_inference, 'cli-hop')
         assert.equal(Object.hasOwn(extra, 'crag_print'), false)
-        assert.ok(JSON.stringify(envelope.body.system).includes(trustedCwd))
-        assert.ok(JSON.stringify(envelope.body.system).includes('caller guidance'))
+        // cli-node does not extract the declaration: the caller system moves verbatim.
+        assert.equal(envelope.body.messages[0].content[0].text, `${cwdTag(trustedCwd)}\ncaller guidance`)
+        assert.equal(JSON.stringify(envelope.body.system).includes(trustedCwd), false)
       }
       const stableSystem = ({ envelope }) => {
         const [billing, ...system] = envelope.body.system
@@ -674,8 +771,8 @@ for (const stream of [false, true]) {
         assert.equal(extra.official_cc_inference, 'crag-print')
         assert.equal(Object.hasOwn(envelope, 'caller_cwd'), false)
         if (preserved) {
-          assert.equal(envelope.body.crag_prompt.mode, 'append')
-          assert.ok(envelope.body.crag_prompt.text.includes(preserved))
+          assert.equal(envelope.body.crag_prompt, undefined)
+          assert.ok(envelope.body.messages[0].content.some((block) => block.text?.includes(preserved)))
         } else {
           assert.equal(Object.hasOwn(envelope.body, 'crag_prompt'), false)
         }
@@ -700,7 +797,81 @@ for (const phase of ['before_convert', 'before_upstream']) {
     ]) {
       const { envelope } = await fixture.send(body)
       assert.equal(envelope.caller_cwd, expectedCwd)
-      assert.deepEqual(envelope.body.crag_prompt, { mode: 'append', text: replacementText })
+      assert.equal(envelope.body.crag_prompt, undefined)
+      assert.equal(envelope.body.messages[0].content[0].text, replacementText)
     }
   })
+}
+
+for (const stream of [false, true]) {
+  unixTest(
+    `CRAG print replays public ${stream ? 'SSE' : 'JSON'} tool history after client normalization`,
+    async (t) => {
+      const tool = {
+        type: 'tool_use',
+        id: 'call-issued',
+        name: 'lookup',
+        input: { term: 'item' },
+        caller: { type: 'direct' },
+        extension: { trace: 'one' },
+      }
+      const fixture = await protocolKernelFixture(t, {
+        health: {
+          ...printHealth,
+          capabilities: [...printCapabilities, 'generation_controls_v3', 'system_text_cache_v3'],
+        },
+        staleHealth: ordinaryHealth,
+        tool: stream ? tool : { ...tool, extension: { trace: 'upstream-only' } },
+        interceptRules: stream
+          ? []
+          : [
+              {
+                phase: 'before_client',
+                action: {
+                  replace_body_json: { type: 'message', role: 'assistant', content: [tool], stop_reason: 'tool_use' },
+                },
+              },
+            ],
+      })
+      const session = '22222222-2222-4222-8222-222222222222'
+      const base = {
+        model: 'claude-sonnet-5-5',
+        max_tokens: 128,
+        metadata: { user_id: JSON.stringify({ device_id: 'a'.repeat(64), session_id: session }) },
+        tools: [{ name: 'lookup', input_schema: { type: 'object' } }],
+      }
+      const prefix = [{ role: 'user', content: 'look up an item' }]
+      const first = await fixture.send({ ...base, stream, messages: prefix })
+      assert.match(first.publicBody, /call-issued/)
+      assert.match(first.publicBody, /"caller":\{"type":"direct"\}/)
+      assert.equal(first.extra.official_cc_inference, 'crag-print')
+      assert.equal(Object.hasOwn(first.envelope.body, 'metadata'), false)
+      assert.equal(JSON.stringify(first.envelope.body).includes(session), false)
+      const echo = stream
+        ? { type: 'tool_use', id: 'client-id', name: 'lookup', input: { term: 'item' } }
+        : { type: 'tool_use', id: tool.id, name: 'changed', input: { term: 'wrong' } }
+      const result = { type: 'tool_result', tool_use_id: echo.id, content: 'no item', is_error: true }
+      const continuation = {
+        ...base,
+        stream: false,
+        messages: [...prefix, { role: 'assistant', content: [echo] }, { role: 'user', content: [result] }],
+      }
+      const { envelope } = await fixture.send(continuation)
+      const history = envelope.body.messages.flatMap((m) => m.content)
+      const { extension: _ignoredExtension, ...whitelistedTool } = tool
+      assert.deepEqual(
+        history.find((b) => b.type === 'tool_use'),
+        whitelistedTool,
+      )
+      assert.deepEqual(
+        history.find((b) => b.type === 'tool_result'),
+        { ...result, tool_use_id: tool.id },
+      )
+      const other = await fixture.send(continuation, ordinaryHealth, { keyId: 'key-2' })
+      assert.deepEqual(
+        other.envelope.body.messages.flatMap((m) => m.content).find((b) => b.type === 'tool_use'),
+        echo,
+      )
+    },
+  )
 }

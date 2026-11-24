@@ -4,11 +4,19 @@ import http from 'node:http'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { Readable } from 'node:stream'
 import { createRespond, readBody } from '../../src/lib/http/respond.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import { classifyUpstreamResult } from '../../src/lib/pool/upstream-error-policy.mjs'
 import { RateLimitService } from '../../src/lib/pool/rate-limit-service.mjs'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
+import { consumeNativeHandoffStream, createNativeHandoffState } from '../../src/lib/protocol/native-handoff.mjs'
+import {
+  applyClaudeSSELineToMessage,
+  claudeSSELineToResponsesEvents,
+  createClaudeMessageAssembler,
+  createResponsesStreamState,
+} from '../../src/lib/protocol/convert.mjs'
 import { callGoWorker, streamGoWorker } from '../../src/lib/transport/go-worker-client.mjs'
 import {
   finalizeAssembledAssistantHop,
@@ -300,26 +308,35 @@ for (const deliveryMode of ['realtime', 'verified']) {
         }),
       )
       await parsedTools.ready
-      assert.equal(committed, false)
-      assert.deepEqual(lines, [])
+      if (deliveryMode === 'verified') {
+        assert.equal(committed, false)
+        assert.deepEqual(lines, [])
+      } else assert.equal(committed, true)
       release.release()
       const received = await pending
-      assert.equal(received.ok, true)
-      assert.equal(received.stopReason, 'refusal')
-      assert.equal(received.body.stop_reason, 'refusal')
-      assert.deepEqual(received.body.content, [{ type: 'text', text: 'Cannot assist with that request.' }])
-      assert.deepEqual(received.usage, USAGE)
-      assert.doesNotMatch(
-        JSON.stringify(received.body) + lines.join('\n'),
-        /tool_secret|parameters|tool_use|client_tool/,
-      )
+      if (deliveryMode === 'verified') {
+        assert.equal(received.ok, true)
+        assert.equal(received.stopReason, 'refusal')
+        assert.equal(received.body.stop_reason, 'refusal')
+        assert.deepEqual(received.body.content, [{ type: 'text', text: 'Cannot assist with that request.' }])
+        assert.deepEqual(received.usage, USAGE)
+        assert.doesNotMatch(
+          JSON.stringify(received.body) + lines.join('\n'),
+          /tool_secret|parameters|tool_use|client_tool/,
+        )
+        assert.deepEqual(
+          eventsFrom(lines)
+            .filter((event) => event.type.startsWith('content_block'))
+            .map((event) => event.index),
+          [0, 0, 0],
+        )
+      } else {
+        assert.equal(received.ok, false)
+        assert.equal(received.committed, true)
+        assert.match(lines.join('\n'), /tool_secret/)
+        assert.match(lines.join('\n'), /event: error/)
+      }
       assertPrivate(received, lines)
-      assert.deepEqual(
-        eventsFrom(lines)
-          .filter((event) => event.type.startsWith('content_block'))
-          .map((event) => event.index),
-        [0, 0, 0],
-      )
     } finally {
       release.release()
       await fx.close()
@@ -407,13 +424,15 @@ for (const stream of [false, true]) {
         assert.equal(received.ok, false)
         assert.equal(received.nativeHandoff, true)
         assert.equal(received.status, 502)
-        assert.equal(received.committed ?? false, false)
-        assert.match(received.body.error.code, /^native_handoff_(missing|invalid|conflict)$/)
+        if (stream) assert.equal(received.committed, true)
+        else assert.equal(received.committed ?? false, false)
+        if (!stream) assert.match(received.body.error.code, /^native_handoff_(missing|invalid|conflict)$/)
         assert.equal(received.providerResult, null)
         assert.deepEqual(received.usage, { input_tokens: 47, output_tokens: stream ? 1 : 2 })
         assert.notEqual(received.usage.output_tokens, result.usage.output_tokens)
         assert.notEqual(received.usage.output_tokens, 9)
-        assert.doesNotMatch(lines.join('\n'), /tool_secret|parameters|tool_use|message_stop/)
+        if (stream) assert.match(lines.join('\n'), /event: error/)
+        else assert.doesNotMatch(lines.join('\n'), /tool_secret|parameters|tool_use|message_stop/)
         assertPrivate(received, lines)
       } finally {
         await fx.close()
@@ -461,6 +480,72 @@ unixTest('realtime text is delivered before native terminal, verified text is wi
   }
 })
 
+unixTest('realtime tool deltas arrive before terminal, verified tools stay withheld', async () => {
+  for (const deliveryMode of ['realtime', 'verified']) {
+    const result = summary({ stop_reason: 'tool_use', usage: { input_tokens: 47, output_tokens: 4 } })
+    const observed = gate()
+    const release = gate()
+    const first = '{"step":'
+    const second = '1}'
+    const fx = await fixture(async (_req, res) => {
+      res.setHeader('content-type', 'text/event-stream')
+      res.write(
+        start(result) +
+          frame({
+            type: 'content_block_start',
+            index: 0,
+            content_block: { type: 'tool_use', id: 'tool_live', name: 'client_tool', input: {} },
+          }) +
+          frame({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: first } }) +
+          frame({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: second } }) +
+          frame({ type: 'kin_outbound_headers', headers: { 'x-fixture-phase': 'tool-observed' } }),
+      )
+      await release.ready
+      res.end(frame({ type: 'content_block_stop', index: 0 }) + resultFrame(result) + terminalFrames(result))
+    })
+    const lines = []
+    try {
+      const pending = streamGoWorker(
+        options(fx, {
+          deliveryMode,
+          onEvent: (line) => lines.push(line),
+          onOutboundHeaders: () => observed.release(),
+        }),
+      )
+      await observed.ready
+      const events = eventsFrom(lines)
+      if (deliveryMode === 'realtime') {
+        assert.deepEqual(
+          events.filter((event) => event.delta?.type === 'input_json_delta').map((event) => event.delta.partial_json),
+          [first, second],
+        )
+        assert.equal(events.filter((event) => event.type === 'content_block_start').length, 1)
+        assert.doesNotMatch(lines.join('\n'), /message_delta|message_stop|kin_provider_result/)
+      } else assert.deepEqual(lines, [])
+      release.release()
+      const received = await pending
+      assert.equal(received.ok, true)
+      const completed = eventsFrom(lines)
+      const starts = completed.filter(
+        (event) => event.type === 'content_block_start' && event.content_block?.type === 'tool_use',
+      )
+      const deltas = completed.filter((event) => event.delta?.type === 'input_json_delta')
+      assert.equal(starts.length, 1)
+      assert.deepEqual(
+        deltas.map((event) => event.delta.partial_json),
+        [first, second],
+      )
+      assert.equal(completed.filter((event) => event.type === 'content_block_stop').length, 1)
+      assert.equal(completed.filter((event) => event.type === 'message_delta').length, 1)
+      assert.equal(completed.at(-1).type, 'message_stop')
+      assertPrivate(received, lines)
+    } finally {
+      release.release()
+      await fx.close()
+    }
+  }
+})
+
 unixTest('real provider error and partial observed usage survive late CLI rows without tool grants', async () => {
   const providerError = {
     type: 'api_error',
@@ -497,7 +582,9 @@ unixTest('real provider error and partial observed usage survive late CLI rows w
     assert.deepEqual(received.body.error, providerError)
     assert.equal(received.body.request_id, 'req_actual_provider')
     assert.deepEqual(received.usage, { input_tokens: 47, output_tokens: 3 })
-    assert.doesNotMatch(lines.join('\n'), /tool_secret|parameters|message_stop/)
+    assert.match(lines.join('\n'), /tool_secret/)
+    assert.match(lines.join('\n'), /event: error/)
+    assert.doesNotMatch(lines.join('\n'), /message_stop/)
     assertPrivate(received, lines)
   } finally {
     await fx.close()
@@ -1128,7 +1215,9 @@ unixTest('a conflicted summary cannot supply the error cause or final usage over
     assert.equal(received.status, 503)
     assert.deepEqual(received.body.error, actualError)
     assert.deepEqual(received.usage, { input_tokens: 47, output_tokens: 0 })
-    assert.deepEqual(lines, [])
+    assert.equal(received.committed, true)
+    assert.match(lines.join('\n'), /tool_secret/)
+    assert.match(lines.join('\n'), /event: error/)
     assertPrivate(received)
   } finally {
     await fx.close()
@@ -1213,13 +1302,19 @@ for (const stream of [false, true]) {
         try {
           const args = options(fx, { onEvent: (line) => lines.push(line) })
           const received = await (stream ? streamGoWorker(args) : callGoWorker(args))
-          assert.equal(received.ok, true)
+          assert.equal(received.ok, !(stream && stopReason === 'refusal'))
           assert.equal(received.nativeHandoff, true)
-          assert.equal(received.stopReason, stopReason)
-          assert.deepEqual(received.providerResult, result)
-          assert.deepEqual(received.body.content, serverContent)
+          if (!(stream && stopReason === 'refusal')) {
+            assert.equal(received.stopReason, stopReason)
+            assert.deepEqual(received.providerResult, result)
+            assert.deepEqual(received.body.content, serverContent)
+          } else {
+            assert.equal(received.committed, true)
+            assert.match(lines.join('\n'), /client_secret/)
+            assert.match(lines.join('\n'), /event: error/)
+          }
           assert.deepEqual(received.usage, USAGE)
-          if (stream) {
+          if (stream && stopReason !== 'refusal') {
             assert.deepEqual(
               eventsFrom(lines)
                 .filter((event) => event.type === 'content_block_start')
@@ -1227,7 +1322,6 @@ for (const stream of [false, true]) {
               serverContent,
             )
           }
-          assert.doesNotMatch(JSON.stringify(received.body) + lines.join('\n'), /client_secret|client_tool|parameters/)
           assertPrivate(received, lines)
         } finally {
           await fx.close()
@@ -1236,3 +1330,143 @@ for (const stream of [false, true]) {
     )
   }
 }
+
+for (const deliveryMode of ['realtime', 'verified']) {
+  unixTest(`thinking-only max_tokens 502 is recovered after a ${deliveryMode} commit`, async () => {
+    const facts = {
+      schema_version: 2,
+      type: 'kin_provider_result',
+      source: 'crag',
+      http_status: 200,
+      public_status: 502,
+      provider_complete: true,
+      usage_complete: true,
+      response_valid: false,
+      delivery_error: { status: 502, type: 'api_error' },
+      validation_error: { type: 'api_error', message: 'native request completed without response content' },
+      message_id: 'msg_native_thinking_only',
+      model: MODEL,
+      stop_reason: 'max_tokens',
+      stop_sequence: null,
+      usage: { input_tokens: 196, output_tokens: 64, cache_read_input_tokens: 49109, cache_creation_input_tokens: 0 },
+    }
+    const fx = await fixture(
+      async (req, res) => {
+        res.writeHead(200, { 'content-type': 'text/event-stream' })
+        res.write(start({ ...summary(), message_id: facts.message_id }))
+        res.write(frame({ type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } }))
+        res.write(frame({ type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'hmm' } }))
+        res.write(
+          frame({ type: 'content_block_delta', index: 0, delta: { type: 'signature_delta', signature: 'sig' } }),
+        )
+        res.write(frame({ type: 'error', error: { type: 'api_error', message: facts.validation_error.message } }))
+        res.write(resultFrame(facts))
+        res.end()
+      },
+      { capabilities: ['native_handoff_v1', 'provider_result_v2'] },
+    )
+    try {
+      const lines = []
+      let commits = 0
+      const result = await streamGoWorker({
+        ...options(fx),
+        deliveryMode,
+        onCommit: () => commits++,
+        onEvent: async (line) => lines.push(line),
+      })
+      assert.equal(result.ok, true)
+      assert.equal(result.status, 200)
+      assert.equal(result.recoveredEmptyContent, true)
+      assert.equal(commits, 1)
+      const types = eventsFrom(lines).map((event) => event.type)
+      assert.equal(types.filter((type) => type === 'message_start').length, 1)
+      assert.ok(!types.includes('error'))
+      assert.deepEqual(types.slice(-2), ['message_delta', 'message_stop'])
+      const open = new Set()
+      for (const event of eventsFrom(lines)) {
+        if (event.type === 'content_block_start') open.add(event.index)
+        if (event.type === 'content_block_stop') open.delete(event.index)
+      }
+      assert.equal(open.size, 0)
+    } finally {
+      await fx.close()
+    }
+  })
+}
+
+test('realtime native handoff completes real max_tokens cut inside tool_use without native_handoff_conflict', async () => {
+  for (const closeToolBlock of [true, false]) {
+    const result = summary({ stop_reason: 'max_tokens' })
+    const toolStream = [
+      frame({ type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'toolu_cut', name: 'Write', input: {} } }),
+      frame({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{"filePath":"/tmp/a' } }),
+      ...(closeToolBlock ? [frame({ type: 'content_block_stop', index: 0 })] : []),
+    ].join('')
+    const sse = start(result) + toolStream + resultFrame(result) + terminalFrames(result)
+    const response = Readable.from([Buffer.from(sse)])
+    response.headers = { 'content-type': 'text/event-stream' }
+    response.trailers = {}
+
+    const state = createNativeHandoffState({ nativeHandoff: true })
+    const lines = []
+    let commits = 0
+    const received = await consumeNativeHandoffStream(response, {
+      state,
+      deliveryMode: 'realtime',
+      isCommitEvent: (event) => event.type === 'content_block_start',
+      onCommit: () => commits++,
+      onEvent: (line) => lines.push(line),
+    })
+
+    assert.equal(commits, 1)
+    assert.equal(received.committed, true)
+    assert.equal(received.body.type, 'message')
+    assert.equal(received.body.stop_reason, 'max_tokens')
+    assert.deepEqual(received.body.usage, USAGE)
+    const events = eventsFrom(lines)
+    assert.ok(!events.some((event) => event.type === 'error'))
+    assert.equal(events.filter((event) => event.type === 'content_block_stop' && event.index === 0).length, 1)
+    assert.equal(events.at(-2).type, 'message_delta')
+    assert.equal(events.at(-2).delta.stop_reason, 'max_tokens')
+    assert.equal(events.at(-1).type, 'message_stop')
+  }
+})
+
+test('realtime native handoff still fails committed tool_use on refusal stop', async () => {
+  const result = summary({ stop_reason: 'refusal' })
+  const sse = start(result) + toolFrames(0, 'toolu_refused') + resultFrame(result) + terminalFrames(result)
+  const response = Readable.from([Buffer.from(sse)])
+  response.headers = { 'content-type': 'text/event-stream' }
+  response.trailers = {}
+
+  const state = createNativeHandoffState({ nativeHandoff: true })
+  const lines = []
+  const received = await consumeNativeHandoffStream(response, {
+    state,
+    deliveryMode: 'realtime',
+    isCommitEvent: (event) => event.type === 'content_block_start',
+    onEvent: (line) => lines.push(line),
+  })
+  assert.equal(received.body.type, 'error')
+  assert.equal(received.body.error.code, 'native_handoff_conflict')
+  assert.ok(eventsFrom(lines).some((event) => event.type === 'error'))
+})
+
+test('multi-chunk signature_delta appends instead of overwriting', () => {
+  const assembler = createClaudeMessageAssembler()
+  const lines = [
+    'data: {"type":"message_start","message":{"id":"msg_sig","model":"claude-opus-5","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}',
+    'data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}',
+    'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"abc"}}',
+    'data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"part1-"}}',
+    'data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"part2"}}',
+    'data: {"type":"content_block_stop","index":0}',
+  ]
+  for (const line of lines) applyClaudeSSELineToMessage(line, assembler)
+  assert.equal(assembler.message.content[0].signature, 'part1-part2')
+
+  const respState = createResponsesStreamState('claude-opus-5', 'vm-test', [])
+  for (const line of lines) claudeSSELineToResponsesEvents(line, respState)
+  const encoded = respState.output[0].encrypted_content.replace(/^anthropic-thinking-v1:/, '')
+  assert.equal(JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')).signature, 'part1-part2')
+})

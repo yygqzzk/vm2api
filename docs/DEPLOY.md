@@ -22,9 +22,13 @@ VM2API_DB_SECRET='再一串'
 
 | 容器 | 说明 |
 |---|---|
-| `vm2api` | 控制面。Compose **只起这一个** |
+| `vm2api` | 控制面（`network_mode: host`） |
+| `vm2api-postgres` | PostgreSQL 18 主库（仅绑定 `127.0.0.1:5432`，全新安装默认启用；使用外部云库时可 `--no-deps` 跳过） |
+| `vm2api-redis` | Redis 8 L2 缓存（仅绑定 `127.0.0.1:6379`，可选，不可用时自动降级 L1） |
 | `kin-<槽>` | 每个**已启动**的槽 1 个 |
-| 没有 | 未启动的槽；同机其它项目的 postgres / newapi 等 |
+| 没有 | 未启动的槽；同机其它项目的独立数据库 |
+
+> **PostgreSQL 一键安装与存量 SQLite 无缝迁移**：支持使用 `curl -sSL https://raw.githubusercontent.com/dofastted/vm2api/main/deploy/install-pg.sh | sudo bash` 自动补装缺失的 Docker / `postgresql-client` / Node(`pg`,`ioredis`) 依赖并完成全新部署或存量无缝迁移；普通 `upgrade` 与面板更新均会自动保留未迁移的 `data/kin.db`（不会误启空 PG 或抢占已有 5432/6379 端口），详情见 [PostgreSQL 迁移指南](POSTGRES_MIGRATION.md)。
 
 不是一个父容器里多个子进程。
 
@@ -62,11 +66,11 @@ sudo bash /opt/vm2api/deploy/install.sh crag-update
 
 需要包含 `scripts/seed-crag.mjs`、`scripts/update-crag.mjs` 的消费端源码/镜像；只下载一个新版 shell 到旧镜像不足以补齐 Node 更新器。支持已有 Docker 控制面和主机 Node 部署；读取进程环境或 `.env` 的 `VM2API_API_KEY` / `KIN_API_KEY`。无 `.env` 的主机 systemd 部署可由 root 从既有 `vm2api.service` 进程环境读取 key/port，不复制或打印完整环境；也可用进程环境 `PORT` 指定本地控制面端口。普通 amd64 `install` / `upgrade` 即使没有 CRAG 缓存也执行获取；`--no-start` / `--no-sync-wrap` 跳过，显式 `crag-update --no-start` 报错。当前 CRAG 发行包仅支持 amd64，ARM64 一键安装明确提示并跳过 CRAG 获取，不影响原有安装路径。缺少有效出厂包时，拉取只信任随官方 vm2api 交付的 `deploy/payload.json` 固定公钥摘要；未携带此摘要的部署仍需可信出厂包。
 
-更新顺序：从 vm2api 公开 Release 下载完整包，以原信任锚校验签名、成员 SHA 与 ELF → 原子切换下载指针 → 全槽清点 → 检查已有 CRAG V2 槽 → 有变化时以唯一标记暂停调度并排空在途请求 → 确认原生 `active_requests`、`queued`、`continuations` 全为 0 → 受管同步或重载对应槽 → 核验运行中 memfd 的 SHA 与签名 payload 承诺一致。安装目录哈希相同不能证明运行进程已更新。
+更新器先下载并验证签名包，再把指定版本交给运行中的控制面安装。控制面使用各槽的实际部署位置，逐槽暂停调度、排空在途请求，并确认运行槽的 `active_requests`、`queued`、`continuations` 均为 0 后才重启，不需要全局暂停。本机槽确认安装文件与运行中的 memfd 都已是目标版本时，不会再次安装；集群槽由控制面在节点安装并报告结果，不使用本机容器或文件校验远端状态。
 
-不改变内核选择：CRAG V2 槽更新运行内核；已停止槽只更新磁盘，不开机；非 CRAG 本地槽若留有 `crag-v2` 缓存，仅原子更新该目录，不碰 wrapper、配置和进程；无副本的槽、Codex 槽不安装 CRAG。非 CRAG 集群槽标为 skip，不宣称替换其远端文件；当前物化器不支持的集群/KVM CRAG V2 目标在下载/停调度前失败。报告逐槽列出 `sync` / `cache` / `skip`。
+仅更新已选用 CRAG V2 的槽；已停止的槽只换包，不开机。非 CRAG 本地槽若留有 `crag-v2` 缓存，仅原子更新该目录，不碰 wrapper、配置和进程；非 CRAG 集群槽、无副本的槽和 Codex 槽标为 `skip`。macOS 原生节点不支持此安装方式。报告逐槽列出 `sync` / `cache` / `skip`。
 
-下载或信任校验失败不覆盖旧包、不停槽；未完成工具续接时拒绝强制重启。更新锁为 `share/crag/kernels/v2/.update-lock`，并发更新失败；强杀后须先确认无更新进程再清理锁。调度 hold 使用本次唯一 `crag_update_*` 标记，正常退出时只恢复自己的 hold；断电/强杀不承诺自动恢复。失败返回非零，不伪装成功。回滚用保留的前一完整包，仍须验证原发行公钥、空闲/续接状态并显式重载；禁止轮换授权身份、用 legacy ELF 降级或仅改指针后宣称已回滚。
+下载或信任校验失败不覆盖旧包、不停槽。更新锁为 `share/crag/kernels/v2/.update-lock`；强杀后须先确认后台安装和更新进程均已结束，再清理锁。失败返回非零，批量安装可能已更新其中部分槽；结果不明时先核对槽位状态，不要重复提交。回滚须选择保留的前一完整签名包并重新安装；仅改下载指针不会回滚槽内运行版本。
 
 当前重装接口在同一槽生命周期锁内排空请求、停止服务、关闭 Docker 自动重启、替换文件并验证重启；成功报告 `restarted: true`、`stopped: false`、`status: running`，无需再发一次启动请求。失败可能保持 stopped，须按逐槽错误和实际运行状态处理，不能用 HTTP 200 判断成功。较旧控制面可能只安装并保持停止，按实际部署版本核对；详见[托管节点内核排障与验收](managed-kernel-troubleshooting.md)。安装不主动重置家目录、凭据、指纹或工作区；启动阶段若需更新容器布局可能保留持久目录重建，不能承诺容器 ID 恒定。
 
@@ -90,6 +94,8 @@ sudo bash /opt/vm2api/deploy/install.sh changelog
 
 保留 `.env` / `vms/` / `data/`。一键更新会把新版 `share/wrap-cli`（包括 `kin-kernel.bin`、`cli-node`、`cc-node`）同步到本机槽并重启槽内 dataplane；集群槽使用同一份二进制加上当前 Go `kin-worker` 遥测重建槽位镜像，再换容器，不改凭证和指纹。如需暂时跳过可加 `--no-sync-wrap`。管理台 **设置 → 关于** 可复制同一条命令、看 changelog。指定版本：`--version v1.2.22`。槽位重建可选「保留原数据」或「重建新特征」。
 
+在 Ubuntu 24.04 等使用 apt 的 Linux amd64 宿主上，一键安装和升级会补齐缺少的 Gemini 宿主依赖，并自动准备 [Gemini 默认组件](gemini-host.md)。管理员在「导入 → Gemini」输入兑换码激活；已有 Gemini 载荷不会被替换。`--no-start` 不安装依赖，也不下载或启动 Gemini。
+
 首次登录后，在「用户」中找到当前管理员，点击「改密码」设置至少 8 位的新密码。默认密码管理员也会写入用户列表；修改后数据库密码优先，重启或更新不会被 `.env` 中的旧密码覆盖。
 
 **ARM64 主机（实验性）**：同一条命令按 `uname -m` 自动选择 `vX.Y.Z-arm64` 控制面镜像并准备 QEMU（slot 仍是 amd64）。`--version` 可带 `-amd64` / `-arm64` 后缀，须与宿主一致。详见 [ARM64.md](ARM64.md)。
@@ -109,6 +115,11 @@ curl -sS --noproxy '*' http://127.0.0.1:8787/health
 ```
 
 `bin/` 与 `share/wrap-cli` 由镜像入口写入挂载目录，`src/config` 缺文件时用镜像内默认值补齐。
+
+同一安装目录只能运行一个控制面，不要让宿主机 `vm2api.service` 和 Compose 控制面共用其 `data/` 同时运行。即使 HTTP 端口不同，槽位出口仍使用同一组监听端口。Linux 源码直跑需要 `flock`（`util-linux`，官方镜像已包含）；重复启动会报 `vm2api_control_plane_already_running`，不会接管已有出口。首次从未使用该锁的旧版本迁移时，先停旧控制面再启动新的；不要靠换 HTTP 端口做并行切换。
+
+Docker 入口在覆盖共享二进制前加锁，并把同一把锁交给 Node。`KIN_AUTO_SYNC_WRAP=1` 时，共享内核文件有变化才会在该 Node 实例开始监听后同步槽位，不向其他控制面发送 HTTP 请求。
+
 KVM / Docker 槽位将宿主 `data/run/slot-guest-bin/`（仅含 `kin-worker`、`kin-kernel` 两个文件，**不会**挂载整个 `bin/`）只读挂进容器，避免单文件 bind mount 在升级替换二进制后仍粘旧 inode，也避免把 `kin-egress`、`kin-api-kernel` 等其它 helper 暴露进槽位 PATH。此后升级 worker/kernel **不必重建槽位**；若容器仍是旧版单文件挂载创建的，须 **重建该槽位容器一次** 才能切换到 staging 目录挂载。
 槽位系统镜像优先 `docker pull ghcr.io/dofastted/kin-os-*`，拉不到时在建槽阶段用仓内 Dockerfile 兜底构建（启动不阻塞）。
 
@@ -151,6 +162,14 @@ kin-<槽> 容器 → keg* 网桥 → 宿主机 kin-egress（网关 IP:端口）�
 本机 SOCKS5 槽位（Docker / KVM）的重启策略为 `no`：由控制面的内核自动恢复流程负责进程崩溃和开机恢复，Docker 不再独立启动槽位。控制面启动时通过现有自动恢复流程，先安装阻断与代理规则，再启动记录为运行中的槽位；如果控制面启动失败、代理不可用或关闭了内核自动恢复，槽位保持停止，需恢复控制面或在面板手动启动。暂停的槽位不会被开机恢复。本地直连出口和远端节点的启动策略不变。
 
 升级时控制面会用 `docker update --restart no` 原地迁移已有本机代理槽位（包括暂停槽位的容器），不重建槽位、不改凭据。请先升级并确认控制面成功启动，再重启 Docker。迁移失败会阻止控制面启动并打印错误；不能仅凭版本号认定已启用保护。该保护针对 Docker 守护进程重启；不要手工 `docker start` 代理槽位或清除其防火墙规则，`live-restore` 场景也不在此启动顺序保证范围内。
+
+宿主机 `kin-egress` 的运行方式（v1.4.134 起）：控制面在 Docker 中运行（compose 设置 `VM2API_CONTAINER_NAME` 并挂载 `docker.sock`）时，每个代理的 `kin-egress` 作为独立的 host 网络容器 `kin-cp-egress-<代理>`（`--restart unless-stopped`）运行，控制面重启不会打断槽位 DNS；其他情况作为控制面子进程运行。可用 `KIN_EGRESS_RUNTIME=process|container` 强制指定。从容器方式切回进程方式时，控制面会先删除同一代理遗留的 `kin-cp-egress-*` 容器再占用端口；降级到 v1.4.133 及更早版本前，请先执行 `docker ps -aq --filter name=kin-cp-egress- | xargs -r docker rm -f`，否则旧版本看不到这些容器的进程，会一直等待端口释放。
+
+**代理故障与恢复（Unreleased）：** 单条宿主 `kin-egress` 故障只限制当前依赖该 helper 的本机运行或暂停槽位；同一代理上的远端槽和本机 GPT 槽不依赖这个 helper。代理端点自身连续探测失败仍按代理池阈值处理，影响绑定该代理的槽位。Docker inspect 或 `ss` 不可用不算已确认故障，不新增或清除槽位限制。
+
+定时探测（启用时）和面板「探测」使用同一恢复逻辑：代理协议探测成功，需要宿主 helper 的槽还须确认其 TCP 监听；随后只清除当前绑定代理留下的自动 `proxy_cooldown`，即使代理行此前已显示健康也会核对。手动禁用代理仍须点「启用」；手动调度关、维护锁、凭据或内核造成的不可调度不会被清除。监听检查不是 DNS 或真实推理验收；若恢复后请求仍失败，按下方步骤从槽内验证网络。
+
+故障期间不会改绑、换 IP、自动直连或放宽防火墙与 IPv6 策略。这是同一控制面内的出口隔离，不是跨宿主高可用；宿主或共享上游故障仍可能影响多个出口，进程模式下控制面进程树退出也可能同时停止多个 helper。
 
 控制面用 iptables 把容器的 TCP 和 DNS 重定向到宿主机上的 `kin-egress`。这一跳的目的地是宿主机本身，要经过宿主机 **INPUT** 链。UFW 默认入站 `DROP`，而 vm2api 不改你的 INPUT 规则，所以需要手动放行：
 
@@ -204,8 +223,8 @@ docker exec kin-<槽> curl -sS -o /dev/null -w '%{http_code}\n' --max-time 10 ht
 Node 听 `:8787`。HTTPS 放在 nginx。
 
 ```nginx
-# 集群页 / 槽位运维终端是 WebSocket：必须透传 Upgrade，并直连 Node（前面若有会丢 Upgrade 的网关，也要绕过）。
-location ~ ^/api/panel/(cluster/nodes|vms)/[^/]+/shell$ {
+# 集群、槽位和 Gemini 终端是 WebSocket：必须透传 Upgrade，并直连 Node。
+location ~ ^/api/panel/((cluster/nodes|vms)/[^/]+/shell|gemini/environments/[^/]+/terminal/ws)$ {
   proxy_pass http://127.0.0.1:8787;
   proxy_http_version 1.1;
   proxy_set_header Host $host;
@@ -238,11 +257,17 @@ location / {
 }
 ```
 
-`Connection ""` 会剥掉 Upgrade，终端或 Responses WS 握手拿不到 101，所以 shell / responses 路径单独放在前面。生产机的 Go 前门在 `:8787`、Node 在 `:8788` 时，这些 location 必须 `proxy_pass` 到 Node。终端症状和核对命令见 [nginx-shell.md](nginx-shell.md)。
+`Connection ""` 会剥掉 Upgrade，终端或 Responses WS 握手拿不到 101。生产机的 Go 前门在 `:8787`、Node 在 `:8788` 时，上述两个 WebSocket location 必须 `proxy_pass` 到 Node；若自定义反代拆分了 API 路由而非统一 `location /`，还需将 `/v1beta/` 一并转发到网关，避免 Google Gemini SDK 请求落到静态页返回 405/HTML。终端症状和核对命令见 [nginx-shell.md](nginx-shell.md)。
 
 ## 本机 Node（备选）
 
 `npm run fetch:payload` 拉 `bin/kin-{kernel,codex-kernel,oauth-auth}` 与 `share/`；`npm run build:egress && npm run build:worker`；`npm ci`、`pnpm -C web install --frozen-lockfile && npm run build:web`；以及占位 `vms/active.json`。单元：[deploy/vm2api.service](deploy/vm2api.service)。细节见 [BUILD.md](BUILD.md)。
+
+## 不停服升级（蓝绿）
+
+普通升级要重启控制面，期间请求挂住、长流可能被砍。单机可以改用蓝绿：haproxy 在前，两个颜色轮流接班，切换约 1 秒、旧实例在后台跑完长流。见 [BLUEGREEN.md](BLUEGREEN.md)。
+
+切到蓝绿后，升级一律用 `deploy/bluegreen/bg-deploy.sh`：`install.sh` 只更新文件、不再 `compose up`；直接 `docker compose up -d` 起来的单容器会拒绝启动（`vm2api_bluegreen_install`）。
 
 ## 一键安装 / 更新
 

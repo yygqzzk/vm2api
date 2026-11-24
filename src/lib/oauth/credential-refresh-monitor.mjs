@@ -7,7 +7,13 @@
 import { isLocalEgressProxy } from '../vm/egress.mjs'
 import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
-import { hasCredentialPresence, hasRefreshPresence, needsRefresh } from './oauth-credentials.mjs'
+import {
+  PROACTIVE_REFRESH_SKEW_MS,
+  classifyCredentialRefresh,
+  hasCredentialPresence,
+  hasRefreshPresence,
+  needsRefresh,
+} from './oauth-credentials.mjs'
 
 export const DEFAULT_CREDENTIAL_REFRESH = Object.freeze({
   enabled: true,
@@ -76,9 +82,32 @@ export function shouldForceRefresh(vm) {
   return true
 }
 
-export function needsScheduledRefresh(vm, now = Date.now()) {
-  if (vm?.refresh_error || vm?.claude?.refresh_error) return false
-  return needsRefresh(vm?.expires_at || vm?.claude?.expires_at, now)
+/** Due 15 minutes ahead so the host refresh always beats the in-slot CLI's 5-minute refresh. */
+export function needsScheduledRefresh(vm, now = Date.now(), skewMs = PROACTIVE_REFRESH_SKEW_MS) {
+  // Older versions persisted transport failures as credential errors. Retry
+  // those at the ordinary monitor cadence; actual grant rejection stays parked.
+  const errors = [vm?.refresh_error, vm?.claude?.refresh_error].filter(Boolean)
+  if (errors.some((code) => classifyCredentialRefresh({ error: { code } }) !== 'retryable')) return false
+  return needsRefresh(vm?.expires_at || vm?.claude?.expires_at, now, skewMs)
+}
+
+/** Parked because the node's worker could not guard refresh retries; only a worker upgrade ends that. */
+export function isUpgradeParked(vm) {
+  // Only where clearUpgradeRequired can clear it: markVmRefreshError writes claude.refresh_error and nothing
+  // writes the top-level field. Looking at both would probe a slot every pass that could never be released.
+  return vm?.claude?.refresh_error === 'worker_upgrade_required'
+}
+
+/**
+ * Local Claude slots whose `.credentials.json` alias must stay a symlink. The CLI
+ * saves by write-then-rename, which turns the alias back into a regular file;
+ * until it is relinked the CLI and the host each hold their own refresh token.
+ */
+export function isLocalCredentialLinkTarget(vm) {
+  if (!vm?.id || vm.node_id) return false
+  if (isCodexVm(vm)) return false
+  if (HARD_DOWN.has(String(vm.status || '').toLowerCase())) return false
+  return hasCredentialPresence(vm.claude) || hasCredentialPresence(vm)
 }
 
 function mapPool(items, concurrency, fn) {
@@ -129,7 +158,33 @@ export function createCredentialRefreshMonitor(opts = {}) {
           }
         })
       }
+      // Slots parked on an old worker: ask the node whether it has been upgraded. A yes clears the park and
+      // the next pass refreshes through the guarded path; nothing is sent to the upstream here.
+      const revived = []
+      if (typeof opts.reviveOne === 'function') {
+        const waiting = vms.filter((vm) => isCredentialRefreshTarget(vm) && isUpgradeParked(vm))
+        await mapPool(waiting, config.concurrency, async (vm) => {
+          try {
+            const result = await opts.reviveOne(vm)
+            if (result?.revived) revived.push(vm.id)
+          } catch {
+            /* probe failed: stay parked, try again next pass */
+          }
+        })
+      }
       const linkFailures = []
+      if (opts.ensureLocalLink) {
+        // Refresh above relinks the slots it touched; this keeps idle slots on one store too.
+        const local = vms.filter(isLocalCredentialLinkTarget)
+        await mapPool(local, config.concurrency, async (vm) => {
+          try {
+            const result = await opts.ensureLocalLink(vm)
+            if (!result?.linked) linkFailures.push({ vm_id: vm.id, reason: 'local_credential_link_failed' })
+          } catch {
+            linkFailures.push({ vm_id: vm.id, reason: 'local_credential_link_failed' })
+          }
+        })
+      }
       if (opts.ensureLink) {
         const running = vms.filter(
           (vm) =>
@@ -151,6 +206,7 @@ export function createCredentialRefreshMonitor(opts = {}) {
         at: new Date(nowFn()).toISOString(),
         duration_ms: nowFn() - started,
         due: due.length,
+        revived,
         link_failures: linkFailures,
         items,
       }

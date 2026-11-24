@@ -29,6 +29,12 @@ export type PreviewEdit =
       field: 'name' | 'description'
       value: string
     }
+  // 推荐角标文案走 edit 通道而不是 layout 通道：父页的 crag-preview:layout
+  // 只认 plan_columns / orders_position / featured_sku，其余 key 一律丢弃，
+  // featured_label 在它的 crag-preview:edit 分支里以 target:'layout' 处理，
+  // 且父页未设推荐位时会拒收。画布目前不做列数/密度/位置/推荐位控件，
+  // 所以没有往 crag-preview:layout 发消息的路径。
+  | { target: 'layout'; key: 'featured_label'; value: string }
 
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -62,6 +68,10 @@ function validPlan(value: unknown): value is DraftPlan {
     (value.months === undefined || integer(value.months, 1)) &&
     (value.enabled === undefined || typeof value.enabled === 'boolean') &&
     (value.renewable === undefined || typeof value.renewable === 'boolean') &&
+    (value.product === undefined ||
+      value.product === 'crag-v2' ||
+      value.product === 'craggemini') &&
+    (value.stackable === undefined || typeof value.stackable === 'boolean') &&
     (value.name === undefined || text(value.name, 120)) &&
     (value.description === undefined || text(value.description, 500))
   )
@@ -85,13 +95,20 @@ function validCommerce(value: unknown): value is CommerceRules {
   )
 }
 
+/**
+ * presentation 校验。`layout` 的内容只校验到「是对象」为止，具体取值交
+ * normalizeLayout 逐字段兜底 —— 一个排版字段的取值错不该让整条草稿被丢弃。
+ *
+ * 顶层未知文案键仍整条拒绝，沿用既有协议强度，未在本次放宽。
+ */
 function validPresentation(value: unknown): value is Presentation {
   return (
     record(value) &&
-    Object.entries(value).every(
-      ([key, content]) =>
-        Object.prototype.hasOwnProperty.call(copyDefaults, key) &&
-        text(content, key.includes('title') ? 120 : 500)
+    Object.entries(value).every(([key, content]) =>
+      key === 'layout'
+        ? content == null || record(content)
+        : Object.prototype.hasOwnProperty.call(copyDefaults, key) &&
+          text(content, key.includes('title') ? 120 : 500)
     )
   )
 }

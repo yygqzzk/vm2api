@@ -25,6 +25,9 @@ export const OAUTH_FLAVORS = Object.freeze({
   },
   setup_token: {
     flavor: 'setup_token',
+    // Same consent page and same grant as CAI: identity (profile/roles/
+    // bootstrap) needs `user:profile`, so the mint is not narrowed. The only
+    // difference is the one-year lifetime requested at exchange time.
     authorizeUrl: 'https://claude.com/cai/oauth/authorize',
     redirectUri: 'https://platform.claude.com/oauth/code/callback',
     tokenUrls: ['https://platform.claude.com/v1/oauth/token', 'https://api.anthropic.com/v1/oauth/token'],
@@ -71,11 +74,14 @@ function fail(code, message) {
   return err
 }
 
-function normalizeSocks(proxyUrl) {
-  if (proxyUrl === '') return ''
-  const s = String(proxyUrl || '').trim()
-  if (!s) return null
-  return s.replace(/^socks5:\/\//i, 'socks5h://')
+/**
+ * Whether a slot has a bound exit at all, for refusing an authorize link before
+ * the user walks through a browser flow. `''` is local egress (bound, direct).
+ * This is not address resolution: the exchange resolves its own exit at the
+ * point of use, and the public SOCKS formatter lives in socks-address.mjs.
+ */
+function hasBoundExitUrl(proxyUrl) {
+  return proxyUrl === '' || Boolean(String(proxyUrl || '').trim())
 }
 
 export function normalizeOauthFlavor(raw) {
@@ -113,7 +119,7 @@ export function buildAuthorizationURL(state, codeChallenge, scope = SCOPE_OAUTH,
 export function generateAuthUrl({ vmId, proxyUrl, flavor } = {}) {
   sweepExpired()
   if (!vmId) throw fail('vm_required', 'vm_id required (先创建虚拟机)')
-  if (normalizeSocks(proxyUrl) == null) {
+  if (!hasBoundExitUrl(proxyUrl)) {
     throw fail('proxy_required', '虚拟机未绑定 SOCKS5，请先分配代理再生成授权链接')
   }
   const spec = oauthFlavorSpec(flavor)
@@ -150,19 +156,55 @@ function parseAuthCode(fullCode) {
   return { code: raw.slice(0, hash), state: raw.slice(hash + 1) }
 }
 
-async function exchangeCodeForToken(authCode, codeVerifier, state, proxyUrl, session, options = {}) {
-  // The execution context resolves the VM's current bound exit, including
-  // controller execution for legacy kernels. Do not reuse a stale session proxy.
-  const px = options.exec ? null : normalizeSocks(proxyUrl)
-  if (px == null && !options.exec) throw fail('proxy_required', '虚拟机未绑定 SOCKS5，无法换票')
+async function exchangeCodeForToken(authCode, codeVerifier, state, session, options = {}) {
+  // The execution context resolves the VM's current bound exit at the point of
+  // use, including controller execution for legacy kernels and native nodes.
+  // `proxyUrl` here is the fetchImpl test seam only; a session's stored proxy is
+  // a snapshot from authorize time and never decides the exchange.
   return exchangeTokenViaCookieAuth({
     code: authCode,
     codeVerifier,
     state,
-    proxyUrl: px,
     redirectUri: session.redirectUri,
     tokenUrls: session.tokenUrls,
+    // Runtime mode selects the transport profile: setup-token for the README
+    // mint flow, OAuth for pasted CAI authorization codes.
+    runtimeMode: session.flavor === 'setup_token' ? 'setup-token' : 'oauth',
     ...options,
+  })
+}
+
+
+/**
+ * The helper already ran the README's post-token sequence (profile → eval →
+ * roles → first token date → eval → bootstrap), so its reply carries
+ * `organization_role`, `subscription_created_at` and `oauth_account` as well.
+ * Keep every field it returned; only the canonical ones are re-stated here.
+ */
+export function linkCredentialFromToken(token = {}, session = {}) {
+  const identity = flattenOauthIdentity(token)
+  const expiresIn = Number(token.expires_in || 0)
+  const now = Math.floor(Date.now() / 1000)
+  // kin-oauth-auth completes bootstrap through the same bound exit as the
+  // exchange, whether in the VM or on the controller. Do not bootstrap twice.
+  return carryOAuthAttempt(token, {
+    ...token,
+    access_token: token.access_token,
+    refresh_token: token.refresh_token || '',
+    token_type: token.token_type || 'Bearer',
+    expires_in: expiresIn,
+    expires_at: token.expires_at || now + expiresIn,
+    scope: token.scope || session.scope,
+    email: identity.email || token.email,
+    email_address: identity.email || token.email_address,
+    account_uuid: identity.account_uuid || token.account_uuid,
+    org_uuid: identity.org_uuid || token.org_uuid,
+    subscription_type: identity.subscription_type || token.subscription_type,
+    rate_limit_tier: identity.rate_limit_tier || token.rate_limit_tier,
+    organization_role: identity.organization_role || token.organization_role,
+    subscription_created_at: identity.subscription_created_at || token.subscription_created_at,
+    source: session.source || 'oauth-auth-url',
+    flavor: session.flavor || 'cai',
   })
 }
 
@@ -175,6 +217,7 @@ export async function exchangeAuthCode({
   exec,
   projectRoot,
   routing,
+  proxyPool,
 } = {}) {
   sweepExpired()
   const session = sessions.get(sessionId)
@@ -192,8 +235,9 @@ export async function exchangeAuthCode({
   if (!parsed.code) throw fail('code_required', '请粘贴授权码')
   if (session.flavor === 'setup_token' && parsed.state && parsed.state !== session.state)
     throw fail('state_mismatch', '授权 state 不匹配，请重新生成授权链接')
-  const px = proxyUrl ?? session.proxyUrl
-  if (px == null && !exec) throw fail('proxy_required', '虚拟机未绑定 SOCKS5，无法换票')
+  // session.proxyUrl stays on the record for audit only. A pool reallocation
+  // inside SESSION_TTL_MS is a legitimate operation, so the exchange resolves
+  // the exit itself rather than refusing or reusing this snapshot.
 
   if (process.env.KIN_FAKE_SESSION_OAUTH === '1' || process.env.KIN_FAKE_SESSION_OAUTH === 'true') {
     sessions.delete(sessionId)
@@ -216,32 +260,14 @@ export async function exchangeAuthCode({
   // Full OAuth paste codes carry the provider's exchange state, not necessarily
   // the authorize nonce. PKCE still binds the code to this VM's live session.
   const exchangeState = session.flavor === 'setup_token' ? parsed.state || session.state : parsed.state
-  const token = await exchangeCodeForToken(parsed.code, session.codeVerifier, exchangeState, px, session, {
+  const token = await exchangeCodeForToken(parsed.code, session.codeVerifier, exchangeState, session, {
     exec,
     projectRoot,
     routing,
+    proxyPool,
+    proxyUrl,
     fetchImpl,
   })
   sessions.delete(sessionId)
-  const expiresIn = Number(token.expires_in || 0)
-  const now = Math.floor(Date.now() / 1000)
-  const identity = flattenOauthIdentity(token)
-  // kin-oauth-auth completes bootstrap through the same bound exit as the
-  // exchange, whether in the VM or on the controller. Do not bootstrap twice.
-  return carryOAuthAttempt(token, {
-    access_token: token.access_token,
-    refresh_token: token.refresh_token || '',
-    token_type: token.token_type || 'Bearer',
-    expires_in: expiresIn,
-    expires_at: token.expires_at || now + expiresIn,
-    scope: token.scope || session.scope,
-    email: identity.email,
-    email_address: identity.email,
-    account_uuid: identity.account_uuid,
-    org_uuid: identity.org_uuid,
-    subscription_type: identity.subscription_type,
-    rate_limit_tier: identity.rate_limit_tier,
-    source: session.source || 'oauth-auth-url',
-    flavor: session.flavor || 'cai',
-  })
+  return linkCredentialFromToken(token, session)
 }

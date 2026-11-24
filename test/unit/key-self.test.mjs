@@ -7,6 +7,7 @@ import { ApiKeyStore } from '../../src/lib/admin/api-keys.mjs'
 import { closeDatabase, createDatabase, getDb, openDatabase } from '../../src/lib/db/database.mjs'
 import { UsageLogsRepo } from '../../src/lib/db/repos/usage-logs-repo.mjs'
 import { zonedDayStartMs } from '../../src/lib/core/timezone.mjs'
+import { getCacheRuntime } from '../../src/lib/cache/index.mjs'
 import { createKeySelfHandler, decodeCursor, encodeCursor } from '../../src/lib/protocol/key-self.mjs'
 
 const MASTER = 'master-secret-for-key-self-tests'
@@ -282,10 +283,11 @@ test('every limit flag agrees with canAccept', async (t) => {
     [
       'window 5h closed',
       { rate_limit_5h: 1 },
-      (rec) => {
+      async (rec) => {
         store.recordUsage(rec.id, { total_cost: 5 })
         const stale = new Date(now - 5 * 3600_000).toISOString()
         db.prepare('UPDATE api_keys SET window_5h_start = ? WHERE id = ?').run(stale, rec.id)
+        await getCacheRuntime().apiKeys.invalidateAll()
       },
       (b) => b.windows['5h'].used === 0 && b.windows['5h'].reset_at === null && !b.windows['5h'].exceeded,
     ],
@@ -310,7 +312,7 @@ test('every limit flag agrees with canAccept', async (t) => {
   ]
   for (const [label, input, arrange, flagged] of scenarios) {
     const rec = store.create({ name: label, ...input })
-    arrange(rec)
+    await arrange(rec)
     const fresh = store.getById(rec.id)
     const gate = store.canAccept(fresh, now)
     const { body } = await call('/v1/me/quota', { key: rec.key, now })

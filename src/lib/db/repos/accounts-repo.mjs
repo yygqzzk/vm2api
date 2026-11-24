@@ -1,9 +1,9 @@
 /**
- * accounts + account_allocations repository (sub2api-shaped table).
+ * Repository for `accounts` and `account_allocations`.
  *
- * The table follows the sub2api Account columns (id/platform/type/extra/
- * priority/schedulable/rate_limited_at/…, ISO-8601 TEXT timestamps) while the
- * public record shape stays what the pool/panel layers always consumed:
+ * The `accounts` table stores id/platform/type/extra/priority/schedulable/
+ * rate_limited_at/… with timestamps as ISO-8601 TEXT. The public record
+ * keeps the fields used by the pool and panel layers:
  * account_id, max_concurrency, unified, last_blocked, last_cli_rate_limit.
  * The unified/blocked/rate-limit snapshots live inside the `extra` JSON.
  */
@@ -56,6 +56,7 @@ export function rowToAccount(row) {
     last_blocked: extra.last_blocked ?? null,
     last_cli_rate_limit: extra.last_cli_rate_limit ?? null,
     window_history: extra.window_history ?? null,
+    created_at: row.created_at ?? null,
     updated_at: row.updated_at,
   }
 }

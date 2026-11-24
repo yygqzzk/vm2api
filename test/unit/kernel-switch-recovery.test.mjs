@@ -406,11 +406,9 @@ for (const placement of ['local', 'cluster']) {
 }
 
 test('native macOS still rejects licensed CRAG switching through both legacy endpoints', async (t) => {
-  const { root, vm } = fixture(t, { node_id: 'node-mac', node_platform: 'darwin' })
+  const { root, vm } = fixture(t, { node_id: 'node-mac', node_platform: 'darwin' }, { universalBeforeSlot: true })
   bindPlacement({ projectRoot: root, manager: { nodePlatform: () => 'darwin' } })
   t.after(unbindPlacement)
-  seedEncryptedPackage(root)
-  activateCragLicense(root, vm, issueUniversalCode(root).code)
   const record = fs.readFileSync(path.join(root, 'vms', `${vm.id}.json`))
   const operations = {
     kernelPolicyOps: {
@@ -768,6 +766,22 @@ test('the first request after CRAG cutover uses the new kernel capabilities, not
     if (previous == null) delete process.env.KIN_KERNEL_BIN
     else process.env.KIN_KERNEL_BIN = previous
   })
+  // A local hop first requires the slot to load its OAuth credential, so a slot
+  // that cannot never reaches the capability question this test is about. The
+  // fixture VM claims `has_access`, so give it the grant that claim implies.
+  const claudeDir = path.join(root, 'vms', vm.id, 'cli-home', '.claude')
+  fs.mkdirSync(claudeDir, { recursive: true })
+  fs.writeFileSync(
+    path.join(claudeDir, 'credentials.json'),
+    JSON.stringify({
+      claudeAiOauth: {
+        accessToken: 'fixture-access',
+        refreshToken: 'fixture-refresh',
+        expiresAt: Date.now() + 3600000,
+        scopes: ['user:inference'],
+      },
+    }),
+  )
   const result = await dispatchCallInference({
     exec: {
       vmId: vm.id,

@@ -1,33 +1,37 @@
 /**
- * Multi API-key store (sub2api-inspired, SQLite-backed).
+ * Multi-key API key store (SQLite-backed).
  *
- * Fields aligned to sub2api basics:
- *   name, status, expires_at, quota (+ used), rate windows → rpm,
- *   concurrency (per-key, sub2api puts this on User).
+ * Managed keys have a name, status, expiry, spend quota and windows, an RPM
+ * limit, and a per-key concurrency limit.
  *
  * Master env key KIN_API_KEY is separate and unlimited.
  * Managed keys live in the `api_keys` table (see lib/db/).
- * Transient state (inflight concurrency, RPM buckets) stays in memory,
- * mirroring sub2api's Redis-transient split.
+ * Transient state (inflight concurrency, RPM buckets) stays in memory.
  *
  * Auth always goes through `key_hash` (HMAC). `key_secret` is a separate
  * at-rest copy of the plaintext — encrypted with KIN_DB_SECRET when set — so
  * the panel can re-reveal a key for copying after creation.
  */
 
-import { keyScopeFromRecord, normalizeKeyScope } from './key-scope.mjs'
+import {
+  keyScopeFromRecord,
+  keyTierPolicyFromRecord,
+  normalizeKeyScope,
+  normalizeMultiTierKeyConfig,
+} from './key-scope.mjs'
 import { normalizeKeyAllowedModels, parseKeyAllowedModels } from './key-models.mjs'
 import { VmPoolsRepo } from '../db/repos/vm-pools-repo.mjs'
 import crypto from 'node:crypto'
-import { resolveStoreDb } from '../db/database.mjs'
+import { DB_INSTANCE_ID, getDb, isDbOpen, resolveStoreDb } from '../db/database.mjs'
 import { ApiKeysRepo } from '../db/repos/api-keys-repo.mjs'
 import { maybeEncrypt, maybeDecrypt } from '../db/secure.mjs'
 import { calculateCost, normalizeUsage } from './pricing.mjs'
 import { UsersRepo } from '../db/repos/users-repo.mjs'
+import { getCacheRuntime } from '../cache/index.mjs'
 
 const KEY_PREFIX = 'sk-vm-'
 const HASH_MARKER = 'hmac:'
-// sub2api USD rate windows; ApiKeysRepo opens one at the first spend.
+// USD spend windows open on the first spend recorded by ApiKeysRepo.
 const RATE_WINDOWS = [
   { name: '5h', limit: 'rate_limit_5h', usage: 'usage_5h', start: 'window_5h_start', ms: 5 * 3600_000 },
   { name: '1d', limit: 'rate_limit_1d', usage: 'usage_1d', start: 'window_1d_start', ms: 24 * 3600_000 },
@@ -134,8 +138,12 @@ export function publicKeyView(rec, { reveal = false } = {}) {
     requests: rec.requests || 0,
     tokens_in: rec.tokens_in || 0,
     tokens_out: rec.tokens_out || 0,
-    category: rec.category === 'api' ? 'api' : 'oauth',
-    api_endpoint_id: rec.category === 'api' ? (rec.api_endpoint_id ?? null) : null,
+    category: rec.category === 'api' ? 'api' : rec.category === 'all' ? 'all' : 'oauth',
+    api_endpoint_id: rec.category === 'api' || rec.category === 'all' ? (rec.api_endpoint_id ?? null) : null,
+    permission_tier: keyTierPolicyFromRecord(rec).permission_tier,
+    owner_id: keyTierPolicyFromRecord(rec).owner_id,
+    allowed_endpoints: keyTierPolicyFromRecord(rec).allowed_endpoints,
+    allowed_gemini_envs: keyTierPolicyFromRecord(rec).allowed_gemini_envs,
     ...keyScopeFromRecord(rec),
     allowed_models: parseKeyAllowedModels(rec.allowed_models),
     inflight: undefined, // filled by store.snapshot
@@ -155,20 +163,20 @@ export class ApiKeyStore {
     this.repo = new ApiKeysRepo(this.db)
     this.hashSecret = String(
       hashSecret ||
-        process.env.VM2API_API_KEY_HASH_SECRET ||
-        process.env.KIN_API_KEY_HASH_SECRET ||
-        process.env.VM2API_DB_SECRET ||
-        process.env.KIN_DB_SECRET ||
-        process.env.VM2API_API_KEY ||
-        process.env.KIN_API_KEY ||
-        'kin-development-api-key-hash-secret',
+      process.env.VM2API_API_KEY_HASH_SECRET ||
+      process.env.KIN_API_KEY_HASH_SECRET ||
+      process.env.VM2API_DB_SECRET ||
+      process.env.KIN_DB_SECRET ||
+      process.env.VM2API_API_KEY ||
+      process.env.KIN_API_KEY ||
+      'kin-development-api-key-hash-secret',
     )
     this.inflight = new Map() // id → count
     this.rpmBuckets = new Map() // id → number[] timestamps ms
     this.users = new UsersRepo(this.db)
   }
 
-  /** sub2api: an api key of a disabled/deleted user must not authenticate. */
+  /** Keys owned by disabled or deleted users cannot authenticate. */
   _ownerActive(rec) {
     if (!rec?.user_id) return true // legacy unowned keys keep working
     try {
@@ -180,14 +188,35 @@ export class ApiKeyStore {
     }
   }
 
-  /** Re-read from DB (no-op cache-wise; kept for API compat + post-restore). */
-  reload() {}
+  /** Re-read from DB and clear cached auth entries. */
+  reload() {
+    getCacheRuntime()
+      .apiKeys.invalidateAll()
+      .catch(() => { })
+  }
 
   /** Re-bind to a fresh DB connection (after backup restore). */
   rebind(db) {
     this.db = db
     this.repo = new ApiKeysRepo(db)
     this.users = new UsersRepo(db)
+    getCacheRuntime()
+      .apiKeys.invalidateAll()
+      .catch(() => { })
+  }
+
+  _cacheKey(hash) {
+    if (!hash) return ''
+    if (isDbOpen() && this.db === getDb()) return hash
+    return `${this.db?.[DB_INSTANCE_ID] || 'isolated'}:${hash}`
+  }
+
+  _invalidateHash(hash, reason = 'updated') {
+    const ck = this._cacheKey(hash)
+    if (ck)
+      getCacheRuntime()
+        .apiKeys.invalidateByHash(ck, reason)
+        .catch(() => { })
   }
 
   list({ reveal = false } = {}) {
@@ -212,8 +241,17 @@ export class ApiKeyStore {
   authenticate(token) {
     if (!token) return { ok: false, reason: 'missing' }
     const hash = this._hash(token)
+    const cacheKey = this._cacheKey(hash)
+    const apiKeyCache = getCacheRuntime().apiKeys
+    const cached = apiKeyCache.getSync(cacheKey)
+    if (cached.hit) {
+      if (!cached.value) return { ok: false, reason: 'invalid' }
+      if (!this._ownerActive(cached.value)) return { ok: false, reason: 'user_disabled' }
+      return { ok: true, record: cached.value }
+    }
     const indexed = this.repo.getByHash(hash)
     if (indexed) {
+      apiKeyCache.putSync(cacheKey, indexed)
       if (!this._ownerActive(indexed)) return { ok: false, reason: 'user_disabled' }
       return { ok: true, record: indexed }
     }
@@ -226,9 +264,12 @@ export class ApiKeyStore {
         rec.key_suffix = String(token).slice(-4)
         rec.key_secret = maybeEncrypt(token)
         rec.key = HASH_MARKER + hash
-        return { ok: true, record: this.repo.update(rec) }
+        const updated = this.repo.update(rec)
+        apiKeyCache.putSync(cacheKey, updated)
+        return { ok: true, record: updated }
       }
     }
+    apiKeyCache.putSync(cacheKey, null)
     return { ok: false, reason: 'invalid' }
   }
 
@@ -247,12 +288,8 @@ export class ApiKeyStore {
       throw Object.assign(new Error('key already exists'), { code: 'key_exists' })
     }
 
-    const category =
-      String(input.category || 'oauth')
-        .trim()
-        .toLowerCase() === 'api'
-        ? 'api'
-        : 'oauth'
+    const multiTier = normalizeMultiTierKeyConfig(input, { partial: false })
+    const category = multiTier.category
     const rec = {
       id: 'key_' + crypto.randomBytes(6).toString('hex'),
       name,
@@ -281,24 +318,31 @@ export class ApiKeyStore {
       tokens_in: 0,
       tokens_out: 0,
       category,
+      permission_tier: multiTier.permission_tier,
+      owner_id: multiTier.owner_id,
+      allowed_endpoints: JSON.stringify(multiTier.allowed_endpoints),
+      allowed_gemini_envs: JSON.stringify(multiTier.allowed_gemini_envs),
       ...storedKeyScope(
         normalizeKeyScope(
           {
             group_type: input.group_type,
             allowed_vms: input.allowed_vms,
             category,
+            permission_tier: multiTier.permission_tier,
+            owner_id: multiTier.owner_id,
             ...(Object.prototype.hasOwnProperty.call(input, 'vm_pool_id') ? { vm_pool_id: input.vm_pool_id } : {}),
           },
           { isApi: category === 'api' },
         ),
       ),
-      api_endpoint_id: category === 'api' ? (input.api_endpoint_id ?? null) : null,
+      api_endpoint_id: category === 'api' || category === 'all' ? (input.api_endpoint_id ?? null) : null,
       allowed_models: JSON.stringify(normalizeKeyAllowedModels(input.allowed_models)),
     }
     if (rec.expires_at && Number.isNaN(Date.parse(rec.expires_at))) {
       throw Object.assign(new Error('invalid expires_at'), { code: 'invalid_expires_at' })
     }
     const stored = this.repo.insert(rec)
+    this._invalidateHash(keyHash, 'created')
     return { ...stored, key, _plain_key: key }
   }
 
@@ -342,18 +386,26 @@ export class ApiKeyStore {
     ) {
       rec.status = 'active'
     }
-    if (patch.category != null) {
-      rec.category = String(patch.category).trim().toLowerCase() === 'api' ? 'api' : 'oauth'
-    }
-    if (rec.category !== 'api') rec.api_endpoint_id = null
+    const multiTier = normalizeMultiTierKeyConfig(patch, { partial: true, current: rec })
+    rec.category = multiTier.category
+    rec.permission_tier = multiTier.permission_tier
+    rec.owner_id = multiTier.owner_id
+    rec.allowed_endpoints = JSON.stringify(multiTier.allowed_endpoints)
+    rec.allowed_gemini_envs = JSON.stringify(multiTier.allowed_gemini_envs)
+    if (rec.category !== 'api' && rec.category !== 'all') rec.api_endpoint_id = null
     else if (Object.hasOwn(patch, 'api_endpoint_id')) rec.api_endpoint_id = patch.api_endpoint_id ?? null
-    const scope = normalizeKeyScope(patch, { partial: true, current: rec, isApi: rec.category === 'api' })
+    const scope = normalizeKeyScope(
+      { ...patch, category: rec.category, permission_tier: rec.permission_tier, owner_id: rec.owner_id },
+      { partial: true, current: rec, isApi: rec.category === 'api' },
+    )
     if (scope) Object.assign(rec, storedKeyScope(scope))
     if (Object.hasOwn(patch, 'allowed_models')) {
       rec.allowed_models = JSON.stringify(normalizeKeyAllowedModels(patch.allowed_models))
     }
     rec.updated_at = nowIso()
-    return this.repo.update(rec)
+    const updated = this.repo.update(rec)
+    this._invalidateHash(rec.key_hash, 'updated')
+    return updated
   }
 
   /**
@@ -377,6 +429,7 @@ export class ApiKeyStore {
     if (this.repo.getByHash(keyHash)) {
       throw Object.assign(new Error('key already exists'), { code: 'key_exists' })
     }
+    const prevHash = rec.key_hash
     rec.key = HASH_MARKER + keyHash
     rec.key_hash = keyHash
     rec.key_prefix = key.slice(0, 10)
@@ -384,14 +437,21 @@ export class ApiKeyStore {
     rec.key_secret = maybeEncrypt(key)
     rec.updated_at = nowIso()
     const stored = this.repo.update(rec)
+    this._invalidateHash(prevHash, 'rotated')
+    this._invalidateHash(keyHash, 'rotated')
     return { ...stored, key, _plain_key: key }
   }
 
   remove(id) {
+    const prev = this.repo.getById(id)
     const removed = this.repo.remove(id)
     if (!removed) return false
     this.inflight.delete(id)
     this.rpmBuckets.delete(id)
+    if (prev?.key_hash) this._invalidateHash(prev.key_hash, 'removed')
+    getCacheRuntime()
+      .billing.invalidateApiKey(id)
+      .catch(() => { })
     return true
   }
 
@@ -441,7 +501,7 @@ export class ApiKeyStore {
         detail: { quota: rec.quota, quota_used: rec.quota_used },
       }
     }
-    // sub2api rate windows: limit > 0 and the current window is still open
+    // Enforce spend limits only for open windows with a positive limit.
     for (const win of RATE_WINDOWS) {
       const w = rateWindow(rec, win, now)
       if (w.limit > 0 && w.open && w.used >= w.limit) {
@@ -476,7 +536,7 @@ export class ApiKeyStore {
         detail: { inflight, max: rec.max_concurrency },
       }
     }
-    // sub2api user-level cap: sum of inflight across all of the owner's keys.
+    // The user-level cap counts inflight requests across all of the owner's keys.
     // The operator (admin) is never capped: its traffic is the platform's own.
     if (rec.user_id) {
       const cap = this._userConcurrencyCap(rec.user_id)
@@ -594,10 +654,10 @@ export class ApiKeyStore {
       try {
         const c = calculateCost(normalized, model)
         if (c?.known) billed = c.total_cost
-      } catch {}
+      } catch { }
     }
     if (billed == null) billed = Number(usage.cost ?? usage.actual_cost) || 0
-    // key quota/windows track actual (group-rated) spend, sub2api-style
+    // Key quotas and spend windows track the cost after applying the group rate.
     const rate = Number.isFinite(Number(rateMultiplier)) ? Number(rateMultiplier) : 1
     const cost = billed * rate
     const rec = this.repo.recordUsage(id, {
@@ -607,11 +667,23 @@ export class ApiKeyStore {
       cache_creation_tokens: Number(normalized.cache_creation_input_tokens ?? normalized.cache_creation_tokens) || 0,
       cost,
     })
-    // sub2api: the billing write flips the key when the USD quota runs out
+    // Mark the key as quota-exhausted when recorded spend reaches its USD quota.
+    let finalRec = rec
     if (rec && rec.status === 'active' && (rec.quota ?? 0) > 0 && (rec.quota_used ?? 0) >= rec.quota) {
-      this.repo.update({ ...rec, status: 'quota_exhausted', updated_at: nowIso() })
+      finalRec = this.repo.update({ ...rec, status: 'quota_exhausted', updated_at: nowIso() })
     }
-    return rec
+    if (finalRec?.key_hash) {
+      getCacheRuntime().apiKeys.putSync(this._cacheKey(finalRec.key_hash), finalRec)
+    }
+    if (cost > 0) {
+      const billing = getCacheRuntime().billing
+      for (const win of RATE_WINDOWS) {
+        if ((finalRec?.[win.limit] ?? 0) > 0) {
+          billing.recordKeyWindowUsage(id, win.name, cost, win.ms).catch(() => { })
+        }
+      }
+    }
+    return finalRec
   }
 
   snapshot() {

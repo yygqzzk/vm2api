@@ -29,7 +29,7 @@ import {
 } from '../fixtures/crag-license.mjs'
 
 const PANEL = 'https://panel.example.test'
-const SHOP = 'https://crag.fkcodex.com'
+const SHOP = 'https://www.vm2api.org'
 const BASE = '/api/panel/crag-shop'
 const INPUT = { sku: 'quarter', payment_method: 'alipay', request_id: 'same-client-key' }
 const PLAN = { sku: 'quarter', term: '3m', amount_minor: 59900, slot_limit: 10 }
@@ -43,6 +43,9 @@ const MIGRATION = new URL('056_crag_shop_orders.sql', MIGRATIONS)
 const COMMERCE_MIGRATION = new URL('057_crag_shop_commerce.sql', MIGRATIONS)
 const ACTIVATION_MIGRATION = new URL('058_crag_shop_activation.sql', MIGRATIONS)
 const DISPATCH_MIGRATION = new URL('060_crag_shop_order_dispatch.sql', MIGRATIONS)
+const CLOSED_MIGRATION = new URL('062_crag_shop_order_closed.sql', MIGRATIONS)
+const DEVICE_HOST_MIGRATION = new URL('066_crag_shop_device_host.sql', MIGRATIONS)
+const ACTIVATION_ERROR_MIGRATION = new URL('067_crag_shop_activation_error.sql', MIGRATIONS)
 const PILOT_TOKEN_FILE_ENV = 'VM2API_CRAG_SHOP_PILOT_TOKEN_FILE'
 
 test.beforeEach((t) => {
@@ -101,12 +104,18 @@ test('shop migration numbering preserves applied schemas and orders from either 
     assert.equal(saved.activation_phase, legacy ? 'redeemed' : 'waiting')
     assert.equal(saved.activation_attempts, legacy ? 2 : 0)
     assert.equal(saved.dispatch_state, 'submitted')
+    assert.equal(saved.redemption_sha256, null)
+    assert.equal(saved.activation_error_code, null)
+    assert.equal(saved.activation_error_recovery, null)
+    assert.equal(saved.activation_request_id, null)
   }
 })
 
 function order(id, status = 'pending') {
   return { ...PLAN, order_id: id, status, payment_method: 'alipay', created_at: 1_800_000_000, redemption_code: CODE }
 }
+
+const LEGACY_SHOP = 'https://crag.fkcodex.com'
 
 function fields(id) {
   return {
@@ -144,6 +153,12 @@ test('shop ACL is limited to the buyer slice and session binding does not become
   }
   assert.equal(authorizePanelRoute('POST', `${BASE}/refund`, 'user').ok, false)
   assert.equal(cragShopRoute('GET', `${BASE}/orders/123/claim`), null)
+  // Recovery re-binds an order to the browser asking for it, which only makes sense on the
+  // anonymous side. A panel buyer's orders are owned by the account, so exposing it there
+  // would let one signed-in buyer pull another's order across accounts.
+  assert.equal(cragShopRoute('POST', `${BASE}/orders/123/recover`), null)
+  assert.equal(cragShopRoute('POST', `${BASE}/device/orders/123/recover`), 'recover')
+  assert.equal(cragShopRoute('GET', `${BASE}/device/orders/123/recover`), null)
 })
 
 test('mutations reject cross-origin and forwarded-header authority', () => {
@@ -193,6 +208,27 @@ test('supplier transport bounds, gateway pairing and response projection', async
   const kpay = 'https://api.kpay.cc/epay/submit.php'
   reply = { ...order(id), url: kpay, data: fields(id) }
   assert.deepEqual((await supplier.create(row, PROOF)).form, { url: kpay, data: fields(id) })
+  reply = {
+    ...order(id),
+    url: ACTION,
+    data: {
+      ...fields(id),
+      notify_url: `${LEGACY_SHOP}/shop/epay/notify`,
+      return_url: `${LEGACY_SHOP}/shop/return`,
+    },
+  }
+  assert.equal((await supplier.create(row, PROOF)).form.data.notify_url, `${LEGACY_SHOP}/shop/epay/notify`)
+  reply = {
+    ...order(id),
+    url: ACTION,
+    data: {
+      ...fields(id),
+      notify_url: `${LEGACY_SHOP}/shop/epay/notify`,
+      return_url: `${SHOP}/shop/return`,
+    },
+  }
+  await assert.rejects(supplier.create(row, PROOF), { code: 'shop_invalid_reply' })
+
   for (const url of [
     'http://gateway.example.test/submit.php',
     `${ACTION}?a=1`,
@@ -320,6 +356,55 @@ test('pilot credential authorizes checkout operations but is never sent with rec
     await checkInvalidFile()
   }
   await checkReceiptOnlyRequests()
+
+  // The failure log is the only record a stalled checkout leaves behind, so what it
+  // carries is load-bearing in both directions: enough to tell the faults apart, and
+  // nothing that works as a credential. Checked here because this test already holds
+  // all three secrets at once — the pilot token, the receipt, and an order id.
+  const warnings = []
+  const warn = console.warn
+  console.warn = (line) => warnings.push(line)
+  try {
+    // A directory makes readPilotToken throw before any request goes out, which is
+    // the shape of every fault that never reaches the supplier.
+    process.env[PILOT_TOKEN_FILE_ENV] = root
+    await assert.rejects(supplier.resume(row, PROOF, { allowPilot: true }), unavailable)
+    // And one that does reach it: with a usable pilot token, a reply echoing that
+    // token is refused inside the transport, so the log sees a real status.
+    fs.writeFileSync(file, token, { mode: 0o600 })
+    process.env[PILOT_TOKEN_FILE_ENV] = file
+    plansReply = { ...catalog, plans: [{ ...PLAN, sku: token }] }
+    await assert.rejects(supplier.plans({ allowPilot: true }), { code: 'shop_invalid_reply' })
+  } finally {
+    console.warn = warn
+  }
+  assert.deepEqual(
+    warnings.map((line) => JSON.parse(line)),
+    [
+      {
+        event: 'crag-shop-supplier',
+        operation: 'resume',
+        // Truncated: a whole order id in a log is a credential, since the Authority's
+        // claim-by-order accepts one as grounds for moving a subscription.
+        path: `/shop/orders/${id.slice(0, 8)}~/resume`,
+        // Zero means no response arrived, which is what separates "the supplier
+        // refused" from "we never reached it".
+        status: 0,
+        code: 'shop_unavailable',
+        cause: 'Error',
+      },
+      {
+        event: 'crag-shop-supplier',
+        operation: 'plans',
+        path: '/shop/plans',
+        status: 200,
+        code: 'shop_invalid_reply',
+      },
+    ],
+  )
+  const logged = warnings.join('\n')
+  assert.ok(!logged.includes(id), 'a usable order id must not reach the log')
+  for (const secret of [token, PROOF]) assert.ok(!logged.includes(secret), 'no credential may reach the log')
 })
 
 test('SQLite reservation survives restart; owners isolate retries, list, status and explicit claim', {
@@ -418,8 +503,13 @@ test('SQLite reservation survives restart; owners isolate retries, list, status 
   assert.equal(failed.http, 503)
   const [[id, firstReceipt]] = saved
   assert.equal(JSON.stringify(failed).includes(firstReceipt), false)
-  assert.equal((await call(PERSON, 'GET', '/orders')).data.orders[0].status, 'reserved')
-  assert.equal((await call(PERSON, 'POST', `/orders/${id}/cancel`, {})).error.code, 'shop_order_cannot_cancel')
+  const listed = (await call(PERSON, 'GET', '/orders')).data.orders[0]
+  assert.equal(listed.status, 'reserved')
+  // A create that never returned a checkout form leaves an orphaned reservation. The
+  // buyer never received a payment link, so it is offered as cancelable even while the
+  // supplier is unavailable. The replay below still needs this reservation, so only the
+  // offer is asserted here; `fulfilled` refusing a cancel is asserted further down.
+  assert.equal(listed.cancelable, true)
   db.close()
   db = createDatabase({ dbPath })
   handle = handler()
@@ -555,6 +645,7 @@ test('device checkout skips panel login, scopes orders to browser and host, and 
   let host = deviceId
   let created = 0
   let applied = 0
+  let confirmed = false
   let status = 'pending'
   const handler = createPanelHandler({
     cfg: { base_url: PANEL },
@@ -576,6 +667,12 @@ test('device checkout skips panel login, scopes orders to browser and host, and 
           assert.equal(expectedHost, deviceId)
           assert.equal(code, CODE)
           applied++
+          confirmed = true
+        },
+        isRedemptionApplied(expectedHost, digest) {
+          assert.equal(expectedHost, deviceId)
+          assert.equal(digest, createHash('sha256').update(CODE).digest('hex'))
+          return confirmed
         },
       },
       supplier: {
@@ -664,12 +761,439 @@ test('device checkout skips panel login, scopes orders to browser and host, and 
   assert.equal((await call('POST', `/orders/${id}/apply`, {})).http, 409)
   status = 'fulfilled'
   assert.equal((await call('GET', `/orders/${id}`)).data.activation.state, 'ready_to_apply')
-  assert.equal((await call('POST', `/orders/${id}/claim`, {})).http, 404)
+  // Exporting the voucher is now an explicit, deliberate action on the device side
+  // too: withholding it left a device buyer with no way to move a subscription whose
+  // order id the Authority never recorded, and the entitlement is theirs. It still
+  // needs the checkout cookie that owns the order.
+  const exported = await call('POST', `/orders/${id}/claim`, {})
+  assert.equal(exported.data.redemption_code, CODE)
+  // Without the checkout cookie there is nothing to prove ownership with, so this
+  // reads exactly like a missing order rather than admitting the id exists. Unlike
+  // 'recover', which mints an identity to re-bind to, exporting needs the cookie
+  // that already owns the order.
+  assert.equal((await call('POST', `/orders/${id}/claim`, {}, {}, false)).http, 404)
   const activation = await call('POST', `/orders/${id}/apply`, {})
   assert.equal(activation.data.activation.state, 'active')
+  // Applying still never carries the code: only the explicit export above does.
   assert.equal(JSON.stringify(activation).includes(CODE), false)
   assert.equal((await call('POST', `/orders/${id}/apply`, {})).data.activation.state, 'active')
   assert.equal(applied, 1)
+})
+
+test('a device order outlives its checkout cookie and is recoverable by its order id alone', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crag-device-reclaim-'))
+  const db = createDatabase({ dbPath: path.join(root, 'kin.db') })
+  t.after(() => {
+    db.close()
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  const deviceId = 'a'.repeat(64)
+  const host = deviceId
+  let status = 'pending'
+  let confirmed = false
+  let applied = 0
+  const handler = createPanelHandler({
+    cfg: { base_url: PANEL },
+    requireAuth() {
+      assert.fail('device checkout must not invoke panel auth')
+    },
+    handleCragShop: createCragShopHandler({
+      getDb: () => db,
+      dataDir: root,
+      publicBaseUrl: PANEL,
+      json: (_, http, body) => ({ http, ...body }),
+      readRawBody: (req) => req.raw,
+      subscription: {
+        purchaseDeviceId: () => host,
+        async redeemDeviceOrder() {
+          applied++
+          confirmed = true
+        },
+        isRedemptionApplied: () => confirmed,
+      },
+      supplier: {
+        async plans() {
+          return { plans: [PLAN], payment_methods: ['alipay'] }
+        },
+        async quote() {
+          return PLAN
+        },
+        async create(row) {
+          return { order: order(row.order_id) }
+        },
+        async resume(row) {
+          return { order: order(row.order_id) }
+        },
+        async status(row) {
+          return order(row.order_id, status)
+        },
+        async claim(row) {
+          return { order_id: row.order_id, redemption_code: CODE }
+        },
+      },
+    }),
+  })
+  let cookie
+  async function call(method, endpoint, body, sendCookie = true) {
+    const url = new URL(`${PANEL}${BASE}/device${endpoint}`)
+    const req = {
+      method,
+      raw: Buffer.from(body === undefined ? '' : JSON.stringify(body)),
+      headers: {
+        host: 'panel.example.test',
+        origin: PANEL,
+        'sec-fetch-site': 'same-origin',
+        'content-type': 'application/json',
+        ...(sendCookie && cookie ? { cookie } : {}),
+      },
+    }
+    return handler(
+      req,
+      {
+        setHeader(name, value) {
+          if (name === 'Set-Cookie') cookie = value.split(';')[0]
+        },
+      },
+      url,
+    )
+  }
+  const deviceHost = (orderId) =>
+    db.prepare('SELECT device_host FROM crag_shop_orders WHERE order_id = ?').get(orderId).device_host
+
+  await call('GET', '/plans')
+  const id = (await call('POST', '/orders', { ...INPUT, expected_amount_minor: PLAN.amount_minor })).data.order_id
+  assert.equal((await call('GET', '/orders')).data.orders.length, 1)
+  // Recorded at purchase as provenance. It is this installation's own machine id, so it is
+  // the same value for every device order in this database and cannot tell two buyers
+  // apart — what distinguishes them is the cookie token, already inside `owner`.
+  assert.equal(deviceHost(id), deviceId)
+
+  // Losing the cookie is what orphaned a paid order. The listing goes empty and, because
+  // applying also matches on owner, delivery became impossible rather than merely hidden.
+  const lost = cookie
+  cookie = undefined
+  assert.equal((await call('POST', `/orders/${id}/recover`, {})).error.code, 'shop_device_checkout_required')
+  await call('GET', '/plans')
+  assert.notEqual(cookie, lost)
+  assert.equal((await call('GET', '/orders')).data.orders.length, 0)
+
+  // A row carrying some other host is still recoverable, and the column is refreshed to
+  // this machine. Since `device_host` is one constant per installation, a mismatch never
+  // means another buyer — it means this gateway's own identity changed, and that is the
+  // moment every device order's owner digest stops matching at once, leaving recovery as
+  // the only way back. Refusing it there turned a recoverable order into a permanently
+  // undeliverable one, which is the failure this route exists to prevent.
+  db.prepare('UPDATE crag_shop_orders SET device_host = ? WHERE order_id = ?').run('b'.repeat(64), id)
+
+  assert.equal((await call('POST', `/orders/${id}/recover`, {})).data.order_id, id)
+  assert.equal(deviceHost(id), deviceId)
+  assert.equal((await call('GET', '/orders')).data.orders.length, 1)
+  // Recovery has to restore delivery, not just visibility.
+  status = 'fulfilled'
+  assert.equal((await call('POST', `/orders/${id}/apply`, {})).data.activation.state, 'active')
+  assert.equal(applied, 1)
+  assert.equal(JSON.stringify(await call('GET', '/orders')).includes(CODE), false)
+
+  // A panel buyer's order belongs to their account. An anonymous caller must not be able
+  // to pull it out, and must not learn that the id exists either.
+  const panelOrder = randomUUID()
+  db.prepare(`INSERT INTO crag_shop_orders
+    (order_id, owner, request_id, sku, payment_method, reserved_at, status, created_at, term, amount_minor, slot_limit)
+    VALUES (?, 'panel:alice-id', 'account-order', 'quarter', 'alipay', 1, 'fulfilled', 1, '3m', 59900, 10)`).run(
+    panelOrder,
+  )
+  const refused = await call('POST', `/orders/${panelOrder}/recover`, {})
+  assert.equal(refused.http, 404)
+  assert.equal(refused.error.code, (await call('POST', `/orders/${randomUUID()}/recover`, {})).error.code)
+  assert.equal(
+    db.prepare('SELECT owner FROM crag_shop_orders WHERE order_id = ?').get(panelOrder).owner,
+    'panel:alice-id',
+  )
+
+  // Orders predating device_host carry NULL. They are recovered on the order id alone —
+  // the only proof that still exists for them — and the host is recorded at that point.
+  const legacyOrder = randomUUID()
+  db.prepare(`INSERT INTO crag_shop_orders
+    (order_id, owner, request_id, sku, payment_method, reserved_at, status, created_at, term, amount_minor, slot_limit)
+    VALUES (?, 'device:forgotten-browser', 'legacy-order', 'quarter', 'alipay', 1, 'fulfilled', 1, '3m', 59900, 10)`).run(
+    legacyOrder,
+  )
+  assert.equal(deviceHost(legacyOrder), null)
+  assert.equal((await call('POST', `/orders/${legacyOrder}/recover`, {})).data.order_id, legacyOrder)
+  assert.equal(deviceHost(legacyOrder), deviceId)
+  assert.equal((await call('GET', '/orders')).data.orders.length, 2)
+})
+
+test('device order recovery projects only a matching durable redemption receipt, including after restart', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crag-device-recovery-'))
+  const dbPath = path.join(root, 'kin.db')
+  let db = createDatabase({ dbPath })
+  t.after(() => {
+    db.close()
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  const hostId = 'a'.repeat(64)
+  const token = Buffer.alloc(32, 17).toString('base64url')
+  const owner = `device:${createHash('sha256').update(`${hostId}:${token}`).digest('hex')}`
+  loadOrderReceiptKey(root, () => false)
+  const id = randomUUID()
+  const otherId = randomUUID()
+  const insert = db.prepare(`INSERT INTO crag_shop_orders
+    (order_id, owner, request_id, sku, payment_method, reserved_at, status, created_at, term, amount_minor, slot_limit)
+    VALUES (?, ?, ?, 'quarter', 'alipay', 1, 'fulfilled', 1800000000, '3m', 59900, 10)`)
+  insert.run(id, owner, 'paid-original')
+  insert.run(otherId, owner, 'different-order')
+  const digest = createHash('sha256').update(CODE).digest('hex')
+  let applied = 0
+  let proof = false
+  let claimed = 0
+  let claimResponse
+  let errorCode = 'crag_subscription_host_package_changed'
+  let receiptError
+  const requestId = randomUUID()
+  const makeHandler = () =>
+    createCragShopHandler({
+      getDb: () => db,
+      dataDir: root,
+      publicBaseUrl: PANEL,
+      json: (_, http, body) => ({ http, ...body }),
+      readRawBody: (req) => req.raw,
+      subscription: {
+        purchaseDeviceId: () => hostId,
+        isRedemptionApplied(expectedHost, actualDigest) {
+          assert.equal(expectedHost, hostId)
+          if (receiptError && actualDigest === digest) throw Object.assign(new Error('damaged'), { code: receiptError })
+          return proof && actualDigest === digest
+        },
+        async redeemDeviceOrder(expectedHost, code) {
+          assert.equal(expectedHost, hostId)
+          assert.equal(code, CODE)
+          assert.equal(
+            db.prepare('SELECT redemption_sha256 FROM crag_shop_orders WHERE order_id = ?').get(id).redemption_sha256,
+            digest,
+          )
+          applied++
+          throw Object.assign(new Error(`private: ${CODE} /opt/private`), {
+            code: errorCode,
+            authorityRequestId: requestId,
+          })
+        },
+      },
+      supplier: {
+        async claim(row) {
+          claimed++
+          if (claimResponse) return claimResponse(row)
+          return { order_id: row.order_id, redemption_code: CODE }
+        },
+        async status(row) {
+          return order(row.order_id, 'fulfilled')
+        },
+      },
+    })
+  let handler = makeHandler()
+  const call = (method, suffix) => {
+    const url = new URL(`${PANEL}${BASE}/device${suffix}`)
+    return handler(
+      {
+        method,
+        raw: Buffer.from('{}'),
+        headers: {
+          host: 'panel.example.test',
+          origin: PANEL,
+          'sec-fetch-site': 'same-origin',
+          'content-type': 'application/json',
+          cookie: `kin_crag_device_checkout=${token}`,
+        },
+      },
+      { setHeader() {} },
+      url,
+      cragShopRoute(method, url.pathname),
+    )
+  }
+  const failed = await call('POST', `/orders/${id}/apply`)
+  assert.equal(failed.http, 409)
+  assert.equal(failed.error.code, errorCode)
+  assert.equal(failed.error.details.authority_request_id, requestId)
+  assert.equal(JSON.stringify(failed).includes(CODE), false)
+  assert.equal(JSON.stringify(failed).includes('/opt/private'), false)
+  assert.equal((await call('GET', `/orders/${id}`)).data.activation.state, 'ready_to_apply')
+  errorCode = 'crag_subscription_authority_unavailable'
+  const uncertain = await call('POST', `/orders/${id}/apply`)
+  assert.equal(uncertain.http, 503)
+  assert.equal(uncertain.error.code, errorCode)
+  assert.equal(
+    (await call('GET', '/orders')).data.orders.every((o) => o.activation.state === 'ready_to_apply'),
+    true,
+  )
+
+  // The administrator finishes the same voucher via subscription recovery, then
+  // the process exits before the shop gets a chance to project that confirmation.
+  proof = true
+  db.close()
+  db = createDatabase({ dbPath })
+  handler = makeHandler()
+  assert.equal((await call('GET', `/orders/${id}`)).data.activation.state, 'active')
+  assert.equal((await call('POST', `/orders/${id}/apply`)).data.activation.state, 'active')
+  const orders = (await call('GET', '/orders')).data.orders
+  assert.equal(orders.find((o) => o.order_id === id).activation.state, 'active')
+  assert.equal(orders.find((o) => o.order_id === otherId).activation.state, 'ready_to_apply')
+  assert.equal(applied, 2)
+  assert.equal(claimed, 2)
+  assert.equal(JSON.stringify(orders).includes(digest), false)
+  assert.equal(JSON.stringify(orders).includes(CODE), false)
+  // Listing also repairs a lost shop projection, without contacting the supplier.
+  db.prepare("UPDATE crag_shop_orders SET activation_phase = 'waiting' WHERE order_id = ?").run(id)
+  assert.equal((await call('GET', '/orders')).data.orders.find((o) => o.order_id === id).activation.state, 'active')
+
+  // One order's unverifiable receipt must not hide the rest of the list. The listing
+  // keeps that row's stored state, the order's own route still reports the reason,
+  // and a repaired receipt converges again without another redemption.
+  db.prepare("UPDATE crag_shop_orders SET activation_phase = 'waiting' WHERE order_id = ?").run(id)
+  receiptError = 'crag_subscription_invalid_redemption_receipt'
+  const tolerated = (await call('GET', '/orders')).data.orders
+  assert.equal(tolerated.length, 2)
+  assert.equal(tolerated.find((o) => o.order_id === id).activation.state, 'ready_to_apply')
+  assert.equal(tolerated.find((o) => o.order_id === otherId).activation.state, 'ready_to_apply')
+  const damaged = await call('GET', `/orders/${id}`)
+  assert.equal(damaged.http, 409)
+  assert.equal(damaged.error.code, 'crag_subscription_invalid_redemption_receipt')
+  receiptError = undefined
+  assert.equal((await call('GET', '/orders')).data.orders.find((o) => o.order_id === id).activation.state, 'active')
+
+  // Two requests read the same unassociated row before either claim completes.
+  // A changed supplier voucher must not bypass the atomic digest association.
+  proof = false
+  db.prepare(
+    "UPDATE crag_shop_orders SET activation_phase = 'waiting', redemption_sha256 = NULL WHERE order_id = ?",
+  ).run(id)
+  const claims = []
+  let bothEntered
+  const entered = new Promise((resolve) => {
+    bothEntered = resolve
+  })
+  claimResponse = (row) =>
+    new Promise((resolve) => {
+      claims.push((code) => resolve({ order_id: row.order_id, redemption_code: code }))
+      if (claims.length === 2) bothEntered()
+    })
+  const first = call('POST', `/orders/${id}/apply`)
+  const second = call('POST', `/orders/${id}/apply`)
+  await entered
+  claims[0](CODE)
+  assert.equal((await first).error.code, errorCode)
+  claims[1](`CRAGR1.${Buffer.alloc(32, 43).toString('base64url')}`)
+  const conflicting = await second
+  assert.equal(conflicting.http, 409)
+  assert.equal(conflicting.error.code, 'shop_redemption_changed')
+  assert.equal(applied, 3)
+  assert.equal(
+    db.prepare('SELECT redemption_sha256 FROM crag_shop_orders WHERE order_id = ?').get(id).redemption_sha256,
+    digest,
+  )
+
+  // A package key the Authority no longer offers, and a mismatched issuer, are
+  // actionable reasons of their own: never the generic "retry the same order".
+  claimResponse = undefined
+  for (const code of ['payload_key_unknown', 'issuer_mismatch']) {
+    errorCode = code
+    const rejected = await call('POST', `/orders/${id}/apply`)
+    assert.equal(rejected.http, 409)
+    assert.equal(rejected.error.code, code)
+    assert.notEqual(rejected.error.code, 'shop_device_apply_failed')
+    assert.equal(JSON.stringify(rejected).includes(CODE), false)
+  }
+  assert.equal(applied, 5)
+})
+
+test('device order package recovery converges through subscription recovery and a read-only order refresh', {
+  skip: process.platform !== 'linux',
+}, async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crag-device-integrated-'))
+  const db = createDatabase({ dbPath: path.join(root, 'kin.db') })
+  t.after(() => {
+    db.close()
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  const source = path.join(root, 'host-machine-id')
+  fs.writeFileSync(source, randomBytes(16).toString('hex'), { mode: 0o600 })
+  fs.mkdirSync(path.dirname(path.dirname(cragSubscriptionPublicDirectory(root))), { recursive: true })
+  seedEncryptedPackage(root)
+  const token = Buffer.alloc(32, 19).toString('base64url')
+  let rejectRedeem = true
+  let redeemCalls = 0
+  let rights
+  const connect = () =>
+    createCragSubscription({
+      projectRoot: root,
+      machineIdFile: source,
+      listTargets: () => [],
+      fetchImpl: async (url, { body }) => {
+        const input = JSON.parse(body)
+        if (url.endsWith('/redeem')) {
+          redeemCalls++
+          assert.equal(input.redemption_code, CODE)
+          if (rejectRedeem) throw new Error('transport interrupted before commit')
+          rights ??= issueHostEntitlement(root, input.host_id, { slot_limit: 1 })
+        }
+        if (!rights) return Response.json({ ok: false, error: { code: 'not_found' } }, { status: 404 })
+        return Response.json({ ok: true, data: { entitlement: rights.code, ...rights.claims, used_slots: 0 } })
+      },
+    })
+  let subscription = connect()
+  const hostId = subscription.purchaseDeviceId()
+  const owner = `device:${createHash('sha256').update(`${hostId}:${token}`).digest('hex')}`
+  loadOrderReceiptKey(root, () => false)
+  const id = randomUUID()
+  db.prepare(`INSERT INTO crag_shop_orders
+    (order_id, owner, request_id, sku, payment_method, reserved_at, status, created_at, term, amount_minor, slot_limit)
+    VALUES (?, ?, 'integrated', 'quarter', 'alipay', 1, 'fulfilled', 1800000000, '3m', 59900, 10)`).run(id, owner)
+  const handler = () =>
+    createCragShopHandler({
+      getDb: () => db,
+      dataDir: root,
+      publicBaseUrl: PANEL,
+      json: (_, http, body) => ({ http, ...body }),
+      readRawBody: (req) => req.raw,
+      subscription,
+      supplier: {
+        claim: async (row) => ({ order_id: row.order_id, redemption_code: CODE }),
+        status: async (row) => order(row.order_id, 'fulfilled'),
+      },
+    })
+  const call = async (method, suffix) => {
+    const url = new URL(`${PANEL}${BASE}/device/orders/${id}${suffix}`)
+    return handler()(
+      {
+        method,
+        raw: Buffer.from('{}'),
+        headers: {
+          host: 'panel.example.test',
+          origin: PANEL,
+          'sec-fetch-site': 'same-origin',
+          'content-type': 'application/json',
+          cookie: `kin_crag_device_checkout=${token}`,
+        },
+      },
+      { setHeader() {} },
+      url,
+      cragShopRoute(method, url.pathname),
+    )
+  }
+  assert.equal((await call('POST', '/apply')).error.code, 'crag_subscription_authority_unavailable')
+  seedEncryptedPackage(root, { payloadKey: randomBytes(32) })
+  assert.equal((await call('POST', '/apply')).error.code, 'crag_subscription_host_package_changed')
+  assert.equal(redeemCalls, 1)
+  rejectRedeem = false
+  await subscription.recover({ useCurrentPackage: true })
+  // A fresh process has no in-memory knowledge of the completed recovery.
+  subscription = connect()
+  const refreshed = await call('GET', '')
+  assert.equal(refreshed.http, 200)
+  assert.equal(refreshed.data.activation.state, 'active')
+  assert.equal((await call('POST', '/apply')).data.activation.state, 'active')
+  assert.equal(redeemCalls, 2)
+  assert.equal((await subscription.status()).slot_limit, 1)
+  assert.equal(JSON.stringify(refreshed).includes(CODE), false)
 })
 
 test('pinned fulfillment survives lost redeem and H2 bind replies without reapplying or rebinding another slot', {
@@ -694,6 +1218,9 @@ test('pinned fulfillment survives lost redeem and H2 bind replies without reappl
   )
   db.exec(fs.readFileSync(ACTIVATION_MIGRATION, 'utf8'))
   db.exec(fs.readFileSync(DISPATCH_MIGRATION, 'utf8'))
+  db.exec(fs.readFileSync(CLOSED_MIGRATION, 'utf8'))
+  db.exec(fs.readFileSync(DEVICE_HOST_MIGRATION, 'utf8'))
+  db.exec(fs.readFileSync(ACTIVATION_ERROR_MIGRATION, 'utf8'))
   // The legacy row normally already has a receipt key from its original checkout.
   const receiptKey = loadOrderReceiptKey(root, () => false)
   const publicDir = cragSubscriptionPublicDirectory(root)
@@ -964,4 +1491,366 @@ test('pinned fulfillment survives lost redeem and H2 bind replies without reappl
   assert.equal(redeems, 2)
   assert.equal(bindAttempts, 2)
   assert.equal(checkCragLicense(root, slots[0]).ok, true)
+})
+
+test('an unpaid checkout link closes once its payment window passes, unless the supplier took the money', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crag-shop-expiry-'))
+  const db = createDatabase({ dbPath: path.join(root, 'kin.db') })
+  t.after(() => {
+    db.close()
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  let supplied = 'pending'
+  let reads = 0
+  const shop = createCragShopHandler({
+    getDb: () => db,
+    dataDir: root,
+    publicBaseUrl: PANEL,
+    json: (_, http, body) => ({ http, ...body }),
+    readRawBody: (req) => req.raw,
+    subscription: {},
+    supplier: {
+      async status(row) {
+        reads++
+        return order(row.order_id, supplied)
+      },
+    },
+  })
+  const now = Math.floor(Date.now() / 1000)
+  // The receipt key is only created while no order exists yet: a table with orders but
+  // no key means the key was lost, and minting a new one would strand their receipts.
+  // These rows are inserted straight into the table, so seed the key before them.
+  loadOrderReceiptKey(root, () => false)
+  // A reserved row carries no commerce columns; migration 057 requires them to be NULL.
+  const reserve = (id, age) =>
+    db
+      .prepare(`INSERT INTO crag_shop_orders
+        (order_id, owner, request_id, sku, payment_method, reserved_at, status, dispatch_state)
+        VALUES (?, ?, ?, 'quarter', 'alipay', ?, 'reserved', 'submitted')`)
+      .run(id, PERSON.panelBuyerOwner, `req-${id}`, now - age)
+  const pend = (id, age) =>
+    db
+      .prepare(`INSERT INTO crag_shop_orders
+        (order_id, owner, request_id, sku, payment_method, reserved_at, status, dispatch_state,
+         created_at, term, amount_minor, slot_limit)
+        VALUES (?, ?, ?, 'quarter', 'alipay', ?, 'pending', 'submitted', 1800000000, '3m', 59900, 10)`)
+      .run(id, PERSON.panelBuyerOwner, `req-${id}`, now - age)
+  const stored = (id) => db.prepare('SELECT closed_at, status FROM crag_shop_orders WHERE order_id = ?').get(id)
+
+  const fresh = randomUUID()
+  pend(fresh, 5 * 60)
+  await shop.pollOrderExpiry()
+  assert.equal(stored(fresh).closed_at, null, 'a link inside its payment window is left alone')
+  assert.equal(reads, 0, 'the supplier is not consulted for an order that cannot have expired yet')
+
+  const stale = randomUUID()
+  pend(stale, 31 * 60)
+  await shop.pollOrderExpiry()
+  assert.equal(reads, 1, 'a live payment link is re-read before it is closed')
+  assert.equal(typeof stored(stale).closed_at, 'number')
+
+  // A payment that landed late keeps the order: reflectOrder moves it to paid, which
+  // also drops it out of the expiry scan.
+  const paid = randomUUID()
+  supplied = 'paid'
+  pend(paid, 31 * 60)
+  await shop.pollOrderExpiry()
+  assert.equal(stored(paid).closed_at, null)
+  assert.equal(stored(paid).status, 'paid')
+
+  // No checkout form ever reached this buyer, so it closes without a supplier read.
+  const orphan = randomUUID()
+  reserve(orphan, 40 * 60)
+  const before = reads
+  await shop.pollOrderExpiry()
+  assert.equal(typeof stored(orphan).closed_at, 'number')
+  assert.equal(reads, before)
+})
+
+test('migration 067 enforces sanitized activation failure columns and pollActivation stops on terminal auth_forbidden without leaking secrets', {
+  skip: process.platform !== 'linux',
+}, async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crag-shop-auth-forbidden-'))
+  const db = createDatabase({ dbPath: path.join(root, 'kin.db') })
+  t.after(() => {
+    db.close()
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  loadOrderReceiptKey(root, () => false)
+
+  // Verify SQLite CHECK constraints directly on migration 067 columns.
+  const checkOrderId = randomUUID()
+  db.prepare(`INSERT INTO crag_shop_orders
+    (order_id, owner, request_id, sku, payment_method, reserved_at, status, dispatch_state,
+     created_at, term, amount_minor, slot_limit, activation_vm_id, activation_fingerprint)
+    VALUES (?, ?, 'check-row', 'quarter', 'alipay', 1, 'fulfilled', 'submitted',
+            1800000000, '3m', 59900, 10, 'vm-check', ?)`).run(checkOrderId, OTHER.panelBuyerOwner, 'f'.repeat(64))
+
+  for (const badCode of ['', 'a', '9bad', 'Auth_forbidden', CODE, 'auth-forbidden', 'bad\ncode', 'a'.repeat(65)]) {
+    assert.throws(() =>
+      db.prepare('UPDATE crag_shop_orders SET activation_error_code = ? WHERE order_id = ?').run(badCode, checkOrderId),
+    )
+  }
+  for (const badRecovery of ['', 'unavailable', 'unknown', CODE]) {
+    assert.throws(() =>
+      db
+        .prepare('UPDATE crag_shop_orders SET activation_error_recovery = ? WHERE order_id = ?')
+        .run(badRecovery, checkOrderId),
+    )
+  }
+  for (const badRequestId of [
+    '',
+    'not-a-uuid',
+    CODE,
+    '6945109e-80be-1d23-9793-68ba195765ce',
+    '6945109e-80be-4d23-0793-68ba195765ce',
+    '6945109e-80be-4d23-9793-68ba195765ce\n',
+  ]) {
+    assert.throws(() =>
+      db
+        .prepare('UPDATE crag_shop_orders SET activation_request_id = ? WHERE order_id = ?')
+        .run(badRequestId, checkOrderId),
+    )
+  }
+  const upperUuid = '6945109E-80BE-4D23-9793-68BA195765CE'
+  db.prepare(`UPDATE crag_shop_orders
+    SET activation_error_code = 'auth_forbidden',
+        activation_error_recovery = 'not_activated',
+        activation_request_id = ?
+    WHERE order_id = ?`).run(upperUuid, checkOrderId)
+  db.prepare('DELETE FROM crag_shop_orders WHERE order_id = ?').run(checkOrderId)
+
+  const fingerprint = 'c'.repeat(64)
+  const bearerSecret = 'secret_bearer_token_43_chars_long_abcdef123'
+  let activateBehavior = () => {
+    throw new Error('unexpected activateOrder call')
+  }
+  let activateCalls = 0
+  let claimCalls = 0
+  let statusCalls = 0
+  const remoteStatus = new Map()
+
+  const makeShop = (activationEnabled = true) =>
+    createCragShopHandler({
+      getDb: () => db,
+      dataDir: root,
+      publicBaseUrl: PANEL,
+      json: (_, http, body) => ({ http, ...body }),
+      readRawBody: (req) => req.raw,
+      isActivationAdmin: (owner) => owner === OTHER.panelBuyerOwner,
+      activationEnabled,
+      subscription: {
+        pinOrderTarget: async (vmId) => {
+          assert.equal(vmId, 'vm-slot')
+          return fingerprint
+        },
+        activateOrder: async (opts) => {
+          activateCalls++
+          return activateBehavior(opts)
+        },
+      },
+      supplier: {
+        create: async (row) => ({
+          order: order(row.order_id, remoteStatus.get(row.order_id) ?? 'fulfilled'),
+        }),
+        status: async (row) => {
+          statusCalls++
+          return order(row.order_id, remoteStatus.get(row.order_id) ?? 'fulfilled')
+        },
+        claim: async (row) => {
+          claimCalls++
+          return { order_id: row.order_id, redemption_code: CODE }
+        },
+      },
+    })
+
+  let shop = makeShop(true)
+  const call = (method, endpoint, body, handler = shop) => {
+    const url = new URL(`${PANEL}${BASE}${endpoint}`)
+    return handler(
+      {
+        ...OTHER,
+        method,
+        raw: Buffer.from(body === undefined ? '' : JSON.stringify(body)),
+        headers: {
+          host: 'panel.example.test',
+          origin: PANEL,
+          'sec-fetch-site': 'same-origin',
+          'content-type': 'application/json',
+        },
+      },
+      {},
+      url,
+      cragShopRoute(method, url.pathname),
+    )
+  }
+
+  const created = (
+    await call('POST', '/orders', {
+      ...INPUT,
+      request_id: 'issue-1600-order',
+      activation_target: { vm_id: 'vm-slot' },
+    })
+  ).data
+  const id = created.order_id
+  const due = (orderId = id) =>
+    db.prepare('UPDATE crag_shop_orders SET activation_next_at = 1 WHERE order_id = ?').run(orderId)
+
+  // 1. Transient auth_forbidden (recovery === 'unavailable') still reschedules and never stores 'unavailable'.
+  const transientReqId = randomUUID()
+  activateBehavior = async ({ claim }) => {
+    await claim()
+    throw Object.assign(new Error(`raw vendor error ${CODE} ${bearerSecret} /opt/private/credential`), {
+      code: 'auth_forbidden',
+      status: 403,
+      recovery: 'unavailable',
+      authorityRequestId: transientReqId,
+    })
+  }
+  due()
+  await shop.pollActivation()
+  assert.equal(activateCalls, 1)
+  assert.equal(claimCalls, 1)
+  const afterTransientRow = db.prepare('SELECT * FROM crag_shop_orders WHERE order_id = ?').get(id)
+  assert.equal(typeof afterTransientRow.activation_next_at, 'number')
+  assert.equal(afterTransientRow.activation_error_code, 'auth_forbidden')
+  assert.equal(afterTransientRow.activation_error_recovery, null)
+  assert.equal(afterTransientRow.activation_request_id, transientReqId)
+  const transientView = (await call('GET', `/orders/${id}`)).data
+  assert.deepEqual(transientView.activation, {
+    vm_id: 'vm-slot',
+    state: 'activating',
+    error_code: 'auth_forbidden',
+    authority_request_id: transientReqId,
+  })
+
+  // 2. Paused auto-activation (!activationEnabled) never falsely reports 'activating' on a fulfilled order,
+  //    and refreshes an unpaid order to fulfilled -> needs_attention.
+  const pausedShop = makeShop(false)
+  const pausedFulfilled = (await call('GET', `/orders/${id}`, undefined, pausedShop)).data
+  assert.equal(pausedFulfilled.activation.state, 'needs_attention')
+  assert.equal(pausedFulfilled.activation.error_code, 'auth_forbidden')
+  assert.equal(
+    (await call('GET', '/orders', undefined, pausedShop)).data.orders.find((o) => o.order_id === id).activation.state,
+    'needs_attention',
+  )
+  assert.equal(
+    (await call('POST', `/orders/${id}/retry-activation`, {}, pausedShop)).error.code,
+    'shop_activation_disabled',
+  )
+
+  const pendingWhilePausedId = randomUUID()
+  remoteStatus.set(pendingWhilePausedId, 'pending')
+  db.prepare(`INSERT INTO crag_shop_orders
+    (order_id, owner, request_id, sku, payment_method, reserved_at, status, dispatch_state,
+     created_at, term, amount_minor, slot_limit, activation_vm_id, activation_fingerprint,
+     activation_next_at, activation_deadline)
+    VALUES (?, ?, 'paused-pending', 'quarter', 'alipay', 1, 'pending', 'submitted',
+            1800000000, '3m', 59900, 10, 'vm-slot', ?, 1800000300, 1800086400)`).run(
+    pendingWhilePausedId,
+    OTHER.panelBuyerOwner,
+    fingerprint,
+  )
+  assert.equal(
+    (await call('GET', `/orders/${pendingWhilePausedId}`, undefined, pausedShop)).data.activation.state,
+    'awaiting_fulfillment',
+  )
+  remoteStatus.set(pendingWhilePausedId, 'fulfilled')
+  const refreshedWhilePaused = (await call('GET', `/orders/${pendingWhilePausedId}`, undefined, pausedShop)).data
+  assert.equal(refreshedWhilePaused.status, 'fulfilled')
+  assert.equal(refreshedWhilePaused.activation.state, 'needs_attention')
+
+  // 3. Terminal auth_forbidden ('not_activated' and 'host_id_collision') and other terminal codes stop polling immediately.
+  for (const [code, recovery] of [
+    ['auth_forbidden', 'not_activated'],
+    ['auth_forbidden', 'host_id_collision'],
+    ['host_subscription_inactive', undefined],
+    ['not_found', undefined],
+    ['request_conflict', undefined],
+    ['invalid_request', undefined],
+  ]) {
+    const reqId = randomUUID()
+    activateBehavior = async ({ claim }) => {
+      await claim()
+      throw Object.assign(new Error(`supplier leak: ${CODE} Bearer ${bearerSecret} /var/lib/kin/private`), {
+        code,
+        status: 403,
+        ...(recovery && { recovery }),
+        authorityRequestId: reqId,
+      })
+    }
+    due()
+    const beforeCalls = activateCalls
+    await shop.pollActivation()
+    assert.equal(activateCalls, beforeCalls + 1)
+    // A second poll must be a complete no-op because activation_next_at was cleared.
+    await shop.pollActivation()
+    assert.equal(activateCalls, beforeCalls + 1, `${code} (${recovery ?? 'no-recovery'}) must stop polling`)
+    assert.equal((await call('POST', `/orders/${id}/claim`, {})).error.code, 'shop_activation_pinned')
+
+    const viewed = (await call('GET', `/orders/${id}`)).data
+    assert.deepEqual(viewed.activation, {
+      vm_id: 'vm-slot',
+      state: 'needs_attention',
+      error_code: code,
+      ...(recovery && { recovery }),
+      authority_request_id: reqId,
+    })
+
+    // Retry-activation clears all stored error metadata immediately.
+    const retried = (await call('POST', `/orders/${id}/retry-activation`, {})).data
+    assert.deepEqual(retried.activation, { vm_id: 'vm-slot', state: 'activating' })
+    const clearedRow = db.prepare('SELECT * FROM crag_shop_orders WHERE order_id = ?').get(id)
+    assert.equal(clearedRow.activation_error_code, null)
+    assert.equal(clearedRow.activation_error_recovery, null)
+    assert.equal(clearedRow.activation_request_id, null)
+  }
+
+  // 4. Security check: untrusted/secret values in error fields are never persisted or returned.
+  for (const untrustedError of [
+    Object.assign(new Error(`leak ${CODE} ${bearerSecret} /etc/machine-id`), {
+      code: bearerSecret,
+      recovery: CODE,
+      authorityRequestId: `${randomUUID()} ${CODE}`,
+    }),
+    Object.assign(new Error(`leak ${CODE}`), {
+      code: CODE,
+      recovery: '/opt/private/credential',
+      authorityRequestId: bearerSecret,
+    }),
+  ]) {
+    activateBehavior = async () => {
+      throw untrustedError
+    }
+    due()
+    await shop.pollActivation()
+    const rawRow = JSON.stringify(db.prepare('SELECT * FROM crag_shop_orders WHERE order_id = ?').get(id))
+    const rawView = JSON.stringify(await call('GET', `/orders/${id}`))
+    const rawList = JSON.stringify(await call('GET', '/orders'))
+    for (const secret of [CODE, bearerSecret, '/etc/machine-id', '/opt/private', 'leak']) {
+      assert.equal(rawRow.includes(secret), false)
+      assert.equal(rawView.includes(secret), false)
+      assert.equal(rawList.includes(secret), false)
+    }
+  }
+
+  // 5. Transitioning to 'active' clears any prior activation_error_* fields.
+  const preActiveReqId = randomUUID()
+  db.prepare(`UPDATE crag_shop_orders
+    SET activation_error_code = 'crag_subscription_authority_unavailable',
+        activation_error_recovery = 'failed',
+        activation_request_id = ?,
+        activation_next_at = 1
+    WHERE order_id = ?`).run(preActiveReqId, id)
+  activateBehavior = async ({ onRedeemed }) => {
+    onRedeemed()
+  }
+  await shop.pollActivation()
+  const activeOrder = (await call('GET', `/orders/${id}`)).data
+  assert.deepEqual(activeOrder.activation, { vm_id: 'vm-slot', state: 'active' })
+  const activeRow = db.prepare('SELECT * FROM crag_shop_orders WHERE order_id = ?').get(id)
+  assert.equal(activeRow.activation_error_code, null)
+  assert.equal(activeRow.activation_error_recovery, null)
+  assert.equal(activeRow.activation_request_id, null)
+  assert.ok(statusCalls >= 1)
 })

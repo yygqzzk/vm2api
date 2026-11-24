@@ -40,6 +40,7 @@ import {
   draftFromStored,
   endpointModelRequest,
   endpointSaveRequest,
+  asBodyPolicy,
 } from './endpoint-save'
 
 type ModelList = {
@@ -52,6 +53,7 @@ function freshEndpoint(protocol: ApiProtocol = 'anthropic'): EndpointDraft {
     id: randomUUID(),
     protocol,
     riskReviewEnabled: false,
+    bodyPolicy: 'persona',
     ...API_DEFAULTS[protocol],
     apiKey: '',
     proxyId: DIRECT,
@@ -68,6 +70,7 @@ export function AnthropicConsolePage() {
   const [allEndpoints, setEndpoints] = useState<EndpointDraft[]>([
     freshEndpoint('anthropic'),
     freshEndpoint('openai'),
+    freshEndpoint('gemini'),
   ])
   const endpoints = useMemo(
     () => allEndpoints.filter((item) => item.protocol === protocol),
@@ -99,7 +102,7 @@ export function AnthropicConsolePage() {
   useEffect(() => {
     if (loaded || !stored.data) return
     const rows = (stored.data.items || []).map(draftFromStored)
-    for (const kind of ['anthropic', 'openai'] as const) {
+    for (const kind of ['anthropic', 'openai', 'gemini'] as const) {
       if (!rows.some((item) => item.protocol === kind))
         rows.push(freshEndpoint(kind))
     }
@@ -254,6 +257,7 @@ export function AnthropicConsolePage() {
                   stored: {
                     protocol: item.protocol,
                     riskReviewEnabled: item.riskReviewEnabled === true,
+                    bodyPolicy: asBodyPolicy(item.bodyPolicy),
                     baseUrl: item.baseUrl.trim() || defaultUrl,
                     authScheme: item.authScheme,
                     headers: row.stored?.headers,
@@ -273,14 +277,17 @@ export function AnthropicConsolePage() {
   })
 
   return (
-    <PageHeader title={VIEW_TITLES.api}>
+    <PageHeader
+      title={VIEW_TITLES.api}
+      description='配置上游 API 渠道。客户端密钥、调用日志和风险策略分别在密钥、日志和风险审计页。'
+    >
       <div className='mx-auto grid max-w-5xl gap-6'>
         <div
           className='flex flex-wrap gap-2'
           role='group'
           aria-label='API 协议'
         >
-          {(['anthropic', 'openai'] as const).map((kind) => (
+          {(['anthropic', 'openai', 'gemini'] as const).map((kind) => (
             <Button
               key={kind}
               variant={protocol === kind ? 'secondary' : 'outline'}
@@ -297,10 +304,6 @@ export function AnthropicConsolePage() {
             </Button>
           ))}
         </div>
-        <p className='text-sm text-muted-foreground'>
-          保存地址、密钥及模型后，渠道选择 API 的密钥会从这里调用，不使用 OAuth
-          虚拟机。
-        </p>
         <div>
           <div className='mb-2 hidden grid-cols-[minmax(10rem,1.1fr)_8rem_minmax(0,1.4fr)_8rem_auto] gap-2 px-1 text-xs text-muted-foreground @2xl/content:grid'>
             <span>地址</span>
@@ -343,6 +346,11 @@ export function AnthropicConsolePage() {
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
+                        {protocol === 'gemini' ? (
+                          <SelectItem value='x_goog_api_key'>
+                            x-goog-api-key
+                          </SelectItem>
+                        ) : null}
                         <SelectItem value='x_api_key'>x-api-key</SelectItem>
                         <SelectItem value='authorization_bearer'>
                           Bearer
@@ -356,7 +364,13 @@ export function AnthropicConsolePage() {
                       onChange={(event) =>
                         patchEndpoint(item.id, { apiKey: event.target.value })
                       }
-                      placeholder={protocol === 'openai' ? 'sk-…' : 'sk-ant-…'}
+                      placeholder={
+                        protocol === 'gemini'
+                          ? 'AIza… / sk-vm-…'
+                          : protocol === 'openai'
+                            ? 'sk-…'
+                            : 'sk-ant-…'
+                      }
                       aria-label={`密钥 ${index + 1}`}
                     />
                     <Popover
@@ -492,6 +506,40 @@ export function AnthropicConsolePage() {
                             风险审计
                           </a>
                           中启用的规则与决策模型审查，通过后再调用此端点；不影响本页连通性测试。
+                        </p>
+                      </div>
+                    </div>
+                  ) : null}
+                  {protocol === 'anthropic' ? (
+                    <div className='mt-3 flex items-start gap-3 px-1 pb-1'>
+                      <Switch
+                        id={`body-policy-${item.id}`}
+                        aria-describedby={`body-policy-help-${item.id}`}
+                        checked={asBodyPolicy(item.bodyPolicy) === 'caller'}
+                        disabled={save.isPending}
+                        onCheckedChange={(checked) =>
+                          patchEndpoint(item.id, {
+                            bodyPolicy: checked ? 'caller' : 'persona',
+                          })
+                        }
+                      />
+                      <div className='grid gap-1 text-sm'>
+                        <label htmlFor={`body-policy-${item.id}`}>
+                          转发调用方原始正文
+                        </label>
+                        <p
+                          id={`body-policy-help-${item.id}`}
+                          className='text-xs text-muted-foreground'
+                        >
+                          默认关闭，修改后需保存。关闭时按
+                          <a
+                            href='#/settings/protocol'
+                            className='underline underline-offset-4'
+                          >
+                            协议
+                          </a>
+                          里配置的人设改写身份与计费块；开启后保留调用方自带的
+                          system、计费标记与工具身份，适用于上游自行读取这些内容的地址。只影响人设注入，不改变风控、配额、模型映射与预算下限。
                         </p>
                       </div>
                     </div>

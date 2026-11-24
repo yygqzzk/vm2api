@@ -10,6 +10,7 @@
     "test:unit": "node scripts/run-isolated-tests.mjs test/unit .test.mjs",
     "test:ci": "node scripts/run-isolated-tests.mjs test/unit .test.mjs security key-scope panel-acl api-channel-routing convert-stream pool-scheduler tenant-billing rate-limit-service errors-map proxy-http-scheme cache-prefix request-body-context",
     "test:e2e": "node scripts/run-isolated-tests.mjs test/e2e .e2e.test.mjs",
+    "verify:oauth-egress": "node scripts/verify-oauth-egress.mjs",
     "test:node": "npm run test:unit",
     "test:go": "cd worker && go test -race ./...",
     "test:all": "npm run test:unit && npm run test:go",
@@ -25,12 +26,15 @@
   "dependencies": {
     "croner": "^10.0.1",
     "https-proxy-agent": "^9.1.0",
+    "ioredis": "^6.1.0",
     "node-fetch": "^2.7.0",
+    "pg": "^8.23.1",
     "socks-proxy-agent": "^10.1.0",
     "ssh2": "^1.17.0",
     "ws": "^8.22.0"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.5.11"
+    "@biomejs/biome": "2.5.11",
+    "esbuild": "0.28.2"
   }
 }
