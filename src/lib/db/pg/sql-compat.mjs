@@ -16,6 +16,7 @@ const SERIAL_PK_TABLES = new Set([
   'request_attempts',
   'scheduler_outbox',
   'auth_cache_invalidation_outbox',
+  'fork_test_reports',
 ])
 
 const NOOP_PRAGMAS =

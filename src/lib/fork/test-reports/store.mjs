@@ -32,7 +32,10 @@ function summary(record) {
 
 export class TestReports {
   constructor({ db, projectRoot, vm = (id) => getVm(projectRoot, id), now = () => Date.now(), schedule = null }) {
-    applyMigrations(db, { migrationsDir: fileURLToPath(new URL('./migrations/', import.meta.url)) })
+    const migrationsDir = fileURLToPath(
+      new URL(db?.engine === 'postgres' ? './pg-migrations/' : './migrations/', import.meta.url),
+    )
+    applyMigrations(db, { migrationsDir })
     this.db = db
     this.settings = new SettingsRepo(db)
     this.vm = vm
@@ -87,11 +90,11 @@ export class TestReports {
   finish(context, result) {
     // A removed slot must not be resurrected by a late manual test.
     if (!context || !this.vm(context.vm_id)) return null
-    const existing = this.db
-      .prepare(
-        "SELECT id, record_json FROM fork_test_reports WHERE vm_id = ? AND json_extract(record_json, '$.run_id') = ?",
-      )
-      .get(context.vm_id, context.run_id)
+    const existingSql =
+      this.db?.engine === 'postgres'
+        ? "SELECT id, record_json FROM fork_test_reports WHERE vm_id = ? AND (record_json::jsonb ->> 'run_id') = ?"
+        : "SELECT id, record_json FROM fork_test_reports WHERE vm_id = ? AND json_extract(record_json, '$.run_id') = ?"
+    const existing = this.db.prepare(existingSql).get(context.vm_id, context.run_id)
     if (existing) return decode(existing)
     const { auto_generation, ...snapshot } = context
     const ok = result?.ok === true

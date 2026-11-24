@@ -26,6 +26,16 @@ test('translateSqliteToPg appends RETURNING id for serial PK tables on run()', (
   assert.equal(hasReturningId, true)
   assert.equal(sql, 'INSERT INTO groups (name, description) VALUES ($1, $2) RETURNING id')
 
+  const forkReports = translateSqliteToPg(
+    'INSERT INTO fork_test_reports (vm_id, source, model, verdict, started_at, record_json) VALUES (?, ?, ?, ?, ?, ?)',
+    { returningId: true },
+  )
+  assert.equal(forkReports.hasReturningId, true)
+  assert.equal(
+    forkReports.sql,
+    'INSERT INTO fork_test_reports (vm_id, source, model, verdict, started_at, record_json) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
+  )
+
   const nonSerial = translateSqliteToPg('INSERT INTO settings (key, value) VALUES (?, ?)', { returningId: true })
   assert.equal(nonSerial.hasReturningId, false)
   assert.equal(nonSerial.sql, 'INSERT INTO settings (key, value) VALUES ($1, $2)')
