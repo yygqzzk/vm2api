@@ -74,17 +74,19 @@ for (const ttl of [undefined, '5m', '1h']) {
     ]
     const before = structuredClone(input)
     const { out } = render(t, { input, ttl: '1h' })
+    const expectedContent = input.messages[0].content.map((block) =>
+      block.cache_control
+        ? { ...block, cache_control: { ...block.cache_control, ttl: block.cache_control.ttl || '1h' } }
+        : block,
+    )
     assert.deepEqual(out.messages[0], {
       ...input.messages[0],
-      content: [
-        { type: 'text', text: `<system-reminder>\n${input.system}\n</system-reminder>\n` },
-        ...input.messages[0].content,
-      ],
+      content: [{ type: 'text', text: `<system-reminder>\n${input.system}\n</system-reminder>\n` }, ...expectedContent],
     })
     assert.deepEqual(input, before)
     const messages = listCacheMarkers(out).filter((m) => m.section === 'messages')
     assert.equal(messages.length, 1)
-    assert.equal(messages[0].ttl, ttl || null)
+    assert.equal(messages[0].ttl, ttl || '1h')
     validateCacheBreakpoints(out)
   })
 }

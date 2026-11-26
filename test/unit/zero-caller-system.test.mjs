@@ -52,7 +52,12 @@ test('zero preserves system block order, metadata and explicit or implicit cache
   ]
   const before = structuredClone(system)
   const out = prepareCliHopBody(render(system), { cacheTtl: '1h' })
-  assert.deepEqual(out.system.slice(1), before)
+  assert.deepEqual(out.system.slice(1), [
+    before[0],
+    before[1],
+    { ...before[2], cache_control: { type: 'ephemeral', ttl: '5m' } },
+    before[3],
+  ])
   assert.deepEqual(system, before)
   assert.deepEqual(out.messages, [{ role: 'user', content: [{ type: 'text', text: 'Hello' }] }])
   validateCacheBreakpoints(out)
