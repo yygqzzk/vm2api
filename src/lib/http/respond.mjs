@@ -2,6 +2,7 @@
  * Shared HTTP helpers for protocol and panel. SSE headers flush immediately
  * and optionally disable Nagle so Claude Code subagent tokens are not delayed.
  */
+import { createGunzip, createZstdDecompress } from 'node:zlib'
 import { ErrorCode, ErrorType, makeError } from '../core/errors.mjs'
 import { CORS_ALLOW_HEADERS, corsHeadersForRequest } from './cors.mjs'
 import { GATEWAY_RETRY_HEADER } from '../fork/gateway-retry.mjs'
@@ -16,7 +17,28 @@ function requestFromResponse(res) {
   return res?.req || res?._kinReq || null
 }
 
-function collectBody(req, maxBytes) {
+function drainAndFail(req, reject, error) {
+  req.removeAllListeners('data')
+  req.on('data', () => {})
+  req.resume()
+  reject(error)
+}
+
+function makeBodyTooLargeError(maxBytes, received, compressedReceived) {
+  const details = { max_bytes: maxBytes, received }
+  if (compressedReceived !== undefined) {
+    details.compressed_received = compressedReceived
+  }
+  return makeError({
+    type: ErrorType.INVALID_REQUEST,
+    code: ErrorCode.BODY_TOO_LARGE,
+    message: `Request body exceeds limit of ${maxBytes} bytes`,
+    status: 413,
+    details,
+  })
+}
+
+function collectRawBody(req, maxBytes) {
   return new Promise((resolve, reject) => {
     const chunks = []
     let size = 0
@@ -24,24 +46,13 @@ function collectBody(req, maxBytes) {
     const fail = (error) => {
       if (settled) return
       settled = true
-      req.removeAllListeners('data')
-      req.on('data', () => {})
-      req.resume()
-      reject(error)
+      drainAndFail(req, reject, error)
     }
     req.on('data', (c) => {
       if (settled) return
       size += c.length
       if (size > maxBytes) {
-        fail(
-          makeError({
-            type: ErrorType.INVALID_REQUEST,
-            code: ErrorCode.BODY_TOO_LARGE,
-            message: `Request body exceeds limit of ${maxBytes} bytes`,
-            status: 413,
-            details: { max_bytes: maxBytes, received: size },
-          }),
-        )
+        fail(makeBodyTooLargeError(maxBytes, size))
         return
       }
       chunks.push(c)
@@ -51,15 +62,126 @@ function collectBody(req, maxBytes) {
       settled = true
       resolve(Buffer.concat(chunks))
     })
-    req.on('error', (e) =>
+    req.on('error', (e) => {
       fail(
         makeError({
           type: ErrorType.API,
           code: 'request_stream_error',
-          message: String(e.message || e),
+          message: String(e?.message || e),
           status: 400,
         }),
-      ),
+      )
+    })
+  })
+}
+
+function collectCompressedBody(req, maxBytes, encoding) {
+  return new Promise((resolve, reject) => {
+    const decompressor =
+      encoding === 'zstd' ? createZstdDecompress() : createGunzip()
+    const chunks = []
+    let rawSize = 0
+    let decompressedSize = 0
+    let settled = false
+
+    const fail = (error) => {
+      if (settled) return
+      settled = true
+      decompressor.destroy()
+      drainAndFail(req, reject, error)
+    }
+
+    decompressor.on('drain', () => {
+      if (!settled) req.resume()
+    })
+
+    decompressor.on('data', (chunk) => {
+      if (settled) return
+      decompressedSize += chunk.length
+      if (decompressedSize > maxBytes) {
+        fail(makeBodyTooLargeError(maxBytes, decompressedSize, rawSize))
+        return
+      }
+      chunks.push(chunk)
+    })
+
+    decompressor.on('end', () => {
+      if (settled) return
+      settled = true
+      resolve(Buffer.concat(chunks))
+    })
+
+    decompressor.on('error', (e) => {
+      fail(
+        makeError({
+          type: ErrorType.INVALID_REQUEST,
+          code: 'invalid_compressed_body',
+          message: `Invalid ${encoding} request body: ${e?.message || e}`,
+          status: 400,
+          details: { content_encoding: encoding },
+        }),
+      )
+    })
+
+    req.on('data', (chunk) => {
+      if (settled) return
+      rawSize += chunk.length
+      if (rawSize > maxBytes) {
+        fail(makeBodyTooLargeError(maxBytes, rawSize))
+        return
+      }
+      if (!decompressor.write(chunk)) {
+        req.pause()
+      }
+    })
+
+    req.on('end', () => {
+      if (settled) return
+      if (rawSize === 0) {
+        settled = true
+        decompressor.destroy()
+        resolve(Buffer.alloc(0))
+        return
+      }
+      decompressor.end()
+    })
+
+    req.on('error', (e) => {
+      fail(
+        makeError({
+          type: ErrorType.API,
+          code: 'request_stream_error',
+          message: String(e?.message || e),
+          status: 400,
+        }),
+      )
+    })
+  })
+}
+
+function collectBody(req, maxBytes) {
+  const encoding = String(req?.headers?.['content-encoding'] || '')
+    .trim()
+    .toLowerCase()
+
+  if (!encoding || encoding === 'identity') {
+    return collectRawBody(req, maxBytes)
+  }
+  if (encoding === 'zstd' || encoding === 'gzip') {
+    return collectCompressedBody(req, maxBytes, encoding)
+  }
+
+  return new Promise((_, reject) => {
+    drainAndFail(
+      req,
+      reject,
+      makeError({
+        type: ErrorType.INVALID_REQUEST,
+        code: 'unsupported_content_encoding',
+        message: `Unsupported Content-Encoding: ${encoding}`,
+        status: 415,
+        details: { content_encoding: encoding },
+      }),
     )
   })
 }
