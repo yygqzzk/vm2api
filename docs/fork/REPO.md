@@ -1,6 +1,6 @@
 # Fork 仓库
 
-本文件是 `yygqzzk/vm2api` 的仓库地图。构建和上线步骤在 [DEPLOY.md](DEPLOY.md)。一次验收的记录在 [VALIDATION.md](VALIDATION.md)，对不上本次提交的记录不算本次通过。代理配置契约、生产基线与恢复检查见 [PROXIES.md](PROXIES.md)。
+本文件是 `yygqzzk/vm2api` 的仓库地图。构建和上线步骤在 [DEPLOY.md](DEPLOY.md)。历史版本验收快照已归档至 [archive/VALIDATION.md](archive/VALIDATION.md)（历史记录不替代当前提交验证）。代理配置契约、生产基线与恢复检查见 [PROXIES.md](PROXIES.md)。
 
 ## 身份
 
@@ -33,11 +33,11 @@
 
 ## 本地文件
 
-- 仓库根的 `docker-compose.override.yml` 被忽略，Compose 仍会自动加载。WSL 控制台转发只放在需要它的机器上。
-- `.local/` 和根目录 `AGENTS.md` 被忽略。要提交的代理说明写在本目录。
+- 仓库根的 `docker-compose.override.yml` 被忽略，Compose 仍会自动加载，macOS 开发环境不维护 WSL 覆盖文件。
+- `/AGENTS.md`、`.agents/` 与 `.local/` 被 `.gitignore` 忽略；`vm2api` 的 `AGENTS.md` 与 `.agents/skills/vm2api-fork-*` 在私有仓 `dasixda-ops/project-skills/vm2api/` 中维护并软链至此。要提交的 fork 文档写在本目录。
 
 ## 同步上游
 
-fetch 作者远程，把作者 `main` 合并进 fork `main`。保留上面的策略模块和三个接入点，保留作者 tag。合完按 [DEPLOY.md](DEPLOY.md) 跑受影响的回归。生产切换用 `deploy/fork/cutover.py`，流程见 DEPLOY.md「标准化切换」。
+fetch 作者远程，把作者 `main` 合并进 fork `main`。保留上面的策略模块和三个接入点，保留作者 tag。合完按 [DEPLOY.md](DEPLOY.md) 跑受影响的回归。生产切换通过全局 `dasixda-ops`（`ops.sh deploy-vm2api` → `deploy/fork/cutover.py`）执行，流程见 [DEPLOY.md](DEPLOY.md)。
 
 完成条件：合并结果包含当时的作者 `main`，接入点还在，相关检查有本次结果。

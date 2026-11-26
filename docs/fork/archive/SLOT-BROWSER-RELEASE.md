@@ -1,7 +1,7 @@
 # 槽位浏览器 + 1.4.032 离线上线候选
 
 本次交付包含槽位浏览器、代理池时区联动，以及作者 `v1.4.032`
-（`6ff6efd2`）的完整更新。功能用法和隔离边界见 [SLOT-BROWSER.md](SLOT-BROWSER.md)。
+（`6ff6efd2`）的完整更新。功能用法和隔离边界见 [SLOT-BROWSER.md](../SLOT-BROWSER.md)。
 
 ## 发布边界
 

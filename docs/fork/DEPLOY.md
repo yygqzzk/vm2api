@@ -1,229 +1,70 @@
 # Fork：Codex 首包优化与部署
 
-本目录对应 `yygqzzk/vm2api` 的二开，不修改上游安装脚本、payload 清单、
-默认 Compose、`VERSION` 或发布流程。
+本目录对应 `yygqzzk/vm2api` 的二开，不修改上游安装脚本、payload 清单、默认 Compose、`VERSION` 或发布流程。
 
 ## 行为边界
 
-仅原生 **Responses + stream=true** 提前下发上游真实的
-`response.created` / `response.in_progress`，要求带有效 response id、
-没有错误且状态为 `in_progress`（或未提供状态）。不合成心跳冒充首包。
+仅原生 **Responses + stream=true** 提前下发上游真实的 `response.created` / `response.in_progress`，要求带有效 response id、没有错误且状态为 `in_progress`（或未提供状态）。不合成心跳冒充首包。
 
-- `first_byte_ms`：第一个上游协议事件。
-- `first_token_ms`：首段实际生成内容；仍可能是文字、推理或工具内容。
-- new-api 的 `frt`：它收到第一条 SSE data 的时间，不能等同于文字首字。
+- `first_byte_ms`：第一个上游协议事件；`first_token_ms`：首段实际生成内容（文字/推理/工具）；new-api 的 `frt` 包含自身排队、网络与反代耗时，首包提前不代表模型更快出字。
+- Claude、非流式 JSON、Chat/Anthropic 转换、闭源内核、模型选择、推理强度、凭证与指纹均保持上游原行为。
+- **代价：** 真实 lifecycle 首包一旦下发即算已提交，之后失败不能静默换号或重放；未发首包的 HTTP 错误按原逻辑处理，下游须处理流内错误和无 `completed` 的中断。
 
-首包提前不代表模型更快生成正文，也不保证 new-api 一定显示绿色。
-仍需加上 new-api 自身排队、网络和反向代理耗时。
-Claude、非流式 JSON、Chat/Anthropic 协议转换保持上游原有提交边界。
-闭源内核、模型选择、推理强度、凭证和指纹不变。
+## 上游接入点与策略模块
 
-**代价**：真实 lifecycle 首包一旦交给下游，本次请求就已经提交。
-之后失败不能静默换账号或重放；未发首包的 HTTP 错误仍按原逻辑处理。
-下游必须处理流内错误和没有 completed 的中断，不把 HTTP 200 当完整成功。
+策略集中在 `src/lib/transport/codex-stream-policy.mjs`，回归测试在 `test/unit/fork-codex-stream.test.mjs`，部署文件在 `deploy/fork/`。上游仅保留 3 个接入点：
 
-## 为什么保持少量上游接入点
+1. `src/lib/protocol/handle-codex.mjs`：仅原生流式 Responses 启用提前下发。
+2. `src/lib/transport/codex-kernel-client.mjs`：选择 Codex 专用提交条件。
+3. `src/lib/transport/go-worker-client.mjs`：允许传入提交条件，默认条件不变。
 
-新增策略在 `src/lib/transport/codex-stream-policy.mjs`，回归测试在
-`test/unit/fork-codex-stream.test.mjs`，部署文件在 `deploy/fork/`。
-上游文件只保留三个必要接入点：
+不同步覆盖 `src/config/routing.json`，不修改作者 tag，不 fork 整套调度器或运行时热补丁源码。
 
-1. `handle-codex.mjs`：仅原生流式 Responses 启用提前下发。
-2. `codex-kernel-client.mjs`：选择 Codex 专用提交条件。
-3. `go-worker-client.mjs`：允许传入提交条件，默认条件不变。
+## 构建与本机隔离验证
 
-不 fork 整套调度器、不 monkey-patch、不在启动脚本替换源码。
-这些位置仍可能和上游产生冲突，不能保证零冲突。
-同步上游时正常 `git fetch upstream`、`git merge upstream/main`，
-保留这几个接入点并重跑回归；不要覆盖 `src/config/routing.json`。
-发布只推自己的 fork，不用 force push，不修改作者的 tag。
+- **完整源码构建（`linux/amd64`）：**
+  ```bash
+  REV=$(git rev-parse --short=12 HEAD)
+  docker build --platform linux/amd64 -f Dockerfile \
+    --label org.opencontainers.image.source=https://github.com/yygqzzk/vm2api \
+    --label org.opencontainers.image.revision="$(git rev-parse HEAD)" \
+    --label io.vm2api.fork.feature=codex-early-sse \
+    -t "local/vm2api:fork-$REV" .
+  ```
+- **本机隔离运行（不挂载本机 Docker socket，不导入线上账号，只能验控制面与模拟内核 HTTP/SSE 链路）：**
+  ```bash
+  mkdir -p .local/fork-docker/{data,vms,config}
+  python3 - <<'PY'
+  import os, secrets
+  p = '.local/fork-docker.env'
+  if not os.path.exists(p):
+      fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+      with os.fdopen(fd, 'w') as f:
+          for k in ('VM2API_LOCAL_API_KEY', 'VM2API_LOCAL_ADMIN_PASSWORD', 'VM2API_LOCAL_DB_SECRET'):
+              f.write(f'{k}={secrets.token_hex(24)}\n')
+  PY
+  docker compose --env-file .local/fork-docker.env -f deploy/fork/compose.local.yml -p vm2api-fork-local up -d --build
+  curl -fsS http://127.0.0.1:18787/health
+  ```
+- **流式回归测试：**
+  - 宿主机：`npm ci && node --test test/unit/fork-codex-stream.test.mjs`
+  - 镜像内：`docker run --rm --platform linux/amd64 --entrypoint node --mount type=bind,src="$PWD/test/unit/fork-codex-stream.test.mjs",dst=/opt/vm2api/test/unit/fork-codex-stream.test.mjs,readonly "local/vm2api:fork-$REV" --test test/unit/fork-codex-stream.test.mjs`
 
-## 构建 fork 镜像
+## 标准化切换（GHCR + cutover.py）
 
-新版上游使用仓库根目录的 **完整源码 `Dockerfile`** 构建：它包含合并后的
-Node 模块、Web、源码构建的 API helper 与 `deploy/payload.json` 固定的 payload。
-完整源码会直接包含 fork 的三个接入点及独立策略模块，不需要覆盖运行时文件。
+`main` 合入后 CI 的 `ghcr-push` 自动推送 `ghcr.io/yygqzzk/vm2api:fork-<完整SHA>` 与 `vm2api-slot-browser`（离线包另保留 7 天兜底）。`deploy/fork/cutover.py` 固化切换流程：**瘦身一致性备份（~0.8G，排除 `cli-home/.kin` 下可再生内核二进制与 socket，保留最近 `--keep-backups 3` 套）→ `/api/panel/vms/schedule/hold` 暂停调度排空 → 仅替换控制面 → `fleet-update`/`warm` 预热运行中槽位内核 → 逐项验收（失败自动回退，不覆写业务数据库）**。
 
-`deploy/fork/Dockerfile` 仅保留为历史 **1.4.015 专用**派生镜像入口，
-基础 digest、三个模块校验值和四模块覆盖清单均未适配新版。
-版本检查会拒绝将新版源码叠加到旧运行环境；不要改 tag 或绕过校验。
+- **只读与生产切换统一入口（全局技能 `dasixda-ops`，双活部署必须显式 `--node`）：**
+  ```bash
+  OPS=~/Code/dasixda-ops/scripts/ops.sh
+  $OPS deploy-vm2api --node <node> --release <完整SHA> --dry-run
+  $OPS deploy-vm2api --node <node> --release <完整SHA>
+  # 或显式指定 digest 与 slot-browser：
+  # $OPS deploy-vm2api --node <node> --digest ghcr.io/yygqzzk/vm2api@sha256:<digest> --revision <SHA> [--browser-image ghcr.io/yygqzzk/vm2api-slot-browser@sha256:<digest>]
+  ```
+- **首次装机与单槽热重载：** 首次在目标机执行 `cd /opt/vm2api && python3 deploy/fork/cutover.py install` 并配只读 GHCR `docker login ghcr.io`。线上单槽抽样重载时，先 `POST /api/panel/vms/schedule/hold`（`{"reason":"...","ids":["<id>"]}`）确认 `paused: 1, drained: true` 后再 `fleet-update`，并在 `finally` 中 `schedule/resume`（省略 `ids` 为整组维护，空数组会被拒绝）。
 
-从仓库根目录构建与线上同架构的镜像（线上为 linux/amd64）：
+## 生产布局与回滚
 
-```bash
-REV=$(git rev-parse --short=12 HEAD)
-docker build --platform linux/amd64 \
-  -f Dockerfile \
-  --label org.opencontainers.image.source=https://github.com/yygqzzk/vm2api \
-  --label org.opencontainers.image.revision="$(git rev-parse HEAD)" \
-  --label io.vm2api.fork.feature=codex-early-sse \
-  -t "local/vm2api:fork-$REV" .
-```
-
-构建前先提交并验收合并结果，确保镜像标签和 revision 对应完整源码。
-`VERSION` 继续表示兼容的上游版本，fork 身份以镜像标签和 OCI revision
-label 为准。当前上游基线读仓库根目录的 `VERSION`。
-
-## 本机隔离部署
-
-不会使用仓库原有的 WSL override，不挂载本机 Docker socket，
-不导入线上账号。这样只能验证控制面与模拟内核的 HTTP/SSE 链路，
-不能在这个隔离实例创建真实 Docker 槽位。
-
-创建随机的本地专用密钥（不要复制生产 `.env`）：
-
-```bash
-mkdir -p .local/fork-docker/{data,vms,config}
-python3 - <<'PY'
-import os, secrets
-p = '.local/fork-docker.env'
-if not os.path.exists(p):
-    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, 'w') as f:
-        for k in ('VM2API_LOCAL_API_KEY', 'VM2API_LOCAL_ADMIN_PASSWORD',
-                  'VM2API_LOCAL_DB_SECRET'):
-            f.write(f'{k}={secrets.token_hex(24)}\n')
-PY
-
-docker compose --env-file .local/fork-docker.env \
-  -f deploy/fork/compose.local.yml -p vm2api-fork-local up -d --build
-curl -fsS http://127.0.0.1:18787/health
-```
-
-面板：`http://127.0.0.1:18787/cc`。
-密钥仅保存在被 git 忽略的 `.local/fork-docker.env` 中。
-`.local/fork-docker/` 也不应提交或上传。
-
-## 流式回归验证
-
-宿主机：
-
-```bash
-npm ci
-node --test test/unit/fork-codex-stream.test.mjs
-```
-
-在实际完整源码镜像中测试（生产镜像不打包测试文件）：
-
-```bash
-docker run --rm --platform linux/amd64 --entrypoint node \
-  --mount type=bind,src="$PWD/test/unit/fork-codex-stream.test.mjs",dst=/opt/vm2api/test/unit/fork-codex-stream.test.mjs,readonly \
-  "local/vm2api:fork-$REV" --test test/unit/fork-codex-stream.test.mjs
-```
-
-测试用假的账号和受控 Unix-socket 内核发包，但运行实际的
-`handleCodexProtocol`、Codex client 和共享转发器，再通过真实 HTTP 客户端
-收包。固定推迟 600ms 才给正文，分别验证旧策略与新策略；首包能提前，
-真正 TTFT 不被改小。另测断包、取消、诊断头不泄露、首包前可重试、
-首包后不能重试，以及 JSON/转换路径不受影响。
-这不是官方模型的真实测速，不消耗生产账号额度。
-
-## 标准化切换（cutover.py）
-
-线上抽样重载时，先向 `/api/panel/vms/schedule/hold` 发送
-`{ "reason": "本次唯一标记", "ids": ["目标槽位ID"] }`，确认 `paused: 1`、
-`drained: true` 后，仅对该 ID 执行 `fleet-update`。排空同时统计 Claude 和 Codex
-在途请求；在 `finally` 中向 `/api/panel/vms/schedule/resume` 发送同一 `reason`。
-原手动停调与自动测试停调保留。省略 `ids` 仍表示整组维护，空数组会被拒绝。
-
-`deploy/fork/cutover.py` 固化本轮验证过的切换流程：一致性备份 → 暂停调度排空 →
-仅替换控制面 → 逐项验收，失败自动回退程序（不覆盖业务数据库）。
-
-- **镜像交付**：`main` 合并后 CI 的 `ghcr-push` job 推送与 amd64 验收相同的镜像到
-  `ghcr.io/yygqzzk/vm2api:fork-<完整SHA>`（另带 slot-browser 镜像）。线上配置只读拉取凭证后按 digest 拉取，
-  不再手动下载/scp/load 离线包；离线包仍在 CI 工件里保留 7 天作兜底。
-- **瘦身备份**：只收 DB（gzip）+ `.env` + Compose 链 + config + 槽位不可再生文件
-  （凭证/指纹/settings/machine-id/kvm 身份），排除 `cli-home/.kin` 下可再生的
-  cli-node/cc-node/kin-kernel/glibc 二进制与运行时 socket。每套约 0.8G 而非 2.5G。
-- **保留策略**：成功切换后自动只保留最近 `--keep-backups`（默认 3）套 cutover 备份。
-- **排空**：面板维护 hold 接口暂停调度并等在途请求自然结束（1.4.046 起也可依赖
-  优雅停机排空；长流场景建议显式 hold）。
-- **内核预热**：通过控制面的 `fleet-update` / `warm` 操作启动原本运行的槽位内核，
-  让面板主进程登记并管理子进程；不重新绑定代理、调整调度或重启槽位容器。
-  启动、重载及预热会从槽位记录同步种子文件的时区和语言，保留用户自定义设置。
-
-服务器上首次安装（一次性）：
-
-```bash
-cd /opt/vm2api && python3 deploy/fork/cutover.py install
-```
-
-之后每次升级只需一条命令（自动拉取 `ghcr.io/yygqzzk/vm2api:fork-<SHA>`、
-备份、排空、替换、验收；失败自动回退）：
-
-```bash
-vm2api-cutover preflight --release <完整SHA>   # 只读：拉取 + Compose 合并校验
-vm2api-cutover deploy    --release <完整SHA>   # 备份 -> 排空 -> 替换 -> 验收
-```
-
-同时升级槽位浏览器时，为两个命令加上 `--browser-image ghcr.io/yygqzzk/vm2api-slot-browser@sha256:<已验收digest>`。脚本核对浏览器与控制面的 revision、amd64 架构和指纹镜像标记，只允许额外修改 `VM2API_BROWSER_IMAGE`；旧 Compose 链保留原浏览器引用供回滚。已有 profile 卷会在无浏览器运行时一并备份，不清空登录态或身份文件。
-
-也可用 `--image <repo>@sha256:... --revision <SHA>` 指定 digest。
-回滚脚本写在每次备份目录的 `rollback.sh`（恢复原 Compose 链，不动数据库）。
-线上 GHCR 拉取凭证用只读 PAT 配置一次：`docker login ghcr.io`。
-
-## 准备部署到现有服务器（手动执行，非本机验证的一部分）
-
-线上现有布局不能换成仓库默认挂载：
-
-- 配置：`/opt/vm2api/.env`、`/opt/vm2api/src/config/`。
-- 数据库和日志：`/opt/vm2api/data/`。
-- 账号、凭证和指纹：`/root/.vm2api/vms/`。
-- 原有 `/opt/vm2api/docker-compose.yml` 保留不动。
-
-1. 先记录镜像 ID、容器 Mounts、10 个槽的 ID 和健康状态。
-   对 SQLite 使用在线 backup API 备份，不单独复制正在使用 WAL 的 `kin.db`；
-   另备份 `.env`、config、原 Compose、vms 的配置/凭证/指纹，权限限制为 root。
-   确认有可恢复备份后再继续，不删除旧镜像。
-2. 将上面构建的 **linux/amd64** 镜像导入服务器；仅复制生产覆盖文件，
-   不上传本机 `.env`、routing、data、vms 或 WSL override：
-
-   ```bash
-   docker save "local/vm2api:fork-$REV" | gzip > ".local/fork-$REV.tar.gz"
-   scp ".local/fork-$REV.tar.gz" vm2api:/tmp/
-   scp deploy/fork/compose.production.yml vm2api:/opt/vm2api/compose.fork.yml
-   # 以下在服务器上执行，REV 替换成已验收的具体提交号。
-   gunzip -c /tmp/fork-$REV.tar.gz | docker load
-   ```
-
-3. **跨版本升级前另行验收**：1.4.015 → 本次同步结果涉及迁移 045–047、
-   新 kernel / cli-node payload 和 worker 遥测变更；还包含托管 API Key 的
-   Codex 门禁扣费、缺省请求体上限 32 MiB、流式判定与计费档位变化。
-   详见 `CHANGELOG.md` 的 1.4.018–1.4.023 条目。先用隔离数据副本验证迁移，
-   再安排 payload / worker 更新与槽位刷新；不能沿用同版补丁“不刷新槽位”的前提。
-   下列命令仅替换控制面，不代表跨版本升级已经完成。
-
-   在服务器 `/opt/vm2api` 使用两个明确的 Compose 文件，避免自动载入
-   本机 WSL override；先验证配置，再替换控制面：
-
-   ```bash
-   cd /opt/vm2api
-   export VM2API_FORK_IMAGE="local/vm2api:fork-$REV"
-   docker compose -f docker-compose.yml -f compose.fork.yml config --quiet
-   docker compose -f docker-compose.yml -f compose.fork.yml \
-     up -d --no-deps --pull never vm2api
-   curl -fsS http://127.0.0.1:8787/health
-   ```
-
-   此操作会短暂中断控制面；先等在途请求结束。
-   不运行 install.sh、面板官方升级或未经验收的槽位重建。
-   入口会刷新程序二进制，应用也可能迁移数据库或规范化配置，
-   所以必须有上一步备份并复核，而不是承诺整个运行目录字节永远不变。
-
-4. 核对新容器的镜像 label、数据库与账号数量、原有路由/出口/指纹，
-   再逐个检查 10 个 Codex 内核健康。随后通过实际 new-api 路径抽样，
-   分开观测首包与真正首字。不要只看面板的版本号或红绿颜色。
-
-回滚使用原 Compose 中已记录的官方镜像，不加载 fork 覆盖文件：
-
-```bash
-cd /opt/vm2api
-docker compose -f docker-compose.yml up -d --no-deps --pull never vm2api
-```
-
-这只回退程序，不恢复/清空数据库，不删除账号槽。
-本次同步新增迁移 045–047；跨版本回滚还须核对数据库、payload 和 worker
-兼容性，必要时按已验收的备份恢复流程操作，不能只换旧镜像就视为完成。
-
-后续重建/重启控制面都要明确带 `-f compose.fork.yml`。
-面板中的官方一键升级不知道 fork 镜像，可能覆盖回官方版，不要混用。
+- **禁止运行面板官方一键升级或 `install.sh`：** 会将 fork 镜像覆盖回官方版本。保留现网 `/opt/vm2api/.env`、`/opt/vm2api/src/config/`、`/opt/vm2api/data/`、`/root/.vm2api/vms/` 与原 `docker-compose.yml`，仅通过 `compose.fork.yml` 覆盖镜像与 `VM2API_BROWSER_IMAGE`。
+- **备份与回滚：** 严禁直接复制正在使用 WAL 的 `kin.db`，须走在线 backup API 或 `vm2api-cutover`；切换失败或回滚可执行备份目录内的 `rollback.sh`（或不加载 `compose.fork.yml` 重建 `vm2api`），仅回退程序而不覆盖数据库、凭证、指纹或已有账号槽；跨版本回滚前须核对迁移脚本与 payload 兼容性。
