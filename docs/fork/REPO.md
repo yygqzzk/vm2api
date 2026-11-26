@@ -11,7 +11,7 @@
 
 ## 改动
 
-1. 从当前 fork `main` 建 `fork/<topic>`，放在仓库旁的 worktree。
+1. 从当前 fork `main` 建 `fork/<topic>`，放在 `~/Code/.worktrees/vm2api/<topic>`。
 2. 策略放进职责明确的模块；上游文件只加接入点。
 3. 用 PR 合回本仓库 `main`，让 `ci` 在进入 `main` 之前跑。紧急修复可以直接推 `main`。
 
