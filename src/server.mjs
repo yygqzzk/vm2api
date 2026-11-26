@@ -32,6 +32,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { loadConfig, reloadActiveVm, routingConfigFile } from './lib/core/config.mjs'
 import { createGeminiCragSubscription } from './lib/gemini/subscription.mjs'
 import { createGeminiScheduler } from './lib/gemini/scheduler.mjs'
+import { createGeminiSlotPrefs } from './lib/gemini/slot-prefs.mjs'
 import {
   createGeminiPublicHandler,
   createGeminiTerminal,
@@ -56,6 +57,7 @@ import {
   getPanelAdmin,
 } from './lib/core/security.mjs'
 import { loadModelPolicy } from './lib/protocol/model-policy.mjs'
+import { loadGeminiModelPolicy } from './lib/protocol/gemini-model-policy.mjs'
 import { gatewayModelCatalog } from './lib/protocol/models.mjs'
 import {
   createCredentialRefreshMonitor,
@@ -83,7 +85,7 @@ import { TestReports } from './lib/fork/test-reports/store.mjs'
 import { StickyRouter } from './lib/pool/sticky-router.mjs'
 import { AccountQuota } from './lib/pool/account-quota.mjs'
 import { normalizeTiers } from './lib/pool/quota-tiers.mjs'
-import { ApiKeyStore } from './lib/admin/api-keys.mjs'
+import { ApiKeyStore, makeApiKeyGateError } from './lib/admin/api-keys.mjs'
 import { keyScopeFromRequest, keyTierPolicyFromRecord } from './lib/admin/key-scope.mjs'
 import { ownerScopeFromRequest } from './lib/admin/resource-owner.mjs'
 import { filterModelCatalogForKey } from './lib/admin/key-models.mjs'
@@ -94,6 +96,7 @@ import { ApiEndpointStore } from './lib/admin/api-endpoints.mjs'
 import { ApiScheduler } from './lib/pool/api-scheduler.mjs'
 import { apiScheduleScope, resolveInferenceBackend } from './lib/pool/api-protocol.mjs'
 import { bootApiKernel, apiKernelPaths, apiKernelSnapshot } from './lib/transport/api-kernel-client.mjs'
+import { bootProtoFront } from './lib/transport/proto-front-client.mjs'
 import { PanelUserStore } from './lib/admin/panel-users.mjs'
 import { RequestLogStore } from './lib/admin/request-log.mjs'
 import {
@@ -105,6 +108,15 @@ import {
   isCodexVm,
   syncCodexQuotaSchedule,
 } from './lib/vm/vm-registry.mjs'
+import {
+  readCodexAccounts,
+  upsertCodexAccount,
+  persistCodexCredentialState,
+  markCodexGrantDead,
+} from './lib/vm/codex-slot.mjs'
+import { hostProxyUrlForVm } from './lib/vm/slot-host.mjs'
+import { refreshCodexAccessToken } from './lib/protocol/codex-models.mjs'
+import { clearOpenAIAccountHold } from './lib/pool/openai-account-runtime.mjs'
 import { extraIsLiveOpen, parseResetMs } from './lib/pool/quota-window.mjs'
 import { createCragSubscription } from './lib/vm/crag-subscription.mjs'
 import { createCragRuntimeInventory } from './lib/vm/crag-runtime-inventory.mjs'
@@ -123,14 +135,17 @@ import { ensureProxyEgress, proxyEgressReady } from './lib/vm/egress.mjs'
 import { syncIpv6ProxyEgress } from './lib/vm/proxy-policy-runtime.mjs'
 import { GATEWAY_CAPABILITIES } from './lib/vm/execution-context.mjs'
 import { isTelemetryPath, telemetryInterceptResponse } from './lib/identity/telemetry-rewrite.mjs'
-import { openDatabaseAsync, closeDatabaseAsync, getDb, getDbEngine } from './lib/db/database.mjs'
+import { openDatabaseAsync, closeDatabaseAsync, getDb, getDbEngine, getPgPool } from './lib/db/database.mjs'
+import { startDashboardAggregator, stopDashboardAggregator } from './lib/db/pg/dashboard-aggregator.mjs'
 import { snapshotCacheMetrics } from './lib/cache/index.mjs'
 import { armWriteBehind } from './lib/db/write-behind.mjs'
 import { JevUsageRepo } from './lib/db/repos/jev-usage-repo.mjs'
 import { installJevUsageRecorder } from './lib/protocol/jev-usage.mjs'
+import { jevHealthSnapshot, readJevConfig } from './lib/protocol/jev-intercept.mjs'
 import { runLegacyImport } from './lib/db/legacy-import.mjs'
 import { initVmDbSync, stopVmWatch } from './lib/vm/vm-db-sync.mjs'
 import { BackupService } from './lib/admin/backup-service.mjs'
+import { ensureRedaction } from './lib/redaction/runtime.mjs'
 import { ClusterNodesRepo } from './lib/db/repos/cluster-nodes-repo.mjs'
 import { ClusterManager } from './lib/cluster/cluster-manager.mjs'
 import { createHostMemoryPressure, installHostMemoryPressure } from './lib/cluster/host-memory-pressure.mjs'
@@ -342,7 +357,7 @@ const allowRate = createRateLimiter({
 
 // --- Persistent store (PostgreSQL or SQLite) ---
 const dataDir = cfg.paths.data || path.join(cfg.paths.root, 'data')
-await openDatabaseAsync({ dataDir, pooled: true })
+await openDatabaseAsync({ dataDir, pooled: true, enableAggregator: false })
 armWriteBehind(getDb())
 const jevUsageRepo = new JevUsageRepo()
 installJevUsageRecorder((event) => jevUsageRepo.record(event))
@@ -350,6 +365,11 @@ try {
   loadModelPolicy()
 } catch (e) {
   console.warn('[model-policy] boot load failed', e?.message || e)
+}
+try {
+  loadGeminiModelPolicy()
+} catch (e) {
+  console.warn('[gemini-model-policy] boot load failed', e?.message || e)
 }
 // one-time migration of legacy JSON files (data/*.json + request-logs) into the DB
 const legacyImport = runLegacyImport({ dataDir, projectRoot: cfg.paths.project })
@@ -545,7 +565,7 @@ if (routingConfig?.logging) {
 runAtActivation('request-log-cleanup', () => {
   try {
     requestLog.cleanup()
-  } catch { }
+  } catch {}
   requestLog.startCleanupScheduler()
 })
 
@@ -616,7 +636,7 @@ function accountForUsageProbe(vm) {
     try {
       const acc = accountQuota.repo.get(key)
       if (acc) return acc
-    } catch { }
+    } catch {}
   }
   try {
     return accountQuota.repo.list().find((a) => a.vm_id === vm.id) || null
@@ -649,7 +669,7 @@ function attachSlotRuntime(vm) {
           cooldown_reason: rt.cooldown_reason || null,
         }
       }
-    } catch { }
+    } catch {}
   }
   return vm
 }
@@ -671,6 +691,42 @@ healthMonitor = createHealthProbeMonitor({
       unofficial: false,
       extraHeaders: { [HEALTH_REAL_HEADER]: '1' },
     }),
+  listGeminiTargets: async () => {
+    if (!geminiScheduler?.catalog) return { models: [], accounts: [] }
+    return geminiScheduler.catalog()
+  },
+  runGeminiProbe: async ({ model, prompt, timeout_ms }) => {
+    if (!geminiScheduler?.complete) return { ok: false, error: 'gemini_scheduler_unavailable' }
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeout_ms || 60_000)
+    try {
+      const turn = await geminiScheduler.complete({
+        model,
+        text: prompt || 'hello',
+        startedAt: Date.now(),
+        signal: controller.signal,
+        allowUnprefixedNonGemini: false,
+      })
+      return {
+        ok: true,
+        status: turn?.upstream_status ?? 200,
+        text: turn?.text || 'ok',
+        vm_id: turn?.account_id ? `gemini:${turn.account_id}` : 'gemini',
+        account_id: turn?.account_id || null,
+        model: turn?.response_model || turn?.model || model,
+        stop_reason: turn?.stopReason || 'end_turn',
+        usage: turn?.usage || { input_tokens: 0, output_tokens: 0 },
+      }
+    } catch (error) {
+      return {
+        ok: false,
+        status: error?.upstreamStatus || error?.status || 0,
+        error: error?.message || error?.code || String(error),
+      }
+    } finally {
+      clearTimeout(timer)
+    }
+  },
 })
 const testReports = new TestReports({
   db: getDb(),
@@ -738,7 +794,7 @@ credentialRefreshMonitor = createCredentialRefreshMonitor({
       try {
         const acc = accountQuota?.repo?.get?.(vm.account_uuid || vm.id)
         lastProbe = acc?.unified?.last_probe || acc?.last_probe || lastProbe
-      } catch { }
+      } catch {}
       return { ...vm, last_probe: lastProbe }
     }),
   reviveOne: async (vm) => {
@@ -751,14 +807,18 @@ credentialRefreshMonitor = createCredentialRefreshMonitor({
     return { revived: cleared }
   },
   refreshOne: (vm) =>
-    refreshWorkerCredentialForVm({
-      vmId: vm.id,
-      vmPath: path.join(cfg.paths.project, 'vms', `${vm.id}.json`),
-      homeDir: path.join(cfg.paths.project, 'vms', vm.id, 'cli-home'),
-      vm: getVm(cfg.paths.project, vm.id) || vm,
-      force: false,
-      skewMs: PROACTIVE_REFRESH_SKEW_MS,
-    }),
+    // codex 槽走 token 端点直连分支（槽内无 kin-worker oauth 可跑），
+    // claude 槽维持既有 worker 链。
+    isCodexVm(vm)
+      ? refreshCodexCredentialForVm({ projectRoot: cfg.paths.project, vm })
+      : refreshWorkerCredentialForVm({
+          vmId: vm.id,
+          vmPath: path.join(cfg.paths.project, 'vms', `${vm.id}.json`),
+          homeDir: path.join(cfg.paths.project, 'vms', vm.id, 'cli-home'),
+          vm: getVm(cfg.paths.project, vm.id) || vm,
+          force: false,
+          skewMs: PROACTIVE_REFRESH_SKEW_MS,
+        }),
 })
 function bootSlot(id) {
   return powerOnSlot({ projectRoot: cfg.paths.project, id, proxyPool, routing: routingConfig })
@@ -803,25 +863,33 @@ usageProbeMonitor = createUsageProbeMonitor({
         syncCodexQuotaSchedule(cfg.paths.project, getVm(cfg.paths.project, vm.id) || vm, {
           policy: routingConfig.codex?.quota,
         })
-      } catch { }
+      } catch {}
       return
     }
     try {
       accountQuota.persistEffectiveWindows(id)
-    } catch { }
+    } catch {}
     try {
       poolScheduler.syncQuotaSchedule(vm, account)
-    } catch { }
+    } catch {}
   },
   probeOne: (vm) => panel.buildProbeOne({ cfg, accountQuota, id: vm.id, routingConfig }),
 })
 catalogMonitor = createCatalogMonitor({
   projectRoot: cfg.paths.project,
   codexCatalogVersion: () => routingConfig.codex?.catalog_client_version || 'auto',
+  callGeminiHost,
+  resolveGeminiProxy: (proxyId, envId) => {
+    const ownerUserId = geminiOwnersRepo?.getOwner?.(envId) ?? null
+    return geminiProxyFor(proxyPool, proxyId, { ownerUserId })
+  },
+  getApiEndpointStore: () => apiEndpointStore,
+  cfg,
   log: (event) => console.log(JSON.stringify(event)),
 })
 notifyMonitor = createNotifyMonitor({
   vmSnapshot: () => snapshotVmConnectivity(listVms(cfg.paths.project)),
+  jevSnapshot: () => jevHealthSnapshot(readJevConfig((k, d) => new SettingsRepo().get(k, d))),
   config: routingConfig.notify,
   baseUrl: cfg.base_url,
   snapshot: () =>
@@ -841,7 +909,7 @@ const backupService = new BackupService({
   projectRoot: cfg.paths.project,
   configDir: path.dirname(routingConfigPath),
 })
-backupService.onRestored((db) => {
+backupService.onRestored(async (db) => {
   // A restore swaps the DatabaseSync instance and routing files. Rebuild every
   // holder before reporting success; otherwise requests keep stale snapshots
   // or silently write through statements owned by the closed connection.
@@ -883,6 +951,11 @@ backupService.onRestored((db) => {
   initPoolRuntime()
   reloadActiveVm(cfg)
   vmTestSchedule.reload()
+  try {
+    await ensureRedaction(routingConfig, { projectRoot: cfg.paths.project })
+  } catch (err) {
+    console.warn('[backup] redaction resync after restore failed:', String(err?.message || err))
+  }
 })
 // A just-activated leader waits for the draining controller to exit before its catch-up backup:
 // that one may still be mid-run, and two full snapshots of a large DB would run side by side.
@@ -956,25 +1029,85 @@ async function refreshWorkerCredentialForVm({ vmId, vmPath, homeDir, vm, force =
   if (result.ok) {
     try {
       mirrorWorkerCredentialsToVm(vmPath, homeDir, { acceptLiveGrant: true })
-    } catch { }
+    } catch {}
     try {
       invalidateLiveCredentialCache()
-    } catch { }
+    } catch {}
     try {
       const accountId = vm?.claude?.account_uuid || vmId
       accountQuota.clearGrantRevokeLeftover(accountId)
       poolScheduler?.clearAuthCooldownFor?.(vmId, accountId)
       poolScheduler?.clearGrantRevokeCooldownFor?.(vmId, accountId)
-    } catch { }
+    } catch {}
   } else if (published.refresh_class !== 'retryable') {
     try {
       markVmRefreshError(vmPath, result)
-    } catch { }
+    } catch {}
     try {
       invalidateLiveCredentialCache()
-    } catch { }
+    } catch {}
   }
   return published
+}
+
+/**
+ * Codex 凭证后台保活（credential-refresh monitor 的 codex 分支）：
+ * claude 槽靠槽内 kin-worker oauth 轮换，codex 槽凭证在
+ * codex-credentials.json、容器是 Go worker——正确路径是控制面直打
+ * auth.openai.com token 端点（refreshCodexAccessToken，同面板刷新）。
+ * 成功：upsertCodexAccount 落新票+清陈旧 refresh_error+清内存 hold；
+ * 吊销（token_revoked→oauth_revoked）：markCodexGrantDead 四态摘池；
+ * 瞬态（超时/网络）：不落标，下轮再来。
+ */
+async function refreshCodexCredentialForVm({ projectRoot, vm }) {
+  const vmId = vm?.id
+  if (!projectRoot || !vmId) return { ok: false, refresh_class: 'retryable', error: { code: 'vm_missing' } }
+  const first = readCodexAccounts(projectRoot, vmId)[0] || {}
+  const refreshToken = String(first.refresh_token || '').trim()
+  if (!refreshToken) {
+    return { ok: false, refresh_class: 'failed', error: { code: 'missing_refresh_token', message: 'no refresh token' } }
+  }
+  const result = await refreshCodexAccessToken({
+    refreshToken,
+    proxyUrl: hostProxyUrlForVm(vm),
+  })
+  if (result?.ok) {
+    upsertCodexAccount(projectRoot, vmId, {
+      access_token: result.access_token,
+      refresh_token: result.refresh_token || refreshToken,
+      id_token: result.id_token || first.id_token,
+      expires_at: result.expires_at || first.expires_at,
+    })
+    // 活票：清陈旧 refresh 标 + 内存 hold（与面板刷新成功路径同语义）。
+    try {
+      persistCodexCredentialState(projectRoot, vmId, { error: null })
+    } catch {}
+    try {
+      clearOpenAIAccountHold(vmId)
+    } catch {}
+    return { ok: true, status: 200, refreshed: true, refresh_class: 'rotated' }
+  }
+  const code = String(result?.error || 'refresh_failed')
+  if (code === 'oauth_revoked') {
+    // 吊销=终态：落标摘池（幂等、不覆盖其他诊断），下轮 isCodexCredentialRefreshTarget 排除。
+    try {
+      persistCodexCredentialState(projectRoot, vmId, { error: 'oauth_revoked' })
+      markCodexGrantDead(projectRoot, vmId, {
+        description: result?.description || 'token endpoint answered revocation',
+        status: result?.status || null,
+      })
+    } catch {}
+    return { ok: false, refresh_class: 'fatal', error: { code: 'oauth_revoked' } }
+  }
+  if (code === 'refresh_rejected') {
+    // 结构性拒绝但非吊销文案：落标供面板归因，不摘池（与 openai-quota rotateIfNeeded 同口径）。
+    try {
+      persistCodexCredentialState(projectRoot, vmId, { error: 'refresh_rejected' })
+    } catch {}
+    return { ok: false, refresh_class: 'failed', error: { code: 'refresh_rejected' } }
+  }
+  // timeout / fetch_failed / 4xx/5xx 模糊拒绝：瞬态，不落标。
+  return { ok: false, refresh_class: 'retryable', error: { code } }
 }
 
 const { json, writeSSEHeaders, readBody, readRawBody } = createRespond(cfg, {
@@ -987,11 +1120,16 @@ function rejectAuth(req, res, error) {
     message: error?.body?.error?.message || 'Invalid credentials',
     status: error?.status || 401,
   }
+  if (error?.headers) {
+    for (const [header, value] of Object.entries(error.headers)) {
+      if (value != null) res.setHeader?.(header, value)
+    }
+  }
   json(res, error.status, error.body)
   return false
 }
 
-/** `keyGate: false` (key self-service) skips the managed key's quota / RPM / concurrency gate and the gateway bucket. */
+/** `keyGate: false` (key self-service) skips the managed key's quota / RPM / concurrency gate. */
 function requireAuth(req, res, { keyGate = true, buyer = false, optionalBuyer = false } = {}) {
   req.presentedApiKey = extractApiKey(req)
   const token = extractPanelToken(req) || req.presentedApiKey
@@ -1039,9 +1177,9 @@ function requireAuth(req, res, { keyGate = true, buyer = false, optionalBuyer = 
     })
     return false
   }
-  // Master env API key — unlimited admin
+  // Master env API key — unlimited admin unless KIN_RATE_CAP is explicitly configured
   if (timingSafeEqualStr(token, cfg.api_key)) {
-    if (!allowRate(token)) {
+    if (cfg.limits.rate_capacity_explicit && !allowRate(token)) {
       return rejectAuth(
         req,
         res,
@@ -1090,35 +1228,7 @@ function requireAuth(req, res, { keyGate = true, buyer = false, optionalBuyer = 
   }
   const gate = keyGate ? apiKeyStore.canAccept(managed.record) : { ok: true }
   if (!gate.ok) {
-    const type =
-      gate.status === 429
-        ? gate.code.includes('quota')
-          ? ErrorType.QUOTA
-          : ErrorType.RATE_LIMIT
-        : ErrorType.PERMISSION
-    return rejectAuth(
-      req,
-      res,
-      makeError({
-        type,
-        code: gate.code,
-        message: gate.message,
-        status: gate.status,
-        details: gate.detail || undefined,
-      }),
-    )
-  }
-  if (keyGate && !allowRate(token)) {
-    return rejectAuth(
-      req,
-      res,
-      makeError({
-        type: ErrorType.RATE_LIMIT,
-        code: ErrorCode.GATEWAY_RATE_LIMIT,
-        message: 'Gateway rate limit exceeded. Retry later.',
-        status: 429,
-      }),
-    )
+    return rejectAuth(req, res, makeApiKeyGateError(gate))
   }
   req.apiKeyKind = 'managed'
   req.apiKeyRecord = managed.record
@@ -1248,7 +1358,7 @@ const clusterManager = new ClusterManager({
   // A node's local row follows its link: re-probe as soon as the link settles.
   onLinkState: (nodeId, state) => {
     if (state === 'ready' || state === 'error' || state === 'backoff') {
-      proxyPool.probeLocalNode(nodeId).catch(() => { })
+      proxyPool.probeLocalNode(nodeId).catch(() => {})
     }
     // Slot image tags change with every control-plane upgrade: rebuild what is missing now,
     // not when the first slot lands there.
@@ -1277,7 +1387,7 @@ if (STANDBY) {
     for (const kernel of Object.keys(OS_CATALOG)) {
       try {
         slotImageSpec(cfg.paths.project, kernel)
-      } catch { }
+      } catch {}
       await new Promise((resolve) => setImmediate(resolve))
     }
     const links = await clusterManager.prewarmReady({ timeoutMs: 20_000 })
@@ -1407,6 +1517,12 @@ const geminiCragSubscription = createGeminiCragSubscription({
   callHost: callGeminiHost,
 })
 const geminiTerminal = createGeminiTerminal({ proxyPool: () => proxyPool })
+const geminiSlotPrefs = createGeminiSlotPrefs({
+  settingsRepo: {
+    get: (key, fallback) => new SettingsRepo().get(key, fallback),
+    set: (key, value) => new SettingsRepo().set(key, value),
+  },
+})
 const geminiScheduler = createGeminiScheduler({
   callHost: callGeminiHost,
   resolveProxy: (proxyId, envOwnerId) => geminiProxyFor(proxyPool, proxyId, { ownerUserId: envOwnerId }),
@@ -1414,8 +1530,11 @@ const geminiScheduler = createGeminiScheduler({
   apiKeyStore,
   groupsRepo: { rateMultiplier: (id) => groupsRepo.rateMultiplier(id) },
   geminiOwnersRepo: geminiOwnersProxy,
+  slotPrefs: geminiSlotPrefs,
   cragSubscription: geminiCragSubscription,
   getRoutingConfig: () => routingConfig,
+  getAttemptsRepo: () => attemptsRepo,
+  listCacheTtlMs: 2000,
 })
 const handleGeminiPublic = createGeminiPublicHandler({
   json,
@@ -1425,6 +1544,7 @@ const handleGeminiPublic = createGeminiPublicHandler({
   groupsRepo: { rateMultiplier: (id) => groupsRepo.rateMultiplier(id) },
   apiKeyStore,
   getRoutingConfig: () => routingConfig,
+  getHealthMonitor: () => healthMonitor,
 })
 const integrationTokenStore = new IntegrationTokenStore()
 const handlePanel = createPanelHandler({
@@ -1433,6 +1553,8 @@ const handlePanel = createPanelHandler({
   cragSubscription,
   geminiCragSubscription,
   geminiOwnersRepo: geminiOwnersProxy,
+  geminiSlotPrefs,
+  geminiScheduler,
   handleCragShop,
   json,
   writeSSEHeaders,
@@ -1527,43 +1649,43 @@ function stopLeaderJobs() {
   for (const fn of leaderStoppers.splice(0)) {
     try {
       fn()
-    } catch { }
+    } catch {}
   }
   try {
     vmTestSchedule.stop()
-  } catch { }
+  } catch {}
   try {
     backupService.stopScheduler()
     void backupService.abortRunning()
-  } catch { }
+  } catch {}
   try {
     proxyPool.stopScheduler()
-  } catch { }
+  } catch {}
   try {
     healthMonitor?.stop?.()
-  } catch { }
+  } catch {}
   try {
     credentialRefreshMonitor?.stop?.()
-  } catch { }
+  } catch {}
   try {
     kernelWatchdog?.stop?.()
     slotCapacityReconciler.stop()
-  } catch { }
+  } catch {}
   try {
     hostMemoryPressure?.stop?.()
-  } catch { }
+  } catch {}
   try {
     cliNodeGuard?.stop?.()
-  } catch { }
+  } catch {}
   try {
     usageProbeMonitor?.stop?.()
-  } catch { }
+  } catch {}
   try {
     catalogMonitor?.stop?.()
-  } catch { }
+  } catch {}
   try {
     notifyMonitor?.stop?.()
-  } catch { }
+  } catch {}
 }
 
 // Blue/green step 2 (SIGUSR1): stop every leader job and hand the data-dir lock to the standby.
@@ -1606,7 +1728,7 @@ function endPanelStreams() {
   for (const res of panelStreams) {
     try {
       res.end()
-    } catch { }
+    } catch {}
   }
   panelStreams.clear()
 }
@@ -1639,17 +1761,17 @@ const gracefulShutdown = createGracefulShutdown({
     await Promise.race([geminiTerminalDrain, delay(2000, undefined, { ref: false })])
     try {
       stopVmWatch()
-    } catch { }
+    } catch {}
     try {
       stopAllRustKernels()
-    } catch { }
+    } catch {}
     try {
       // After a handover the relay socket paths belong to the new leader: close ours, leave the files.
       await clusterManager.stop({ unlink: handoverRole() !== 'draining' })
-    } catch { }
+    } catch {}
     try {
       await closeDatabaseAsync()
-    } catch { }
+    } catch {}
   },
 })
 
@@ -1841,7 +1963,7 @@ const server = http.createServer(async (req, res) => {
           try {
             const gemCat = await geminiScheduler.catalog(modelGeminiScope)
             gemModels = Array.isArray(gemCat?.models) ? gemCat.models : []
-          } catch { }
+          } catch {}
           const apiCat = apiScheduler.catalog(apiScheduleScope(req, 'gemini', apiKeyStore?.users))
           const merged = []
           const seen = new Set()
@@ -1880,7 +2002,7 @@ const server = http.createServer(async (req, res) => {
             const extra = gemCatalog.models.filter((m) => m?.id && !seen.has(m.id))
             if (extra.length) result.data = [...existing, ...extra]
           }
-        } catch { }
+        } catch {}
       }
       if (backend === 'all') {
         const apiCat = apiScheduler.catalog(apiScopeForModels)
@@ -1954,6 +2076,7 @@ const server = http.createServer(async (req, res) => {
           routeStream: gemGen.stream,
         })
       }
+      let preloadedGemCat = null
       if (gemGen && backend === 'all') {
         const policy = req.apiKeyKind === 'managed' ? keyTierPolicyFromRecord(req.apiKeyRecord) : null
         const gemScope = {
@@ -1968,6 +2091,7 @@ const server = http.createServer(async (req, res) => {
         let hasOwnedGemEnv = false
         try {
           const cat = await geminiScheduler.catalog(gemScope)
+          preloadedGemCat = cat
           hasOwnedGemEnv = Array.isArray(cat?.accounts) && cat.accounts.length > 0
         } catch {
           hasOwnedGemEnv = false
@@ -1982,7 +2106,7 @@ const server = http.createServer(async (req, res) => {
           })
         }
       }
-      return handleGeminiPublic(req, res)
+      return handleGeminiPublic(req, res, preloadedGemCat ? { catalogSnapshot: preloadedGemCat } : {})
     }
     // A shared path only belongs to Gemini when the key does. Dispatching on
     // the path alone would make the OpenAI handlers below unreachable, and
@@ -2033,7 +2157,7 @@ const server = http.createServer(async (req, res) => {
     } else {
       try {
         res.end()
-      } catch { }
+      } catch {}
     }
   }
 })
@@ -2060,11 +2184,11 @@ server.on('clientError', (err, socket) => {
         message: String(err?.message || err).slice(0, 200),
       }),
     )
-  } catch { }
+  } catch {}
   if (!socket || !socket.writable) {
     try {
       socket?.destroy()
-    } catch { }
+    } catch {}
     return
   }
   socket.end(
@@ -2123,7 +2247,7 @@ function runExclusivePass() {
     const done = await markExclusive()
     // Gates whose recreate was deferred were just ensured by markExclusive; re-check only the others.
     const gatesDone = new Set(done.filter((k) => k.startsWith('gate:')).map((k) => k.slice(5)))
-    if (process.env.KIN_CRS_MOCK !== '1') await clusterManager.refreshGates({ skip: gatesDone }).catch(() => { })
+    if (process.env.KIN_CRS_MOCK !== '1') await clusterManager.refreshGates({ skip: gatesDone }).catch(() => {})
     if (wrapChanged && process.env.KIN_AUTO_SYNC_WRAP === '1') {
       const summary = await syncInstalledKernels({
         project: cfg.paths.project,
@@ -2213,16 +2337,44 @@ if (process.env.KIN_CRS_MOCK !== '1') {
 }
 await bootApiKernel(cfg)
 testReports.auto.reconcile()
+await bootProtoFront(cfg)
 server.keepAliveTimeout = 120_000
 server.headersTimeout = 125_000
 server.timeout = 0
 
 server.listen(cfg.port, cfg.host, () => {
   runAtActivation('background', () => {
+    if (getDbEngine() === 'postgres' && process.env.VM2API_DASHBOARD_AGGREGATOR_DISABLED !== '1') {
+      startDashboardAggregator(getPgPool())
+      onLeaderStop(() => stopDashboardAggregator())
+    }
     if (process.env.KIN_CRS_MOCK !== '1') {
       void cragSubscription.recover().catch(() => {
         console.warn('[crag-subscription] startup recovery failed; use the administrator panel to retry')
       })
+      void geminiCragSubscription.recover().catch(() => {
+        console.warn('[crag-gemini-subscription] startup recovery failed; will retry in background')
+      })
+      let maintainingGeminiSub = false
+      const maintainGeminiSub = () => {
+        if (maintainingGeminiSub) return
+        maintainingGeminiSub = true
+        void (async () => {
+          if (geminiCragSubscription.hasSyncPending?.()) {
+            await geminiCragSubscription.recover().catch(() => {
+              console.warn('[crag-gemini-subscription] background sync-pending recovery deferred')
+            })
+          }
+          await geminiCragSubscription.refreshExpiredEntitlement?.().catch(() => {
+            console.warn('[crag-gemini-subscription] expired quota refresh deferred')
+          })
+        })().finally(() => {
+          maintainingGeminiSub = false
+        })
+      }
+      const geminiSubTimer = setInterval(maintainGeminiSub, 15_000).unref()
+      onLeaderStop(() => clearInterval(geminiSubTimer))
+      maintainGeminiSub()
       const refresh = () =>
         void cragSubscription.refreshExpiredEntitlement().catch(() => {
           console.warn('[crag-subscription] expired quota refresh deferred')
@@ -2251,6 +2403,15 @@ server.listen(cfg.port, cfg.host, () => {
       const timer = setInterval(expireOrders, 60_000).unref()
       onLeaderStop(() => clearInterval(timer))
       expireOrders()
+    }
+    if (process.env.KIN_CRS_MOCK !== '1' && typeof handleCragShop.warmPlans === 'function') {
+      const warmCatalog = () =>
+        void handleCragShop.warmPlans().catch(() => {
+          console.warn('[crag-shop] catalog cache warm deferred')
+        })
+      const timer = setInterval(warmCatalog, 5 * 60_000).unref()
+      onLeaderStop(() => clearInterval(timer))
+      warmCatalog()
     }
     // Installation intent is durable; reconnecting nodes must not depend on a lost HTTP callback.
     if (process.env.KIN_CRS_MOCK !== '1') {
@@ -2322,7 +2483,7 @@ server.listen(cfg.port, cfg.host, () => {
       // still recorded at its old small limits is reloaded down, then up again.
       slotCapacityReconciler
         .tick()
-        .catch(() => { })
+        .catch(() => {})
         .finally(() => {
           slotCapacityReconciler.start()
           kernelWatchdog?.start?.({ immediate: true })

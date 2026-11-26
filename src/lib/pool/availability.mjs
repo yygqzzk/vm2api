@@ -32,7 +32,7 @@ export const REVOKE_TEXT = 'revoke'
 /** Dead grant only. Do not match stale-access 401 (`authentication_failed_after_refresh`) or `/usage` 429. */
 export const TRANSIENT_CREDENTIAL_REFRESH_FAIL = /worker_output_invalid|refresh_rejected|refresh_denied/i
 export const CREDENTIAL_REFRESH_FAIL =
-  /oauth_invalid_grant|invalid_grant|refresh_token_missing|refresh_token_invalid|refresh token not found|oauth_revoked|oauth_no_refresh|oauth_cleared|credential_refresh_failed|worker_output_invalid|refresh_rejected|refresh_denied/i
+  /oauth_invalid_grant|invalid_grant|refresh_token_missing|refresh_token_invalid|refresh token not found|oauth_revoked|oauth_no_refresh|oauth_cleared|credential_refresh_failed|worker_output_invalid|refresh_rejected|refresh_denied|token_revoked|invalidated oauth token/i
 
 function liveAccessTtlMs(vm = {}, workerCredential = {}, expiresAt = null) {
   return (
@@ -502,9 +502,9 @@ export function evaluateAccount({
   })
 }
 
-/** Extra 5h/7d reject reasons that write restriction, not 调度关. */
+/** Extra quota-window reject reasons (5h / 7d / 24h / …) that write restriction, not 调度关. */
 export function isQuotaWindowReason(reason) {
-  return /^(quota_5h|quota_7d)/.test(String(reason || ''))
+  return /^quota_\d+[mhd]/.test(String(reason || ''))
 }
 
 /** Account-scope quota / 429 parks stored on temp_unschedulable_* + runtime cooldown. */

@@ -1,3 +1,4 @@
+import { apiKeyGateDetails } from '../admin/api-keys.mjs'
 import crypto from 'node:crypto'
 import { setTimeout as sleep } from 'node:timers/promises'
 import {
@@ -9,10 +10,12 @@ import {
   createSseFrameSplitter,
 } from '../protocol/gemini-convert.mjs'
 import { createStreamTiming } from '../protocol/stream-timing.mjs'
+import { isGeminiModelEnabled, isGeminiSeriesId, resolveGeminiDefaultEffort } from '../protocol/gemini-model-policy.mjs'
 import { classifyAntigravityModel, indexAccountModelCatalog, resolveUpstreamModel } from './model-catalog.mjs'
+import { createDirectCragClient } from './direct-client.mjs'
 import { callGeminiHost, callGeminiHostStream } from './routes.mjs'
 import { DEFAULT_GEMINI_ROUTING, normalizeGeminiRouting } from './routing-config.mjs'
-import { GEMINI_LICENSE_MESSAGES } from './subscription.mjs'
+import { GEMINI_LICENSE_MESSAGES, RECOVERABLE_GEMINI_SEAT_CODES } from './subscription.mjs'
 import { PLATFORM_SCOPE, geminiEnvMatchesOwnerScope } from '../admin/resource-owner.mjs'
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/
@@ -59,9 +62,17 @@ const FAILURES = {
     403,
     'Google requires browser account verification before this account can use Antigravity.',
   ],
+  gemini_client_unsupported: [
+    403,
+    'Google rejected the current Antigravity client version or metadata (UNSUPPORTED_CLIENT).',
+  ],
   gemini_account_ineligible: [403, 'Google rejected this account as ineligible for Antigravity.'],
   gemini_proxy_error: [502, 'The bound Gemini proxy could not reach Google.'],
   gemini_quota_exhausted: [429, 'The selected Gemini account quota is exhausted.'],
+  gemini_content_rejected: [
+    429,
+    'The request prompt was rejected by upstream content filtering (429); account quota was not exhausted.',
+  ],
   gemini_inference_timeout: [504, 'The Gemini turn timed out.'],
   gemini_inference_invalid_output: [502, 'Gemini returned an unreadable response.'],
   gemini_tool_call_required: [
@@ -80,6 +91,10 @@ const FAILURES = {
   gemini_invalid_request: [400, 'Invalid Gemini request payload.'],
   gemini_native_tty_unavailable: [503, 'No free Linux virtual console is available for CRAGGemini.'],
   gemini_native_worker_unavailable: [503, 'The CRAGGemini native worker is unavailable.'],
+  gemini_native_config_invalid: [
+    503,
+    'CRAGGemini rejected the host-generated worker configuration; align the host script and signed payload versions.',
+  ],
   gemini_native_bridge_timeout: [503, 'The CRAGGemini TUI did not connect to its native worker in time.'],
   gemini_egress_unavailable: [503, 'Gemini egress is not available.'],
   gemini_oauth_tools_missing: [503, 'Gemini OAuth runtime tools are missing.'],
@@ -89,51 +104,160 @@ const FAILURES = {
   license_not_yet_valid: [403, GEMINI_LICENSE_MESSAGES.license_not_yet_valid],
   license_invalid: [403, GEMINI_LICENSE_MESSAGES.license_invalid],
   license_binding_mismatch: [403, GEMINI_LICENSE_MESSAGES.license_binding_mismatch],
+  license_payload_key_mismatch: [403, GEMINI_LICENSE_MESSAGES.license_payload_key_mismatch],
   license_unconfigured: [403, GEMINI_LICENSE_MESSAGES.license_unconfigured],
+  gemini_subscription_sync_pending: [503, GEMINI_LICENSE_MESSAGES.gemini_subscription_sync_pending],
 }
 
 const NON_CIRCUIT_FAILURES = new Set([
   'gemini_quota_exhausted',
+  'gemini_content_rejected',
   'gemini_oauth_required',
   'gemini_api_key_invalid',
-  'gemini_location_unsupported',
-  'gemini_account_verification_required',
-  'gemini_account_ineligible',
   'gemini_model_unavailable',
   'gemini_unsupported_turn',
-  'gemini_invalid_request',
   'gemini_inference_tool_blocked',
   'gemini_tool_call_required',
+  'gemini_native_config_invalid',
   'gemini_proxy_calibration_mismatch',
   'license_required',
   'license_expired',
   'license_not_yet_valid',
   'license_invalid',
   'license_binding_mismatch',
+  'license_payload_key_mismatch',
   'license_unconfigured',
+  'gemini_subscription_sync_pending',
 ])
 
 const FAILOVER_ERRORS = new Set([
   'gemini_quota_exhausted',
   'gemini_account_verification_required',
   'gemini_location_unsupported',
+  'gemini_client_unsupported',
   'gemini_account_ineligible',
   'gemini_oauth_required',
   'gemini_operation_busy',
   'gemini_proxy_unavailable',
   'gemini_proxy_error',
   'gemini_native_worker_unavailable',
+  'gemini_native_bridge_timeout',
   'gemini_inference_start_failed',
+  'gemini_inference_failed',
+  'gemini_inference_timeout',
+  'gemini_inference_invalid_output',
+  'gemini_host_protocol_error',
 ])
 
 const ACCOUNT_WIDE_COOLDOWN_ERRORS = new Set([
   'gemini_account_verification_required',
   'gemini_location_unsupported',
+  'gemini_client_unsupported',
   'gemini_account_ineligible',
   'gemini_oauth_required',
 ])
 
-const INELIGIBLE_STATES = new Set(['verification_required', 'location_unsupported', 'ineligible'])
+const INELIGIBLE_STATES = new Set(['verification_required', 'location_unsupported', 'client_unsupported', 'ineligible'])
+
+const CONTENT_OUTPUT_EVENTS = new Set([
+  'text',
+  'thinking',
+  'thinking_signature',
+  'text_signature',
+  'tool_call',
+  'image',
+  'search',
+  'stop',
+])
+
+const GROUP_QUOTA_EXHAUSTED_REASONS = new Set(['QUOTA_EXHAUSTED', 'INSUFFICIENT_G1_CREDITS_BALANCE'])
+const SHORT_RATE_LIMIT_MAX_MS = 5_000
+
+function parseGoDurationMs(raw) {
+  if (typeof raw !== 'string') return null
+  const text = raw.trim()
+  if (!text || text.length > 64) return null
+  let totalMs = 0
+  let pos = 0
+  const re = /(\d+(?:\.\d+)?)(ms|s|m|h)/g
+  for (const match of text.matchAll(re)) {
+    if (match.index !== pos) return null
+    pos = match.index + match[0].length
+    const val = Number(match[1])
+    if (!Number.isFinite(val) || val < 0) return null
+    const unit = match[2]
+    const factor = unit === 'ms' ? 1 : unit === 's' ? 1_000 : unit === 'm' ? 60_000 : 3_600_000
+    totalMs += val * factor
+  }
+  if (pos !== text.length || !Number.isFinite(totalMs) || totalMs <= 0) return null
+  return Math.min(3_600_000, Math.max(1, Math.ceil(totalMs)))
+}
+
+function parseUpstreamQuotaMeta(rawBody) {
+  let upstreamReason =
+    typeof rawBody?.upstream_reason === 'string' && rawBody.upstream_reason ? rawBody.upstream_reason : null
+  const errObj = rawBody?.error && typeof rawBody.error === 'object' ? rawBody.error : rawBody
+  const details = Array.isArray(errObj?.details) ? errObj.details : []
+  for (const item of details) {
+    if (!item || typeof item !== 'object') continue
+    if (!upstreamReason && typeof item.reason === 'string' && item.reason) {
+      upstreamReason = item.reason
+    }
+  }
+  const explicitContentRejected = rawBody?.content_rejected === true || rawBody?.code === 'gemini_content_rejected'
+  return { upstreamReason, contentRejected: explicitContentRejected }
+}
+
+function parseRetryAfterMs(rawBody, headers) {
+  const bodyMs = Number(rawBody?.retry_after_ms ?? rawBody?.retryAfterMs)
+  if (Number.isFinite(bodyMs) && bodyMs > 0) {
+    return Math.min(3_600_000, Math.max(1_000, Math.round(bodyMs)))
+  }
+  const bodySec = Number(rawBody?.retry_after ?? rawBody?.retryAfter)
+  if (Number.isFinite(bodySec) && bodySec > 0) {
+    return Math.min(3_600_000, Math.max(1_000, Math.round(bodySec * 1000)))
+  }
+  const errObj = rawBody?.error && typeof rawBody.error === 'object' ? rawBody.error : rawBody
+  const details = Array.isArray(errObj?.details) ? errObj.details : []
+  let googleMs = null
+  for (const item of details) {
+    if (!item || typeof item !== 'object') continue
+    const rd = parseGoDurationMs(item.retryDelay)
+    if (rd != null) googleMs = Math.max(googleMs || 0, rd)
+    const meta = item.metadata && typeof item.metadata === 'object' ? item.metadata : null
+    if (meta) {
+      const qd = parseGoDurationMs(meta.quotaResetDelay)
+      if (qd != null) googleMs = Math.max(googleMs || 0, qd)
+      if (typeof meta.quotaResetTimeStamp === 'string' && meta.quotaResetTimeStamp.trim()) {
+        const parsedTs = Date.parse(meta.quotaResetTimeStamp.trim())
+        if (Number.isFinite(parsedTs)) {
+          const delta = parsedTs - Date.now()
+          if (delta > 0) googleMs = Math.max(googleMs || 0, Math.min(3_600_000, Math.round(delta)))
+        }
+      }
+    }
+  }
+  if (googleMs != null && googleMs > 0) {
+    return Math.min(3_600_000, Math.max(1_000, googleMs))
+  }
+  const headerVal = headers?.['retry-after'] ?? headers?.['Retry-After']
+  if (headerVal != null && headerVal !== '') {
+    const asNum = Number(headerVal)
+    if (Number.isFinite(asNum) && asNum > 0) {
+      return Math.min(3_600_000, Math.max(1_000, Math.round(asNum * 1000)))
+    }
+    const asDur = parseGoDurationMs(String(headerVal))
+    if (asDur != null) {
+      return Math.min(3_600_000, Math.max(1_000, asDur))
+    }
+    const asDate = Date.parse(String(headerVal))
+    if (Number.isFinite(asDate)) {
+      const delta = asDate - Date.now()
+      if (delta > 0) return Math.min(3_600_000, Math.max(1_000, Math.round(delta)))
+    }
+  }
+  return null
+}
 
 function fail(status, code, message = FAILURES[code]?.[1] || code) {
   const error = new Error(message)
@@ -146,7 +270,16 @@ function known(error) {
   const code = error?.code
   if (typeof code === 'string' && Object.hasOwn(FAILURES, code)) {
     const [status, message] = FAILURES[code]
-    return fail(Number.isInteger(error.status) ? error.status : status, code, error.message || message)
+    const out = fail(Number.isInteger(error.status) ? error.status : status, code, error.message || message)
+    if (Number.isInteger(error.upstreamStatus)) out.upstreamStatus = error.upstreamStatus
+    if (Number.isFinite(error.retryAfterMs) && error.retryAfterMs > 0) out.retryAfterMs = error.retryAfterMs
+    if (error.retryAfter != null) out.retryAfter = error.retryAfter
+    if (typeof error.upstreamReason === 'string' && error.upstreamReason) out.upstreamReason = error.upstreamReason
+    if (error.contentRejected === true) out.contentRejected = true
+    if (error.timing) out.timing = error.timing
+    if (error.usage) out.usage = error.usage
+    if (error.details) out.details = error.details
+    return out
   }
   return null
 }
@@ -371,18 +504,33 @@ export function createGeminiScheduler({
   groupsRepo,
   geminiOwnersRepo = null,
   getEnvOwner = null,
+  slotPrefs = null,
   cragSubscription = null,
   getRoutingConfig = null,
+  attemptsRepo = null,
+  getAttemptsRepo = null,
   quotaCooldownMs = null,
   accountCooldownMs = null,
+  listCacheTtlMs = callHost === callGeminiHost ? 2000 : 0,
+  directClient = undefined,
   now = () => Date.now(),
 }) {
+  const resolveAttemptsRepo = () => (typeof getAttemptsRepo === 'function' ? getAttemptsRepo() : attemptsRepo) || null
   const envOwnerOf = (envId) => {
     if (typeof getEnvOwner === 'function') return getEnvOwner(envId) ?? null
     if (geminiOwnersRepo?.getOwner) return geminiOwnersRepo.getOwner(envId) ?? null
     return null
   }
   const streamHost = callHostStream ?? (callHost === callGeminiHost ? callGeminiHostStream : null)
+  const effectiveDirectClient =
+    directClient !== undefined
+      ? directClient
+      : callHost === callGeminiHost && streamHost === callGeminiHostStream
+        ? createDirectCragClient({ callHost, now })
+        : null
+  const effectiveListCacheTtlMs = Number.isFinite(listCacheTtlMs) && listCacheTtlMs > 0 ? Math.floor(listCacheTtlMs) : 0
+  let hostListCache = null
+  let hostListInFlight = null
   const groupCooldowns = new Map()
   const modelCooldowns = new Map()
   const accountCooldowns = new Map()
@@ -390,6 +538,35 @@ export function createGeminiScheduler({
   const toolContinuationBindings = new Map()
   const localInflight = new Map()
   let rrCursor = 0
+
+  function invalidateCatalogCache() {
+    hostListCache = null
+    effectiveDirectClient?.invalidate?.()
+  }
+
+  async function fetchHostList({ force = false } = {}) {
+    if (!force && effectiveListCacheTtlMs > 0 && hostListCache) {
+      if (now() - hostListCache.fetchedAt < effectiveListCacheTtlMs) {
+        return hostListCache.view
+      }
+    }
+    if (!force && hostListInFlight) {
+      return hostListInFlight
+    }
+    const pending = Promise.resolve()
+      .then(() => callHost('list', {}))
+      .then((view) => {
+        if (effectiveListCacheTtlMs > 0 && Array.isArray(view?.environments)) {
+          hostListCache = { view, fetchedAt: now() }
+        }
+        return view
+      })
+      .finally(() => {
+        if (hostListInFlight === pending) hostListInFlight = null
+      })
+    if (!force) hostListInFlight = pending
+    return pending
+  }
 
   function resolveToolContinuation(callIds, ts) {
     if (!Array.isArray(callIds) || !callIds.length) return null
@@ -407,7 +584,14 @@ export function createGeminiScheduler({
     return null
   }
 
-  function recordToolContinuation(accountId, collected, ts, consumedCallIds = [], stickyKey = null) {
+  function recordToolContinuation(
+    accountId,
+    collected,
+    ts,
+    consumedCallIds = [],
+    stickyKey = null,
+    parentRequestId = null,
+  ) {
     if (Array.isArray(consumedCallIds)) {
       for (const cid of consumedCallIds) {
         if (typeof cid === 'string' && cid) toolContinuationBindings.delete(cid)
@@ -433,6 +617,7 @@ export function createGeminiScheduler({
       accountId,
       conversationId: meta.conversationId,
       stickyKey,
+      parentRequestId: parentRequestId || null,
       expiresAt: ts + TOOL_CONTINUATION_TTL_MS,
     }
     for (const tc of collected.toolCalls) {
@@ -594,27 +779,35 @@ export function createGeminiScheduler({
     return reserve(balancedOrdered)
   }
 
-  function activeCooldownUntil(account, upstreamModel, quotaGroup, ts) {
-    let until = proactiveCooldownUntil(account, upstreamModel, quotaGroup, ts)
+  function activeCooldownState(account, upstreamModel, quotaGroup, ts) {
+    const proactiveUntil = proactiveCooldownUntil(account, upstreamModel, quotaGroup, ts)
+    let accountUntil = 0
     const accUntil = accountCooldowns.get(account.id) || 0
-    if (accUntil > ts) until = Math.max(until, accUntil)
+    if (accUntil > ts) accountUntil = accUntil
     else if (accUntil) accountCooldowns.delete(account.id)
 
+    let reactiveQuotaUntil = 0
     const grpKey = `${account.id}:${quotaGroup}`
     const grpUntil = groupCooldowns.get(grpKey) || 0
-    if (grpUntil > ts) until = Math.max(until, grpUntil)
+    if (grpUntil > ts) reactiveQuotaUntil = Math.max(reactiveQuotaUntil, grpUntil)
     else if (grpUntil) groupCooldowns.delete(grpKey)
 
     const mdlKey = `${account.id}:${upstreamModel}`
     const mdlUntil = modelCooldowns.get(mdlKey) || 0
-    if (mdlUntil > ts) until = Math.max(until, mdlUntil)
+    if (mdlUntil > ts) reactiveQuotaUntil = Math.max(reactiveQuotaUntil, mdlUntil)
     else if (mdlUntil) modelCooldowns.delete(mdlKey)
 
-    return until
+    const hardUntil = Math.max(proactiveUntil, accountUntil)
+    const cooldownUntil = Math.max(hardUntil, reactiveQuotaUntil)
+    return { cooldownUntil, hardUntil, reactiveQuotaUntil }
   }
 
   function recordFailureCooldown(accountId, upstreamModel, quotaGroup, failure, ts) {
     const code = failure?.code
+    if (code === 'gemini_content_rejected' || failure?.contentRejected === true) {
+      // Prompt content rejection (reasonless 429) is request-scoped, not account exhaustion.
+      return 0
+    }
     const policy = currentPolicy()
     const effectiveQuotaCooldown = quotaCooldownMs ?? policy.failover.quota_cooldown_ms ?? DEFAULT_QUOTA_COOLDOWN_MS
     const effectiveAccountCooldown =
@@ -625,20 +818,28 @@ export function createGeminiScheduler({
           ? failure.retryAfterMs
           : effectiveQuotaCooldown
       const until = ts + retryMs
-      groupCooldowns.set(
-        `${accountId}:${quotaGroup}`,
-        Math.max(groupCooldowns.get(`${accountId}:${quotaGroup}`) || 0, until),
-      )
+      // Scope generic/capacity reactive 429 cooldown to the specific upstream model so a
+      // single model's RPM/capacity 429 does not poison healthy sibling models. When upstream
+      // explicitly reports QUOTA_EXHAUSTED / INSUFFICIENT_G1_CREDITS_BALANCE, also cool the
+      // shared quota group so sibling models on the same exhausted bucket fail over cleanly.
       modelCooldowns.set(
         `${accountId}:${upstreamModel}`,
         Math.max(modelCooldowns.get(`${accountId}:${upstreamModel}`) || 0, until),
       )
-      return
+      if (quotaGroup && GROUP_QUOTA_EXHAUSTED_REASONS.has(failure?.upstreamReason)) {
+        groupCooldowns.set(
+          `${accountId}:${quotaGroup}`,
+          Math.max(groupCooldowns.get(`${accountId}:${quotaGroup}`) || 0, until),
+        )
+      }
+      return until
     }
     if (ACCOUNT_WIDE_COOLDOWN_ERRORS.has(code)) {
       const until = ts + effectiveAccountCooldown
       accountCooldowns.set(accountId, Math.max(accountCooldowns.get(accountId) || 0, until))
+      return until
     }
+    return 0
   }
 
   function clearCooldownOnSuccess(accountId, upstreamModel, quotaGroup) {
@@ -691,8 +892,69 @@ export function createGeminiScheduler({
       }
     },
 
-    async catalog({ ownerScope = PLATFORM_SCOPE, allowedEnvIds = null } = {}) {
-      let view = await callHost('list', {})
+    environmentRestriction(envId, ts = now()) {
+      if (!envId) return { restriction: null, circuit: null }
+      const rawCircuit = poolScheduler?.unitCircuit?.view?.(`gemini:${envId}`, ts) || null
+      const circuit = rawCircuit && rawCircuit.state !== 'closed' ? rawCircuit : null
+
+      let accountUntil = accountCooldowns.get(envId) || 0
+      if (accountUntil <= ts) {
+        if (accountUntil) accountCooldowns.delete(envId)
+        accountUntil = 0
+      }
+
+      const prefix = `${envId}:`
+      let groupUntil = 0
+      for (const [key, until] of groupCooldowns.entries()) {
+        if (!key.startsWith(prefix)) continue
+        if (until > ts) groupUntil = Math.max(groupUntil, until)
+        else groupCooldowns.delete(key)
+      }
+
+      let modelUntil = 0
+      for (const [key, until] of modelCooldowns.entries()) {
+        if (!key.startsWith(prefix)) continue
+        if (until > ts) modelUntil = Math.max(modelUntil, until)
+        else modelCooldowns.delete(key)
+      }
+
+      let restriction = null
+      if (circuit?.state === 'open') {
+        restriction = { reason: 'circuit_open', text: '熔断中', until: circuit.open_until ?? null }
+      } else if (circuit?.state === 'half_open') {
+        restriction = { reason: 'circuit_probe', text: '熔断探测', until: null }
+      } else if (accountUntil > 0) {
+        restriction = { reason: 'account_cooldown', text: '账号冷却中', until: accountUntil }
+      } else if (groupUntil > 0) {
+        restriction = { reason: 'quota_group_cooldown', text: '配额组冷却中', until: groupUntil }
+      } else if (modelUntil > 0) {
+        restriction = { reason: 'model_quota_cooldown', text: '模型冷却中', until: modelUntil }
+      }
+      return { restriction, circuit }
+    },
+
+    clearRestriction(envId) {
+      if (!envId) return { cleared: false }
+      accountCooldowns.delete(envId)
+      const prefix = `${envId}:`
+      for (const key of [...groupCooldowns.keys()]) {
+        if (key.startsWith(prefix)) groupCooldowns.delete(key)
+      }
+      for (const key of [...modelCooldowns.keys()]) {
+        if (key.startsWith(prefix)) modelCooldowns.delete(key)
+      }
+      poolScheduler?.unitCircuit?.reset?.(`gemini:${envId}`)
+      return { cleared: true }
+    },
+
+    invalidateCatalogCache,
+
+    async catalog({ ownerScope = PLATFORM_SCOPE, allowedEnvIds = null, forceRefresh = false } = {}) {
+      if (cragSubscription?.hasSyncPending?.()) {
+        await cragSubscription.recover().catch(() => null)
+        invalidateCatalogCache()
+      }
+      let view = await fetchHostList({ force: forceRefresh })
       if (!Array.isArray(view?.environments)) throw fail(502, 'gemini_host_protocol_error')
       if (view.payload_state !== 'installed') return { models: [], accounts: [] }
       const payloadMode = view.payload_mode === 'crag_subscription' ? 'crag_subscription' : 'legacy_release'
@@ -709,14 +971,15 @@ export function createGeminiScheduler({
             Array.isArray(environment.models) &&
             environment.models.length > 0 &&
             environment.crag_license?.valid !== true &&
-            (!environment.crag_license?.code || environment.crag_license.code === 'license_required'),
+            (!environment.crag_license?.code || RECOVERABLE_GEMINI_SEAT_CODES.has(environment.crag_license.code)),
         )
         if (needSeat.length) {
           const reconciled = await cragSubscription
             .reconcileEnvironmentSeats(needSeat, { payloadMode })
             .catch(() => ({ boundIds: [] }))
           if (reconciled.boundIds?.length) {
-            view = await callHost('list', {})
+            invalidateCatalogCache()
+            view = await fetchHostList({ force: true })
             if (!Array.isArray(view?.environments)) throw fail(502, 'gemini_host_protocol_error')
             if (view.payload_state !== 'installed') return { models: [], accounts: [] }
           }
@@ -740,6 +1003,8 @@ export function createGeminiScheduler({
         const envOwner = envOwnerOf(environment.id)
         if (!geminiEnvMatchesOwnerScope(envOwner, ownerScope)) continue
         if (Array.isArray(allowedEnvIds) && !allowedEnvIds.includes(environment.id)) continue
+        const pref = slotPrefs?.resolved?.(environment.id) ?? null
+        if (pref && pref.schedulable === false) continue
         if (resolveProxy) {
           try {
             resolveProxy(environment.proxy_id, envOwner)
@@ -768,7 +1033,9 @@ export function createGeminiScheduler({
           }
           accounts.push({
             id: environment.id,
+            proxy_id: environment.proxy_id,
             auth_method: authMethod,
+            schedule_level: pref?.schedule_level ?? 5,
             max_concurrency: normalizeConcurrency(
               environment.max_concurrency,
               currentPolicy().pool.max_concurrency_per_account,
@@ -788,6 +1055,7 @@ export function createGeminiScheduler({
         for (const rawId of account.models) {
           const hint = account.catalogIndex?.get(rawId) || null
           const classified = classifyAntigravityModel(rawId, hint?.provider, hint?.quota_group)
+          if (classified.provider === 'google' && !isGeminiModelEnabled(classified.public_id)) continue
           if (!publicModels.has(classified.public_id)) {
             publicModels.set(classified.public_id, {
               id: classified.public_id,
@@ -806,6 +1074,7 @@ export function createGeminiScheduler({
 
     async stream({
       model,
+      requestedEffort = null,
       geminiBody,
       targetBodyFor = null,
       restoreContext = null,
@@ -822,13 +1091,22 @@ export function createGeminiScheduler({
       allowUnprefixedNonGemini = null,
       ownerScope = PLATFORM_SCOPE,
       allowedEnvIds = null,
+      catalogSnapshot = null,
       onEvent = null,
     }) {
       const turnStartedAt = Number.isFinite(startedAt) ? startedAt : now()
       const gate = apiKeyStore?.acquire?.(apiKeyRecord)
-      if (gate && !gate.ok) throw fail(gate.status || 429, gate.code, gate.message)
+      if (gate && !gate.ok) {
+        const err = fail(gate.status || 429, gate.code, gate.message)
+        const details = apiKeyGateDetails(gate)
+        if (details) err.details = details
+        if (gate.retry_after != null) err.retryAfter = gate.retry_after
+        throw err
+      }
       const allowUnprefixed = allowUnprefixedNonGemini ?? apiKeyRecord?.group_type !== 'all'
       const excluded = new Set()
+      const shortRetried = new Set()
+      let preferredRetryAccountId = null
       let reservation = null
       let selected = null
       let legacyRun = null
@@ -838,8 +1116,11 @@ export function createGeminiScheduler({
       let lastAccountId = null
       let lastAuthMethod = null
       let lastUpstreamModel = null
+      let lastConversationId = null
       let lastTiming = null
       let lastUsage = null
+      const attemptRecords = []
+      const attemptsRepoRef = resolveAttemptsRepo()
       const attachAttemptMeta = (err) => {
         if (!err || typeof err !== 'object') return err
         if (err.attemptCount == null) err.attemptCount = attempts
@@ -849,19 +1130,30 @@ export function createGeminiScheduler({
         if (err.accountId == null && lastAccountId) err.accountId = lastAccountId
         if (err.authMethod == null && lastAuthMethod) err.authMethod = lastAuthMethod
         if (err.upstreamModel == null && lastUpstreamModel) err.upstreamModel = lastUpstreamModel
+        if (err.conversationId == null && lastConversationId) err.conversationId = lastConversationId
         if (err.timing == null && lastTiming) err.timing = lastTiming
         if (err.usage == null && lastUsage) err.usage = lastUsage
+        if (err.attempts == null && attemptRecords.length) err.attempts = attemptRecords
         return err
       }
 
       try {
         signal?.throwIfAborted()
-        const catalog = await this.catalog({ ownerScope, allowedEnvIds })
+        if (isGeminiSeriesId(model) && !isGeminiModelEnabled(model)) {
+          throw fail(404, 'gemini_model_unavailable', `Gemini model '${model}' is disabled by model policy.`)
+        }
+        const defaultEffort = isGeminiSeriesId(model) ? resolveGeminiDefaultEffort(model) : null
+        const catalog =
+          catalogSnapshot && Array.isArray(catalogSnapshot.accounts)
+            ? catalogSnapshot
+            : await this.catalog({ ownerScope, allowedEnvIds })
         const matchedAccounts = []
         for (const account of catalog.accounts) {
           const resolved = resolveUpstreamModel(model, account.models, {
             allowUnprefixedNonGemini: allowUnprefixed,
             catalogIndex: account.catalogIndex,
+            requestedEffort,
+            defaultEffort,
           })
           if (resolved) matchedAccounts.push({ account, resolved })
         }
@@ -871,6 +1163,8 @@ export function createGeminiScheduler({
               resolveUpstreamModel(model, account.models, {
                 allowUnprefixedNonGemini: allowUnprefixed,
                 catalogIndex: account.catalogIndex,
+                requestedEffort,
+                defaultEffort,
               }),
             ),
           )
@@ -927,7 +1221,7 @@ export function createGeminiScheduler({
             ? Math.max(1, (policy.failover.max_account_switches ?? 3) + 1)
             : capableAccounts.length
         const scored = capableAccounts.map(({ account, resolved }) => {
-          const until = activeCooldownUntil(account, resolved.upstreamModel, resolved.quotaGroup, ts)
+          const cd = activeCooldownState(account, resolved.upstreamModel, resolved.quotaGroup, ts)
           const effectiveMaxConc = normalizeConcurrency(
             account.max_concurrency,
             policy.pool.max_concurrency_per_account,
@@ -935,7 +1229,9 @@ export function createGeminiScheduler({
           return {
             account,
             resolved,
-            cooldownUntil: until,
+            cooldownUntil: cd.cooldownUntil,
+            hardUntil: cd.hardUntil,
+            reactiveQuotaUntil: cd.reactiveQuotaUntil,
             candidate: {
               accountId: `gemini:${account.id}`,
               vmId: `gemini:${account.id}`,
@@ -945,37 +1241,114 @@ export function createGeminiScheduler({
               provider: resolved.provider,
               authMethod: account.auth_method,
               maxConcurrency: effectiveMaxConc,
-              priority: account.auth_method === 'api_key' && requiredCapabilities.length ? 1 : 0,
+              priority:
+                (Number.isSafeInteger(account.schedule_level) ? account.schedule_level : 5) * 10 +
+                (account.auth_method === 'api_key' && requiredCapabilities.length ? 1 : 0),
               weight: 1,
               lastUsedAt: 0,
             },
           }
         })
         const uncooled = scored.filter((item) => item.cooldownUntil === 0)
-        // Prefer uncooled accounts; if every account is currently in cooldown, fall back to
-        // probing the earliest-expiring one so single-account pools and post-reset slots recover.
-        const activeList = uncooled.length ? uncooled : [...scored].sort((a, b) => a.cooldownUntil - b.cooldownUntil)
-        const candidates = activeList.map((item) => item.candidate)
-        const resolvedByAccountId = new Map(activeList.map((item) => [item.candidate.accountId, item.resolved]))
+        const reactiveQuotaCooled = scored
+          .filter((item) => item.hardUntil === 0 && item.reactiveQuotaUntil > 0)
+          .sort((a, b) => a.reactiveQuotaUntil - b.reactiveQuotaUntil)
+        const hardCooled = scored.filter((item) => item.hardUntil > 0).sort((a, b) => a.cooldownUntil - b.cooldownUntil)
+        // Tier 1: uncooled accounts (always tried first with policy strategy + sticky affinity).
+        // Tier 2: reactive short-cooldown (429) accounts ordered by earliest expiry, used ONLY
+        // when all Tier 1 accounts fail (never touches proactively-exhausted 0% or ineligible
+        // accounts unless every account is hard-cooled).
+        const primaryItems = uncooled.length ? uncooled : reactiveQuotaCooled.length ? reactiveQuotaCooled : hardCooled
+        const fallbackItems = uncooled.length ? reactiveQuotaCooled : []
+        const allItems = [...primaryItems, ...fallbackItems]
+        const primaryCandidates = primaryItems.map((item) => item.candidate)
+        const fallbackCandidates = fallbackItems.map((item) => item.candidate)
+        const totalCandidates = allItems.length
+        const resolvedByAccountId = new Map(allItems.map((item) => [item.candidate.accountId, item.resolved]))
+        const accountByAccountId = new Map(allItems.map((item) => [item.candidate.accountId, item.account]))
 
         let lastError = null
-        while (excluded.size < candidates.length && attempts < maxAttempts) {
+        while (excluded.size < totalCandidates && attempts < maxAttempts) {
           signal?.throwIfAborted()
-          const grant = pickCandidateWithPolicy(candidates, excluded, {
-            strategy: policy.pool.strategy,
-            stickyAccountId,
-          })
+          let fromFallback = false
+          let grant = null
+          if (preferredRetryAccountId && !excluded.has(preferredRetryAccountId)) {
+            const retryCand = allItems.find((item) => item.candidate.accountId === preferredRetryAccountId)?.candidate
+            preferredRetryAccountId = null
+            if (retryCand) {
+              grant = pickCandidateWithPolicy([retryCand], excluded, {
+                strategy: 'balanced',
+                stickyAccountId: null,
+              })
+            }
+          }
+          if (!grant?.selected && uncooled.length) {
+            grant = pickCandidateWithPolicy(primaryCandidates, excluded, {
+              strategy: policy.pool.strategy,
+              stickyAccountId,
+            })
+          } else if (!grant?.selected) {
+            // Preserve earliest-expiry order across cooled candidates instead of letting
+            // balanced/lastUsed sorting lock every probe onto the same account sequence.
+            for (const candidate of primaryCandidates) {
+              if (excluded.has(candidate.accountId)) continue
+              const probeGrant = pickCandidateWithPolicy([candidate], excluded, {
+                strategy: 'balanced',
+                stickyAccountId: null,
+              })
+              if (probeGrant?.selected) {
+                grant = probeGrant
+                break
+              }
+            }
+          }
+          if (!grant?.selected && fallbackCandidates.length) {
+            for (const candidate of fallbackCandidates) {
+              if (excluded.has(candidate.accountId)) continue
+              const fb = pickCandidateWithPolicy([candidate], excluded, {
+                strategy: 'balanced',
+                stickyAccountId: null,
+              })
+              if (fb?.selected) {
+                grant = fb
+                fromFallback = true
+                break
+              }
+            }
+          }
           if (!grant?.selected) break
           attempts += 1
+          const attemptStartedAt = now()
           reservation = grant.reservation
           const id = grant.selected.accountId.slice('gemini:'.length)
           const resolved = resolvedByAccountId.get(grant.selected.accountId)
           selected = { ...grant.selected, id, resolved }
+          poolScheduler?.lastUsed?.set?.(selected.accountId, attemptStartedAt)
           lastAccountId = id
           lastAuthMethod = selected.authMethod || 'oauth'
           lastUpstreamModel = resolved.upstreamModel
           lastUpstreamStatus = null
           let emittedOutput = false
+          let attemptConversationId = null
+          const selectionReason = fromFallback
+            ? 'cooldown_fallback'
+            : !uncooled.length
+              ? 'all_cooled_probe'
+              : stickyAccountId === id && attempts === 1
+                ? 'sticky'
+                : attempts > 1
+                  ? 'failover'
+                  : policy.pool.strategy || 'balanced'
+          try {
+            attemptsRepoRef?.begin?.({
+              requestId,
+              attemptNo: attempts,
+              vmId: selected.vmId,
+              accountId: selected.accountId,
+              model: resolved.publicId,
+              selectionReason,
+            })
+          } catch {}
 
           try {
             const envOwner = envOwnerOf(id)
@@ -985,12 +1358,18 @@ export function createGeminiScheduler({
             ) {
               throw fail(403, 'gemini_model_unavailable')
             }
-            const listed = await callHost('get', { id })
-            const proxyId = listed?.proxy_id
+            const cachedAccount = accountByAccountId.get(selected.accountId)
+            let proxyId = cachedAccount?.proxy_id
+            let authMethod = cachedAccount?.auth_method === 'api_key' ? 'api_key' : selected.authMethod || 'oauth'
+            if (typeof proxyId !== 'string' || !ID.test(proxyId)) {
+              const listed = await callHost('get', { id })
+              proxyId = listed?.proxy_id
+              if (listed?.auth_method === 'api_key') authMethod = 'api_key'
+              else if (listed?.auth_method === 'oauth') authMethod = 'oauth'
+            }
             if (typeof proxyId !== 'string' || !ID.test(proxyId)) throw fail(502, 'gemini_host_protocol_error')
             const proxyUrl = resolveProxy ? resolveProxy(proxyId, envOwner) : undefined
             signal?.throwIfAborted()
-            const authMethod = listed?.auth_method === 'api_key' ? 'api_key' : selected.authMethod || 'oauth'
             lastAuthMethod = authMethod
             const target = authMethod === 'api_key' ? 'gemini' : 'antigravity'
             // Account-scoped outbound conversation_id policy for CRAGGemini:
@@ -1026,6 +1405,8 @@ export function createGeminiScheduler({
                 )
               }
             }
+            attemptConversationId = outboundConversationId
+            if (outboundConversationId) lastConversationId = outboundConversationId
             const rawOutboundBody = targetBodyFor
               ? targetBodyFor(target, {
                   upstreamModel: resolved.upstreamModel,
@@ -1053,59 +1434,116 @@ export function createGeminiScheduler({
                       stream_idle_timeout_ms: policy.pool.idle_timeout_ms,
                     }
                   : undefined
-              const res = await streamHost(
-                'infer',
-                {
+              const turnTimeoutMs = Math.max(STREAM_TURN_MS, (policy.pool.timeout_ms || 120_000) + 15_000)
+              if (target === 'antigravity' && effectiveDirectClient) {
+                const directTarget = await effectiveDirectClient.resolveTarget({
                   id,
-                  proxy_id: proxyId,
-                  proxy_url: proxyUrl,
-                  ...(proxySha256 ? { proxy_sha256: proxySha256 } : {}),
+                  proxyId,
+                  proxyUrl,
+                  proxySha256,
                   model: resolved.upstreamModel,
-                  request_id: attemptRequestId,
-                  ...(gatewayPolicy ? { gateway_policy: gatewayPolicy } : {}),
-                  body: outboundBody,
-                },
-                { signal, timeoutMs: Math.max(STREAM_TURN_MS, (policy.pool.timeout_ms || 120_000) + 15_000) },
-              )
-              if (Number.isInteger(res?.statusCode)) lastUpstreamStatus = res.statusCode
-              const contentType = String(res.headers?.['content-type'] || '')
-                .split(';')[0]
-                .trim()
-                .toLowerCase()
-              if (res.statusCode === 200 && contentType === 'text/event-stream') {
-                activeInfer = { id, request_id: attemptRequestId }
-                streamResponse = res
-              } else {
-                const errBody = await readErrorPayload(res)
-                if (
-                  res.statusCode === 404 &&
-                  (!errBody?.code || errBody.code === 'not_found' || errBody.code === 'gemini_host_protocol_error') &&
-                  plainText != null
-                ) {
-                  // Backward compatibility with an older host without /infer.
-                  const started = await callHost('test-chat', {
+                })
+                if (directTarget) {
+                  const directOutcome = await effectiveDirectClient.openDirectStream(directTarget, {
+                    model: resolved.upstreamModel,
+                    requestId: attemptRequestId,
+                    bodyObj: outboundBody,
+                    gatewayPolicy,
+                    signal,
+                    timeoutMs: turnTimeoutMs,
+                  })
+                  if (directOutcome.ok) {
+                    lastUpstreamStatus = 200
+                    activeInfer = { id, request_id: attemptRequestId, directTarget }
+                    streamResponse = directOutcome.res
+                  } else if (!directOutcome.fallback) {
+                    if (
+                      typeof directOutcome.error?.code === 'string' &&
+                      (directOutcome.error.code.startsWith('license_') ||
+                        directOutcome.error.code === 'gemini_native_worker_unavailable')
+                    ) {
+                      effectiveDirectClient.invalidate(id)
+                    }
+                    if (Number.isInteger(directOutcome.error?.upstreamStatus)) {
+                      lastUpstreamStatus = directOutcome.error.upstreamStatus
+                    }
+                    throw directOutcome.error
+                  } else {
+                    effectiveDirectClient.invalidate(id)
+                  }
+                }
+              }
+              if (!streamResponse) {
+                const res = await streamHost(
+                  'infer',
+                  {
                     id,
                     proxy_id: proxyId,
                     proxy_url: proxyUrl,
+                    ...(proxySha256 ? { proxy_sha256: proxySha256 } : {}),
                     model: resolved.upstreamModel,
-                    prompt: plainText,
-                  })
-                  if (typeof started?.run_id !== 'string' || !RUN_ID.test(started.run_id)) {
-                    throw fail(502, 'gemini_host_protocol_error')
-                  }
-                  legacyRun = { id, run_id: started.run_id }
+                    request_id: attemptRequestId,
+                    ...(gatewayPolicy ? { gateway_policy: gatewayPolicy } : {}),
+                    body: outboundBody,
+                  },
+                  { signal, timeoutMs: turnTimeoutMs },
+                )
+                if (Number.isInteger(res?.statusCode)) lastUpstreamStatus = res.statusCode
+                const contentType = String(res.headers?.['content-type'] || '')
+                  .split(';')[0]
+                  .trim()
+                  .toLowerCase()
+                if (res.statusCode === 200 && contentType === 'text/event-stream') {
+                  activeInfer = { id, request_id: attemptRequestId }
+                  streamResponse = res
                 } else {
-                  const errCode =
-                    typeof errBody?.code === 'string' && Object.hasOwn(FAILURES, errBody.code)
-                      ? errBody.code
-                      : res.statusCode === 429
-                        ? 'gemini_quota_exhausted'
-                        : res.statusCode === 400
-                          ? 'gemini_invalid_request'
-                          : res.statusCode === 404
-                            ? 'gemini_model_unavailable'
-                            : 'gemini_inference_failed'
-                  throw fail(res.statusCode || FAILURES[errCode][0], errCode, errBody?.message || FAILURES[errCode][1])
+                  const errBody = await readErrorPayload(res)
+                  if (
+                    res.statusCode === 404 &&
+                    (!errBody?.code || errBody.code === 'not_found' || errBody.code === 'gemini_host_protocol_error') &&
+                    plainText != null
+                  ) {
+                    // Backward compatibility with an older host without /infer.
+                    const started = await callHost('test-chat', {
+                      id,
+                      proxy_id: proxyId,
+                      proxy_url: proxyUrl,
+                      model: resolved.upstreamModel,
+                      prompt: plainText,
+                    })
+                    if (typeof started?.run_id !== 'string' || !RUN_ID.test(started.run_id)) {
+                      throw fail(502, 'gemini_host_protocol_error')
+                    }
+                    legacyRun = { id, run_id: started.run_id }
+                  } else {
+                    const quotaMeta = parseUpstreamQuotaMeta(errBody)
+                    const errCode =
+                      typeof errBody?.code === 'string' && Object.hasOwn(FAILURES, errBody.code)
+                        ? errBody.code
+                        : res.statusCode === 429
+                          ? quotaMeta.contentRejected
+                            ? 'gemini_content_rejected'
+                            : 'gemini_quota_exhausted'
+                          : res.statusCode === 400
+                            ? 'gemini_invalid_request'
+                            : res.statusCode === 404
+                              ? 'gemini_model_unavailable'
+                              : 'gemini_inference_failed'
+                    const err = fail(
+                      res.statusCode || FAILURES[errCode][0],
+                      errCode,
+                      errBody?.message || FAILURES[errCode][1],
+                    )
+                    if (Number.isInteger(res.statusCode)) err.upstreamStatus = res.statusCode
+                    if (quotaMeta.upstreamReason) err.upstreamReason = quotaMeta.upstreamReason
+                    if (quotaMeta.contentRejected || errCode === 'gemini_content_rejected') err.contentRejected = true
+                    const retryAfterMs = parseRetryAfterMs(errBody, res.headers)
+                    if (retryAfterMs != null) {
+                      err.retryAfterMs = retryAfterMs
+                      err.retryAfter = Math.ceil(retryAfterMs / 1000)
+                    }
+                    throw err
+                  }
                 }
               }
             } else {
@@ -1148,12 +1586,20 @@ export function createGeminiScheduler({
                   if (activeInfer) {
                     const ref = activeInfer
                     activeInfer = null
-                    callHost('infer-cancel', ref).catch(() => {})
+                    if (ref.directTarget && effectiveDirectClient) {
+                      effectiveDirectClient.cancelDirectTurn(ref.directTarget, ref.request_id).catch(() => {})
+                    } else {
+                      callHost('infer-cancel', ref).catch(() => {})
+                    }
                   }
                 },
                 onEvent: (event) => {
-                  if (event && event.kind !== 'error') emittedOutput = true
-                  onEvent?.(event)
+                  const committed = onEvent?.(event)
+                  if (typeof committed === 'boolean') {
+                    if (committed) emittedOutput = true
+                  } else if (event && CONTENT_OUTPUT_EVENTS.has(event.kind)) {
+                    emittedOutput = true
+                  }
                 },
               })
               activeInfer = null
@@ -1222,15 +1668,72 @@ export function createGeminiScheduler({
                 ? collected.meta.conversationId
                 : outboundConversationId
             const finishedAt = now()
-            recordStickyAccount(effectiveStickyKey, id, reportedConvId, policy, finishedAt, attemptUsedConversationIds)
-            recordToolContinuation(id, collected, finishedAt, continuationCallIds, effectiveStickyKey)
-            recordAccountUsage(apiKeyRecord, resolved.publicId, collected.usage || {})
-            poolScheduler?.unitCircuit?.recordSuccess?.(selected.accountId)
-            poolScheduler?.lastUsed?.set?.(selected.accountId, finishedAt)
+            const attemptLatencyMs = Math.max(0, finishedAt - attemptStartedAt)
+            if (reportedConvId) lastConversationId = reportedConvId
             const reportedModel =
               typeof collected.reportedModel === 'string' && collected.reportedModel.trim()
                 ? collected.reportedModel.trim()
                 : null
+            const usageObj = collected.usage || {}
+            const totalUsedTokens =
+              Number(usageObj.input_tokens || 0) +
+              Number(usageObj.output_tokens || 0) +
+              Number(usageObj.cache_read_tokens || 0) +
+              Number(usageObj.cache_read_input_tokens || 0) +
+              Number(usageObj.reasoning_tokens || 0)
+            const isLocalToolDrain =
+              target === 'antigravity' &&
+              Boolean(continuationBinding) &&
+              continuationBinding.accountId === id &&
+              collected.meta?.awaitingToolResults === true &&
+              Array.isArray(collected.toolCalls) &&
+              collected.toolCalls.length > 0 &&
+              totalUsedTokens === 0 &&
+              !reportedModel
+            const effectiveParentRequestId = isLocalToolDrain
+              ? continuationBinding.parentRequestId || null
+              : requestId || null
+            recordStickyAccount(effectiveStickyKey, id, reportedConvId, policy, finishedAt, attemptUsedConversationIds)
+            recordToolContinuation(
+              id,
+              collected,
+              finishedAt,
+              continuationCallIds,
+              effectiveStickyKey,
+              effectiveParentRequestId,
+            )
+            recordAccountUsage(apiKeyRecord, resolved.publicId, collected.usage || {})
+            poolScheduler?.unitCircuit?.recordSuccess?.(selected.accountId)
+            poolScheduler?.lastUsed?.set?.(selected.accountId, finishedAt)
+            try {
+              if (isLocalToolDrain) {
+                attemptsRepoRef?.removeByRequestId?.(requestId)
+              } else {
+                attemptsRepoRef?.complete?.(requestId, attempts, {
+                  upstreamStatus: lastUpstreamStatus ?? 200,
+                  errorScope: null,
+                  action: 'ok',
+                  cooldownUntil: null,
+                  downstreamCommitted: true,
+                  terminalState: 'verified',
+                  usage: collected.usage || null,
+                  ttftMs: collected.timing?.ttftMs ?? null,
+                  latencyMs: attemptLatencyMs,
+                })
+              }
+            } catch {}
+            attemptRecords.push({
+              attempt_no: attempts,
+              account_id: id,
+              vm_id: selected.vmId,
+              upstream_model: reportedModel || resolved.upstreamModel,
+              ...(reportedConvId ? { conversation_id: reportedConvId } : {}),
+              selection_reason: selectionReason,
+              upstream_status: lastUpstreamStatus ?? 200,
+              error_code: null,
+              action: 'ok',
+              latency_ms: attemptLatencyMs,
+            })
             return {
               ...collected,
               account_id: id,
@@ -1242,8 +1745,17 @@ export function createGeminiScheduler({
               provider: resolved.provider,
               quota_group: resolved.quotaGroup,
               attempt_count: attempts,
+              attempts: attemptRecords,
               upstream_status: lastUpstreamStatus ?? 200,
               ...(reportedConvId ? { conversation_id: reportedConvId } : {}),
+              ...(isLocalToolDrain
+                ? {
+                    local_tool_drain: true,
+                    ...(effectiveParentRequestId
+                      ? { tool_continuation_parent_request_id: effectiveParentRequestId }
+                      : {}),
+                  }
+                : {}),
             }
           } catch (error) {
             if (legacyRun) {
@@ -1254,7 +1766,11 @@ export function createGeminiScheduler({
             }
             if (activeInfer) {
               try {
-                await callHost('infer-cancel', activeInfer)
+                if (activeInfer.directTarget && effectiveDirectClient) {
+                  await effectiveDirectClient.cancelDirectTurn(activeInfer.directTarget, activeInfer.request_id)
+                } else {
+                  await callHost('infer-cancel', activeInfer)
+                }
               } catch {}
               activeInfer = null
             }
@@ -1263,14 +1779,48 @@ export function createGeminiScheduler({
 
             if (error?.timing) lastTiming = error.timing
             if (error?.usage) lastUsage = error.usage
-            const failure = attachAttemptMeta(known(error) || error)
+            const failedAt = now()
+            const attemptLatencyMs = Math.max(0, failedAt - attemptStartedAt)
+            const failure = known(error) || error
             const failureCode = failure?.code
             const cancelled = signal?.aborted || failure?.name === 'AbortError' || failureCode === 'ABORT_ERR'
+            const attemptUpstreamStatus = Number.isInteger(failure?.upstreamStatus)
+              ? failure.upstreamStatus
+              : Number.isInteger(lastUpstreamStatus)
+                ? lastUpstreamStatus
+                : Number.isInteger(failure?.status)
+                  ? failure.status
+                  : null
 
             if (cancelled) {
+              try {
+                attemptsRepoRef?.complete?.(requestId, attempts, {
+                  upstreamStatus: attemptUpstreamStatus,
+                  errorScope: 'request',
+                  action: 'stop',
+                  cooldownUntil: null,
+                  downstreamCommitted: emittedOutput,
+                  terminalState: 'cancelled',
+                  usage: error?.usage || null,
+                  ttftMs: error?.timing?.ttftMs ?? null,
+                  latencyMs: attemptLatencyMs,
+                })
+              } catch {}
+              attemptRecords.push({
+                attempt_no: attempts,
+                account_id: id,
+                vm_id: selected.vmId,
+                upstream_model: resolved.upstreamModel,
+                ...(attemptConversationId ? { conversation_id: attemptConversationId } : {}),
+                selection_reason: selectionReason,
+                upstream_status: attemptUpstreamStatus,
+                error_code: 'gemini_inference_cancelled',
+                action: 'stop',
+                latency_ms: attemptLatencyMs,
+              })
               poolScheduler?.unitCircuit?.releaseProbe?.(selected.accountId)
               selected = null
-              throw failure
+              throw attachAttemptMeta(failure)
             }
 
             if (NON_CIRCUIT_FAILURES.has(failureCode)) {
@@ -1278,20 +1828,141 @@ export function createGeminiScheduler({
             } else {
               poolScheduler?.unitCircuit?.recordFailure?.(selected.accountId)
             }
+            if (
+              failureCode === 'gemini_proxy_unavailable' ||
+              failureCode === 'gemini_model_unavailable' ||
+              failureCode === 'gemini_oauth_required' ||
+              failureCode === 'gemini_host_protocol_error' ||
+              failureCode === 'gemini_environment_conflict' ||
+              (typeof failureCode === 'string' && failureCode.startsWith('license_'))
+            ) {
+              invalidateCatalogCache()
+            }
 
-            recordFailureCooldown(id, resolved.upstreamModel, resolved.quotaGroup, failure, now())
-            lastError = failure
-            excluded.add(selected.accountId)
-            selected = null
+            // Short transient RPM backoff (<= 5s, non-quota-exhausted, non-content-rejected):
+            // wait once and retry the same account before cooling or burning sibling accounts.
+            const canShortRetrySameAccount =
+              !emittedOutput &&
+              failureCode === 'gemini_quota_exhausted' &&
+              failure?.contentRejected !== true &&
+              !GROUP_QUOTA_EXHAUSTED_REASONS.has(failure?.upstreamReason) &&
+              Number.isFinite(failure?.retryAfterMs) &&
+              failure.retryAfterMs > 0 &&
+              failure.retryAfterMs <= SHORT_RATE_LIMIT_MAX_MS &&
+              !shortRetried.has(selected.accountId) &&
+              attempts < maxAttempts
 
-            if (!emittedOutput && FAILOVER_ERRORS.has(failureCode) && excluded.size < candidates.length) {
+            if (canShortRetrySameAccount) {
+              shortRetried.add(selected.accountId)
+              preferredRetryAccountId = selected.accountId
+              try {
+                attemptsRepoRef?.complete?.(requestId, attempts, {
+                  upstreamStatus: attemptUpstreamStatus,
+                  errorScope: 'quota',
+                  action: 'retry_backoff',
+                  cooldownUntil: null,
+                  downstreamCommitted: false,
+                  terminalState: 'failed_retryable',
+                  usage: error?.usage || null,
+                  ttftMs: error?.timing?.ttftMs ?? null,
+                  latencyMs: attemptLatencyMs,
+                })
+              } catch {}
+              attemptRecords.push({
+                attempt_no: attempts,
+                account_id: id,
+                vm_id: selected.vmId,
+                upstream_model: resolved.upstreamModel,
+                ...(attemptConversationId ? { conversation_id: attemptConversationId } : {}),
+                selection_reason: selectionReason,
+                upstream_status: attemptUpstreamStatus,
+                error_code: failureCode,
+                action: 'retry_backoff',
+                latency_ms: attemptLatencyMs,
+              })
+              lastError = attachAttemptMeta(failure)
+              selected = null
+              try {
+                await sleep(Math.min(failure.retryAfterMs, SHORT_RATE_LIMIT_MAX_MS), undefined, { signal })
+              } catch (sleepErr) {
+                throw attachAttemptMeta(sleepErr)
+              }
               continue
             }
-            throw failure
+
+            const cooldownUntilMs = recordFailureCooldown(
+              id,
+              resolved.upstreamModel,
+              resolved.quotaGroup,
+              failure,
+              failedAt,
+            )
+            excluded.add(selected.accountId)
+            const willFailover =
+              !emittedOutput &&
+              failure?.contentRejected !== true &&
+              FAILOVER_ERRORS.has(failureCode) &&
+              excluded.size < totalCandidates &&
+              attempts < maxAttempts
+            const errorScope = ACCOUNT_WIDE_COOLDOWN_ERRORS.has(failureCode)
+              ? 'account'
+              : failureCode === 'gemini_content_rejected'
+                ? 'request'
+                : failureCode === 'gemini_quota_exhausted'
+                  ? 'quota'
+                  : 'upstream'
+            const action = willFailover ? 'failover' : 'stop'
+            try {
+              attemptsRepoRef?.complete?.(requestId, attempts, {
+                upstreamStatus: attemptUpstreamStatus,
+                errorScope,
+                action,
+                cooldownUntil: cooldownUntilMs > 0 ? Math.trunc(cooldownUntilMs) : null,
+                downstreamCommitted: emittedOutput,
+                terminalState: willFailover ? 'failed_retryable' : 'failed',
+                usage: error?.usage || null,
+                ttftMs: error?.timing?.ttftMs ?? null,
+                latencyMs: attemptLatencyMs,
+              })
+            } catch {}
+            attemptRecords.push({
+              attempt_no: attempts,
+              account_id: id,
+              vm_id: selected.vmId,
+              upstream_model: resolved.upstreamModel,
+              ...(attemptConversationId ? { conversation_id: attemptConversationId } : {}),
+              selection_reason: selectionReason,
+              upstream_status: attemptUpstreamStatus,
+              error_code: failureCode || 'gemini_inference_failed',
+              action,
+              latency_ms: attemptLatencyMs,
+            })
+            lastError = attachAttemptMeta(failure)
+            selected = null
+
+            if (willFailover) {
+              continue
+            }
+            throw lastError
           }
         }
 
-        throw attachAttemptMeta(lastError || fail(503, 'gemini_operation_busy'))
+        if (!lastError) {
+          const allCandidates = [...primaryCandidates, ...fallbackCandidates].filter((c) => !excluded.has(c.accountId))
+          const inflightCountOf = (id) =>
+            poolScheduler ? poolScheduler.inflight?.get?.(id) || 0 : localInflight.get(id) || 0
+          const circuitBlocked =
+            allCandidates.length > 0 &&
+            allCandidates.some((c) => poolScheduler?.unitCircuit?.inspect?.(c.accountId)?.ok === false) &&
+            !allCandidates.some((c) => {
+              const circuitOk = poolScheduler?.unitCircuit?.inspect?.(c.accountId)?.ok !== false
+              return circuitOk && inflightCountOf(c.accountId) >= Math.max(1, c.maxConcurrency)
+            })
+          throw attachAttemptMeta(
+            fail(503, circuitBlocked ? 'gemini_native_worker_unavailable' : 'gemini_operation_busy'),
+          )
+        }
+        throw attachAttemptMeta(lastError)
       } finally {
         reservation?.release()
         try {
@@ -1311,6 +1982,7 @@ export function createGeminiScheduler({
       allowUnprefixedNonGemini = null,
       ownerScope = PLATFORM_SCOPE,
       allowedEnvIds = null,
+      catalogSnapshot = null,
     }) {
       const result = await this.stream({
         model,
@@ -1325,6 +1997,7 @@ export function createGeminiScheduler({
         allowUnprefixedNonGemini,
         ownerScope,
         allowedEnvIds,
+        catalogSnapshot,
       })
       return {
         text: result.text,
@@ -1338,8 +2011,10 @@ export function createGeminiScheduler({
         stopReason: result.stopReason,
         searches: result.searches,
         attempt_count: result.attempt_count,
+        attempts: result.attempts,
         upstream_status: result.upstream_status,
         timing: result.timing,
+        ...(result.conversation_id ? { conversation_id: result.conversation_id } : {}),
       }
     },
   }

@@ -4,6 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { validateCacheBreakpoints } from '../../src/lib/protocol/cache-ttl.mjs'
 import { applyClaudeSSELineToMessage, createClaudeMessageAssembler } from '../../src/lib/protocol/convert.mjs'
 import { prepareCragPrintBody } from '../../src/lib/protocol/crag-print-prompt.mjs'
 import {
@@ -89,6 +90,49 @@ test('CRAG whitelist accepts L0 minimal request and strips all CC-native/diagnos
   assert.ok(strippedFields.includes('diagnostics'))
   assert.ok(strippedFields.includes('service_tier'))
   assert.ok(strippedFields.includes('fallbacks'))
+})
+
+test('CRAG whitelist keeps every advisor tool option and still rejects a bad definition', () => {
+  const advisor = {
+    type: 'advisor_20260301',
+    name: 'advisor',
+    model: 'claude-opus-5-5',
+    max_uses: 3,
+    // Bounds the advisor's own output per call; it was being dropped, which
+    // silently removed the caller's ceiling on advisor spend.
+    max_tokens: 4096,
+    caching: { type: 'ephemeral', ttl: '1h' },
+  }
+  const { body } = sanitizeCragBodyWhitelist(
+    {
+      model: 'claude-sonnet-5-5',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'ask the advisor' }] }],
+      tools: [advisor],
+    },
+    { capabilities: V3_CAPS },
+  )
+  assert.deepEqual(body.tools, [advisor])
+
+  // An advisor tool carrying input_schema is refused outright rather than cleaned:
+  // the upstream contract has no schema for it.
+  for (const bad of [
+    { ...advisor, input_schema: { type: 'object' } },
+    { ...advisor, name: 'helper' },
+    { ...advisor, model: '' },
+  ]) {
+    assert.throws(
+      () =>
+        sanitizeCragBodyWhitelist(
+          {
+            model: 'claude-sonnet-5-5',
+            messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+            tools: [bad],
+          },
+          { capabilities: V3_CAPS },
+        ),
+      /advisor/i,
+    )
+  }
 })
 
 test('CRAG whitelist fails closed 400 on unknown top-level and unrepresentable fields', () => {
@@ -188,47 +232,342 @@ test('CRAG whitelist strictly rebuilds cache_control, strips scope/evict_on_comp
     cache_control: { type: 'ephemeral', ttl: '5m' },
   })
 
-  // Inverted TTL (5m before 1h) fails closed 400
-  assert.throws(
-    () =>
-      prepareCragRequest(
+  // Inverted TTL (5m before 1h) auto-repairs by downgrading trailing 1h to 5m instead of 400ing
+  const fixedOrder = prepareCragRequest(
+    {
+      model: 'claude-sonnet-5-5',
+      system: [{ type: 'text', text: 'sys', cache_control: { type: 'ephemeral', ttl: '5m' } }],
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'hi', cache_control: { type: 'ephemeral', ttl: '1h' } }] },
+      ],
+    },
+    { capabilities: V3_CAPS },
+  )
+  assert.deepEqual(fixedOrder.system[0].cache_control, { type: 'ephemeral', ttl: '5m' })
+  assert.deepEqual(fixedOrder.messages[0].content[0].cache_control, { type: 'ephemeral', ttl: '5m' })
+  assert.doesNotThrow(() => validateCacheBreakpoints(fixedOrder))
+
+  // More than 4 breakpoints auto-trims to 4 (dropping stale earlier message anchors first) instead of 400ing
+  const trimmed = prepareCragRequest(
+    {
+      model: 'claude-sonnet-5-5',
+      system: [
+        { type: 'text', text: 's1', cache_control: { type: 'ephemeral', ttl: '1h' } },
+        { type: 'text', text: 's2', cache_control: { type: 'ephemeral', ttl: '1h' } },
+      ],
+      messages: [
         {
-          model: 'claude-sonnet-5-5',
-          system: [{ type: 'text', text: 'sys', cache_control: { type: 'ephemeral', ttl: '5m' } }],
-          messages: [
-            { role: 'user', content: [{ type: 'text', text: 'hi', cache_control: { type: 'ephemeral', ttl: '1h' } }] },
+          role: 'user',
+          content: [
+            { type: 'text', text: 'u1', cache_control: { type: 'ephemeral', ttl: '1h' } },
+            { type: 'text', text: 'u2', cache_control: { type: 'ephemeral', ttl: '1h' } },
+            { type: 'text', text: 'u3', cache_control: { type: 'ephemeral', ttl: '1h' } },
           ],
         },
-        { capabilities: V3_CAPS },
-      ),
-    (err) => err.status === 400 && err.code === 'invalid_cache_control',
+      ],
+    },
+    { capabilities: V3_CAPS },
+  )
+  assert.doesNotThrow(() => validateCacheBreakpoints(trimmed))
+  assert.equal(trimmed.system.filter((b) => b.cache_control).length, 2)
+  assert.equal(trimmed.messages[0].content[0].cache_control, undefined)
+  assert.deepEqual(trimmed.messages[0].content[1].cache_control, { type: 'ephemeral', ttl: '1h' })
+  assert.deepEqual(trimmed.messages[0].content[2].cache_control, { type: 'ephemeral', ttl: '1h' })
+
+  // Malformed cache_control (wrong type / non-object / invalid ttl) is repaired or stripped cleanly
+  const malformed = prepareCragRequest(
+    {
+      model: 'claude-sonnet-5-5',
+      system: [{ type: 'text', text: 'sys', cache_control: { type: 'persistent' } }],
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'a', cache_control: true },
+            { type: 'text', text: 'b', cache_control: { type: 'ephemeral', ttl: 'bad' } },
+          ],
+        },
+      ],
+    },
+    { capabilities: V3_CAPS },
+  )
+  assert.equal(malformed.system[0].cache_control, undefined)
+  assert.equal(malformed.messages[0].content[0].cache_control, undefined)
+  assert.deepEqual(malformed.messages[0].content[1].cache_control, { type: 'ephemeral', ttl: '1h' })
+  assert.doesNotThrow(() => validateCacheBreakpoints(malformed))
+
+  // crag_prompt.blocks (zero replace mode) are also counted and repaired in budget/TTL order
+  const zeroPromptBudget = prepareCragRequest(
+    {
+      model: 'claude-sonnet-5-5',
+      crag_prompt: {
+        mode: 'replace',
+        text: 'sys1sys2',
+        blocks: [
+          { type: 'text', text: 'sys1', cache_control: { type: 'ephemeral', ttl: '5m', scope: 'global' } },
+          { type: 'text', text: 'sys2', cache_control: { type: 'ephemeral', ttl: '1h' } },
+        ],
+      },
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'u1', cache_control: { type: 'ephemeral', ttl: '1h' } },
+            { type: 'text', text: 'u2', cache_control: { type: 'ephemeral', ttl: '1h' } },
+            { type: 'text', text: 'u3', cache_control: { type: 'ephemeral', ttl: '1h' } },
+          ],
+        },
+      ],
+    },
+    { capabilities: V3_CAPS },
+  )
+  assert.doesNotThrow(() => validateCacheBreakpoints(zeroPromptBudget))
+  assert.deepEqual(zeroPromptBudget.crag_prompt.blocks[0].cache_control, { type: 'ephemeral', ttl: '5m' })
+  assert.deepEqual(zeroPromptBudget.crag_prompt.blocks[1].cache_control, { type: 'ephemeral', ttl: '5m' })
+  assert.equal(zeroPromptBudget.messages[0].content[0].cache_control, undefined)
+  assert.deepEqual(zeroPromptBudget.messages[0].content[2].cache_control, { type: 'ephemeral', ttl: '5m' })
+})
+
+test('#8 CRAG whitelist keeps thinking.block_binding so thinking-binding-controls can arm', () => {
+  // Field survives the whitelist rebuild, unknown siblings still drop.
+  const cleaned = prepareCragRequest(
+    {
+      model: 'claude-sonnet-5-5',
+      thinking: { type: 'adaptive', budget_tokens: 2048, display: 'updates', block_binding: true, stray_key: 'drop' },
+      messages: [{ role: 'user', content: 'hi' }],
+    },
+    { capabilities: V3_CAPS },
+  )
+  assert.deepEqual(cleaned.thinking, {
+    type: 'adaptive',
+    budget_tokens: 2048,
+    display: 'updates',
+    block_binding: true,
+  })
+
+  // Object form is passed through untouched as well.
+  const objectForm = prepareCragRequest(
+    {
+      model: 'claude-sonnet-5-5',
+      thinking: { type: 'adaptive', block_binding: { scope: 'turn' } },
+      messages: [{ role: 'user', content: 'hi' }],
+    },
+    { capabilities: V3_CAPS },
+  )
+  assert.deepEqual(objectForm.thinking.block_binding, { scope: 'turn' })
+
+  // End to end: because the key now survives prepareCragRequest, withRequestProtocolBetas
+  // can finally see it and arm the beta. Before this fix the key was dropped at
+  // crag-whitelist before the beta check ran, so the capability never engaged on CRAG.
+  // `linux_tui_native_queue` is omitted on purpose: with it, nativeOwnsHeaders short-circuits
+  // and the slot's official CC owns beta selection instead of us.
+  const worker = finalizeWorkerPayload({
+    body: {
+      model: 'claude-sonnet-5-5',
+      max_tokens: 64,
+      thinking: { type: 'adaptive', block_binding: true },
+      messages: [{ role: 'user', content: 'hi' }],
+    },
+    reqHeaders: {},
+    exec: {
+      homeDir: '',
+      vm: { dataplane: 'crag', crag_kernel_version: 'v2', claude: { mode: 'setup-token', scope: 'user:inference' } },
+      workerStatus: {
+        runtime_variant: 'crag-v2',
+        capabilities: ['generation_controls_v3', 'prompt_append', 'prompt_replace', 'system_text_cache_v3'],
+      },
+    },
+    identity: null,
+    cliHop: true,
+    cragPrint: true,
+  })
+  assert.equal(worker.body.thinking.block_binding, true, 'block_binding must reach the slot')
+  assert.ok(
+    String(worker.headers['anthropic-beta'] || '').includes('thinking-binding-controls-2026-08-01'),
+    'the binding beta must arm once block_binding survives the whitelist',
+  )
+})
+
+test('#7 CRAG whitelist lifts and repairs cache breakpoints nested inside tool_result.content', () => {
+  const toolTurns = (resultContent) => [
+    { role: 'user', content: [{ type: 'text', text: 'read it' }] },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'read_file', input: { path: 'a' } }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', ...resultContent }] },
+  ]
+
+  // 1 top-level + 4 nested inside tool_result.content: instead of 400ing or
+  // tripping CRAG anchor mismatch, nested markers collapse onto the parent tool_result.
+  const lifted = prepareCragRequest(
+    {
+      model: 'claude-sonnet-5-5',
+      system: [{ type: 'text', text: 'sys', cache_control: { type: 'ephemeral', ttl: '1h' } }],
+      messages: toolTurns({
+        content: ['a', 'b', 'c', 'd'].map((text) => ({
+          type: 'text',
+          text,
+          cache_control: { type: 'ephemeral', ttl: '1h' },
+        })),
+      }),
+    },
+    { capabilities: V3_CAPS },
+  )
+  assert.doesNotThrow(() => validateCacheBreakpoints(lifted))
+  assert.deepEqual(lifted.messages[2].content[0].cache_control, { type: 'ephemeral', ttl: '1h' })
+  assert.equal(
+    lifted.messages[2].content[0].content.some((child) => child.cache_control != null),
+    false,
   )
 
-  // More than 4 breakpoints fails closed 400
+  // Nested 1h child + 5m parent preserves parent's 5m breakpoint and strips child marker.
+  const nestedOrder = prepareCragRequest(
+    {
+      model: 'claude-sonnet-5-5',
+      messages: toolTurns({
+        content: [{ type: 'text', text: 'long', cache_control: { type: 'ephemeral', ttl: '1h' } }],
+        cache_control: { type: 'ephemeral', ttl: '5m' },
+      }),
+    },
+    { capabilities: V3_CAPS },
+  )
+  assert.deepEqual(nestedOrder.messages[2].content[0].cache_control, { type: 'ephemeral', ttl: '5m' })
+  assert.equal(nestedOrder.messages[2].content[0].content[0].cache_control, undefined)
+
+  // Nested 5m child + 1h parent repairs cleanly without throwing 400.
+  const invertedNested = prepareCragRequest(
+    {
+      model: 'claude-sonnet-5-5',
+      messages: toolTurns({
+        content: [{ type: 'text', text: 'short', cache_control: { type: 'ephemeral', ttl: '5m' } }],
+        cache_control: { type: 'ephemeral', ttl: '1h' },
+      }),
+    },
+    { capabilities: V3_CAPS },
+  )
+  assert.doesNotThrow(() => validateCacheBreakpoints(invertedNested))
+  assert.equal(invertedNested.messages[2].content[0].content[0].cache_control, undefined)
+  assert.deepEqual(invertedNested.messages[2].content[0].cache_control, { type: 'ephemeral', ttl: '1h' })
+})
+
+test('#2 CRAG whitelist lets tool_addition / tool_removal through and still rebuilds the inline tool', () => {
+  const withBlocks = (...blocks) => ({
+    model: 'claude-sonnet-5-5',
+    messages: [
+      { role: 'user', content: 'hi' },
+      { role: 'system', content: blocks },
+    ],
+  })
+
+  // tool_definition form: the definition is rebuilt, unknown fields inside it drop.
+  const added = prepareCragRequest(
+    withBlocks({
+      type: 'tool_addition',
+      tool: {
+        type: 'tool_definition',
+        definition: {
+          name: 'lookup',
+          description: 'lookup',
+          input_schema: { type: 'object', properties: { q: { type: 'string' } } },
+          unknown_definition_key: 'drop-me',
+        },
+        stray_inline_key: 'drop-me',
+      },
+      cache_control: { type: 'ephemeral', ttl: '1h' },
+    }),
+    { capabilities: V3_CAPS },
+  )
+  assert.deepEqual(added.messages[1].content[0], {
+    type: 'tool_addition',
+    tool: {
+      type: 'tool_definition',
+      definition: {
+        name: 'lookup',
+        description: 'lookup',
+        input_schema: { type: 'object', properties: { q: { type: 'string' } } },
+      },
+    },
+    cache_control: { type: 'ephemeral', ttl: '1h' },
+  })
+
+  // tool_reference form, and tool_removal keys off the same `tool` field.
+  const referenced = prepareCragRequest(
+    withBlocks(
+      { type: 'tool_addition', tool: { type: 'tool_reference', name: 'lookup' } },
+      { type: 'tool_removal', tool: { type: 'tool_reference', name: 'obsolete', stray: 1 } },
+    ),
+    { capabilities: V3_CAPS },
+  )
+  assert.deepEqual(referenced.messages[1].content, [
+    { type: 'tool_addition', tool: { type: 'tool_reference', name: 'lookup' } },
+    { type: 'tool_removal', tool: { type: 'tool_reference', name: 'obsolete' } },
+  ])
+
+  // The whitelist must not be bypassable one level deeper: the same tool rules
+  // that guard `tools` still apply inside tool_addition.
   assert.throws(
     () =>
       prepareCragRequest(
-        {
-          model: 'claude-sonnet-5-5',
-          system: [
-            { type: 'text', text: 's1', cache_control: { type: 'ephemeral', ttl: '1h' } },
-            { type: 'text', text: 's2', cache_control: { type: 'ephemeral', ttl: '1h' } },
-          ],
-          messages: [
-            {
-              role: 'user',
-              content: [
-                { type: 'text', text: 'u1', cache_control: { type: 'ephemeral', ttl: '1h' } },
-                { type: 'text', text: 'u2', cache_control: { type: 'ephemeral', ttl: '1h' } },
-                { type: 'text', text: 'u3', cache_control: { type: 'ephemeral', ttl: '1h' } },
-              ],
-            },
-          ],
-        },
+        withBlocks({
+          type: 'tool_addition',
+          tool: { type: 'tool_definition', definition: { name: 'bad', input_schema: 'not-an-object' } },
+        }),
         { capabilities: V3_CAPS },
       ),
-    (err) => err.status === 400 && err.code === 'invalid_cache_control',
+    (err) => err.status === 400 && /input_schema/.test(err.message),
   )
+  assert.throws(
+    () =>
+      prepareCragRequest(
+        withBlocks({
+          type: 'tool_addition',
+          tool: {
+            type: 'tool_definition',
+            definition: { name: 'bad', parameters: { type: 'object' } },
+          },
+        }),
+        { capabilities: V3_CAPS },
+      ),
+    (err) => err.status === 400 && /Claude tool definition/.test(err.message),
+  )
+  // An unadvertised provider-managed tool cannot sneak in inline either.
+  assert.throws(
+    () =>
+      prepareCragRequest(
+        withBlocks({
+          type: 'tool_addition',
+          tool: { type: 'tool_definition', definition: { type: 'memory_20250818', name: 'memory' } },
+        }),
+        { capabilities: V3_CAPS },
+      ),
+    (err) => err.status === 400,
+  )
+  // Unknown inline tool shapes fail closed instead of passing through.
+  assert.throws(
+    () =>
+      prepareCragRequest(withBlocks({ type: 'tool_addition', tool: { type: 'mystery_form', name: 'x' } }), {
+        capabilities: V3_CAPS,
+      }),
+    (err) => err.status === 400 && /unsupported inline tool type/.test(err.message),
+  )
+  assert.throws(
+    () => prepareCragRequest(withBlocks({ type: 'tool_addition' }), { capabilities: V3_CAPS }),
+    (err) => err.status === 400 && /typed inline tool/.test(err.message),
+  )
+
+  // An inline tool carries no cache_control of its own: the breakpoint belongs to
+  // the block, and sanitizeInlineTool strips anything deeper.
+  const inlineBreakpoint = prepareCragRequest(
+    withBlocks({
+      type: 'tool_addition',
+      tool: { type: 'tool_reference', name: 'lookup', cache_control: { type: 'ephemeral', ttl: '1h' } },
+      cache_control: { type: 'ephemeral', ttl: '1h' },
+    }),
+    { capabilities: V3_CAPS },
+  )
+  assert.deepEqual(inlineBreakpoint.messages[1].content[0], {
+    type: 'tool_addition',
+    tool: { type: 'tool_reference', name: 'lookup' },
+    cache_control: { type: 'ephemeral', ttl: '1h' },
+  })
 })
 
 test('third-party system relocation + prepareCragPrintBody omits redundant CLI identity placeholder (prevents Extra Usage)', () => {

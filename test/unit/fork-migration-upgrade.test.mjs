@@ -113,6 +113,7 @@ test('1.4.076 migrations preserve accounts and correlated usage across lifetime-
     '066_crag_shop_device_host.sql',
     '067_crag_shop_activation_error.sql',
     '068_multi_tier_key_permissions.sql',
+    '069_log_error_details_and_hop_correlation.sql',
   ])
   assert.deepEqual(db.prepare('SELECT * FROM accounts').all(), accounts)
   const usage = db.prepare('SELECT id, request_id, correlation_id, usage_account_id FROM usage_logs').get()
@@ -158,6 +159,7 @@ test('1.4.115 upgrades preserve correlated history and keep the previous schema 
     '066_crag_shop_device_host.sql',
     '067_crag_shop_activation_error.sql',
     '068_multi_tier_key_permissions.sql',
+    '069_log_error_details_and_hop_correlation.sql',
   ])
   assert.deepEqual(db.prepare('SELECT * FROM accounts').all(), accounts)
   const reopened = f.open({ migrationsDir: legacy })

@@ -24,10 +24,7 @@ test('readBody reads identity and uncompressed JSON bodies', async () => {
   const parsed = await readBody(makeRequest({}, [raw]), 4096)
   assert.deepEqual(parsed, payload)
 
-  const identityParsed = await readBody(
-    makeRequest({ 'content-encoding': 'identity' }, [raw]),
-    4096,
-  )
+  const identityParsed = await readBody(makeRequest({ 'content-encoding': 'identity' }, [raw]), 4096)
   assert.deepEqual(identityParsed, payload)
 })
 
@@ -50,10 +47,7 @@ test('readBody and readRawBody decompress zstd and gzip payloads transparently',
   assert.deepEqual(fromZstd, payload)
 
   const gzipBytes = gzipSync(raw)
-  const rawFromGzip = await readRawBody(
-    makeRequest({ 'content-encoding': 'GZIP' }, [gzipBytes]),
-    65536,
-  )
+  const rawFromGzip = await readRawBody(makeRequest({ 'content-encoding': 'GZIP' }, [gzipBytes]), 65536)
   assert.deepEqual(rawFromGzip, raw)
 })
 
@@ -70,36 +64,20 @@ test('readBody and readRawBody handle 0-byte empty body cleanly for identity and
 
 test('readBody rejects unsupported content-encoding with 415', async () => {
   await assert.rejects(
-    () =>
-      readBody(
-        makeRequest({ 'content-encoding': 'br' }, [Buffer.from('abc')]),
-        1024,
-      ),
-    (err) =>
-      err.status === 415 &&
-      err.body?.error?.code === 'unsupported_content_encoding',
+    () => readBody(makeRequest({ 'content-encoding': 'br' }, [Buffer.from('abc')]), 1024),
+    (err) => err.status === 415 && err.body?.error?.code === 'unsupported_content_encoding',
   )
 })
 
 test('readBody rejects corrupt compressed payload with 400', async () => {
   await assert.rejects(
-    () =>
-      readBody(
-        makeRequest({ 'content-encoding': 'zstd' }, [Buffer.from('not-valid-zstd-frame')]),
-        1024,
-      ),
-    (err) =>
-      err.status === 400 && err.body?.error?.code === 'invalid_compressed_body',
+    () => readBody(makeRequest({ 'content-encoding': 'zstd' }, [Buffer.from('not-valid-zstd-frame')]), 1024),
+    (err) => err.status === 400 && err.body?.error?.code === 'invalid_compressed_body',
   )
 
   await assert.rejects(
-    () =>
-      readBody(
-        makeRequest({ 'content-encoding': 'gzip' }, [Buffer.from('not-valid-gzip')]),
-        1024,
-      ),
-    (err) =>
-      err.status === 400 && err.body?.error?.code === 'invalid_compressed_body',
+    () => readBody(makeRequest({ 'content-encoding': 'gzip' }, [Buffer.from('not-valid-gzip')]), 1024),
+    (err) => err.status === 400 && err.body?.error?.code === 'invalid_compressed_body',
   )
 })
 
@@ -109,13 +87,8 @@ test('readRawBody enforces maxBytes on both raw compressed stream and decompress
   assert.ok(compressedBomb.length < 512)
 
   await assert.rejects(
-    () =>
-      readRawBody(
-        makeRequest({ 'content-encoding': 'zstd' }, [compressedBomb]),
-        1024,
-      ),
-    (err) =>
-      err.status === 413 && err.body?.error?.code === ErrorCode.BODY_TOO_LARGE,
+    () => readRawBody(makeRequest({ 'content-encoding': 'zstd' }, [compressedBomb]), 1024),
+    (err) => err.status === 413 && err.body?.error?.code === ErrorCode.BODY_TOO_LARGE,
   )
 
   const noisy = randomBytes(2048)
@@ -123,12 +96,7 @@ test('readRawBody enforces maxBytes on both raw compressed stream and decompress
   assert.ok(bigCompressed.length > 512)
 
   await assert.rejects(
-    () =>
-      readRawBody(
-        makeRequest({ 'content-encoding': 'gzip' }, [bigCompressed]),
-        512,
-      ),
-    (err) =>
-      err.status === 413 && err.body?.error?.code === ErrorCode.BODY_TOO_LARGE,
+    () => readRawBody(makeRequest({ 'content-encoding': 'gzip' }, [bigCompressed]), 512),
+    (err) => err.status === 413 && err.body?.error?.code === ErrorCode.BODY_TOO_LARGE,
   )
 })

@@ -7,6 +7,7 @@ import { consumeClaudeSSEData } from '../protocol/convert.mjs'
 import { isCompleteAssistantMessage, mapUpstreamError } from '../core/errors.mjs'
 import { isContentPolicyErrorCode } from '../core/refusal-guard.mjs'
 import { forwardApi, readApiJson } from '../transport/api-kernel-client.mjs'
+import { compileWithProtoFront, protoFrontMode } from '../transport/proto-front-client.mjs'
 import {
   geminiGenerateUrl,
   messagesUrl,
@@ -39,8 +40,9 @@ import {
 import { usageFromSseLine } from '../protocol/handle-codex.mjs'
 import { BETA_CONTEXT_1M } from '../protocol/claude-code-betas.mjs'
 import { shouldPassContext1mByPolicy } from '../protocol/model-policy.mjs'
+import { resolveGeminiDefaultEffort } from '../protocol/gemini-model-policy.mjs'
 import { createStreamTiming } from '../protocol/stream-timing.mjs'
-import { resolveGeminiReasoningEffort } from '../protocol/log-fields.mjs'
+import { firstNonEmptyEffort, isEmptyEffortValue, resolveGeminiReasoningEffort } from '../protocol/log-fields.mjs'
 import { mergeUsage } from '../protocol/openai-usage.mjs'
 import { ensureRedaction, maskJson, restoreSseLine } from '../redaction/runtime.mjs'
 import { keyTierPolicyFromRecord } from '../admin/key-scope.mjs'
@@ -405,25 +407,60 @@ export async function runApiInference({
       },
     }
   }
-  let body = isOpenAI
-    ? {
-        ...(protocol === 'openai.responses'
+  let openAIBaseBody = null
+  if (isOpenAI) {
+    if (protoFrontMode() === 'go') {
+      try {
+        const pfRes = await compileWithProtoFront({
+          cfg,
+          inboundProtocol: protocol,
+          targetFamily: 'api_openai',
+          reqPath: req?.url || '',
+          headers: req?.headers || {},
+          body: inbound,
+          routing: routing || {},
+          endpointBodyPolicy: picked.endpoint.body_policy || '',
+        })
+        if (pfRes?.ok && pfRes.outbound_body) openAIBaseBody = pfRes.outbound_body
+      } catch {}
+    }
+    if (!openAIBaseBody) {
+      openAIBaseBody =
+        protocol === 'openai.responses'
           ? inbound
           : protocol === 'openai.chat'
             ? chatToCodexResponses(inbound)
-            : claudeToOpenAIResponsesRequest(canonical)),
+            : claudeToOpenAIResponsesRequest(canonical)
+    }
+  }
+  let body = isOpenAI
+    ? {
+        ...openAIBaseBody,
         model: picked.upstream_model,
         stream: true,
         store: false,
       }
     : { ...stripIllegalCacheControlFields(canonical), model: picked.upstream_model, stream: true }
-  if (isOpenAI && protocol === 'openai.chat') {
-    for (const name of ['temperature', 'top_p', 'parallel_tool_calls']) {
-      if (inbound?.[name] != null) body[name] = inbound[name]
+  if (isOpenAI) {
+    if (protocol === 'openai.chat') {
+      for (const name of ['temperature', 'top_p', 'parallel_tool_calls']) {
+        if (inbound?.[name] != null) body[name] = inbound[name]
+      }
     }
-    if (body.reasoning_effort != null) {
-      body.reasoning = { ...body.reasoning, effort: body.reasoning?.effort ?? body.reasoning_effort }
-      delete body.reasoning_effort
+    const effort = firstNonEmptyEffort(body.reasoning?.effort, body.reasoning_effort)
+    delete body.reasoning_effort
+    if (effort !== undefined) {
+      body.reasoning = { ...(body.reasoning && typeof body.reasoning === 'object' ? body.reasoning : {}), effort }
+    } else if (
+      body.reasoning &&
+      typeof body.reasoning === 'object' &&
+      Object.prototype.hasOwnProperty.call(body.reasoning, 'effort') &&
+      isEmptyEffortValue(body.reasoning.effort)
+    ) {
+      const nextReasoning = { ...body.reasoning }
+      delete nextReasoning.effort
+      if (Object.keys(nextReasoning).length) body.reasoning = nextReasoning
+      else delete body.reasoning
     }
   }
   if (requestContext) Object.assign(body, prepareClassifierBody(body))
@@ -963,7 +1000,13 @@ async function runGeminiApiInference({
     }
   }
 
-  let body = buildGeminiRequest({ ...parsed, model: picked.upstream_model }, { target: 'gemini' })
+  const inboundModel = picked.requested_model || inbound?.model || picked.upstream_model
+  const defaultGeminiEffort =
+    resolveGeminiDefaultEffort(picked.upstream_model) ?? resolveGeminiDefaultEffort(inboundModel)
+  let body = buildGeminiRequest(
+    { ...parsed, model: picked.upstream_model },
+    { target: 'gemini', defaultEffort: defaultGeminiEffort },
+  )
   const redactionState = await ensureRedaction(routing || {}, { projectRoot: cfg?.paths?.project })
   const redaction = redactionState.enabled
     ? { principal: redactionPrincipal, session: redactionSession, maxBodyBytes: redactionState.maxBodyBytes }
@@ -1030,13 +1073,13 @@ async function runGeminiApiInference({
     scheduler.reload(store.listRaw())
   }
 
-  const inboundModel = picked.requested_model || inbound?.model || picked.upstream_model
   const reasoningEffort = resolveGeminiReasoningEffort({
     inbound,
     parsed,
     outboundBody: body,
     model: inboundModel,
     upstreamModel: picked.upstream_model,
+    defaultEffort: defaultGeminiEffort,
   })
   const resultBase = {
     ok: status >= 200 && status < 300,

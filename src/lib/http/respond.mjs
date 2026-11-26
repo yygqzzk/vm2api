@@ -77,8 +77,7 @@ function collectRawBody(req, maxBytes) {
 
 function collectCompressedBody(req, maxBytes, encoding) {
   return new Promise((resolve, reject) => {
-    const decompressor =
-      encoding === 'zstd' ? createZstdDecompress() : createGunzip()
+    const decompressor = encoding === 'zstd' ? createZstdDecompress() : createGunzip()
     const chunks = []
     let rawSize = 0
     let decompressedSize = 0

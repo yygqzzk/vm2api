@@ -337,10 +337,21 @@ const publicCwd = '/synthetic/public-cwd-must-not-win'
 const cwdTag = (cwd) => `<cwd>\n${cwd}\n</cwd>`
 // The public handler relocates a non Claude Code caller's system (these
 // fixtures do not send official Claude Code headers) to the head of the first
-// user message before any hop renders (third-party-system.mjs). CRAG then
-// receives only the official identity line as its caller prompt. A valid <cwd>
+// user message before any hop renders (third-party-system.mjs). A valid <cwd>
 // declaration still becomes caller_cwd and is not relocated with the text.
-const identityPrompt = (mode) => ({ mode, text: CRS_OFFICIAL_CLI_SYSTEM })
+//
+// What is left in `system` after that relocation is only the official CLI
+// identity line the gateway itself injects. Since #1731 that placeholder is
+// dropped instead of forwarded as crag_prompt: the CRAG kernel *is* the
+// official CLI and already carries that identity, so sending it again only
+// bills Extra Usage (crag-whitelist-automode.test.mjs covers the unit side).
+// Both presets collapse to the same thing -- 'replace' would have replaced the
+// kernel identity with that very same line -- so no prompt reaches CRAG here.
+function assertIdentityPlaceholderOmitted(envelope) {
+  assert.equal(Object.hasOwn(envelope.body, 'crag_prompt'), false)
+  assert.equal(Object.hasOwn(envelope.body, 'system'), false)
+  assert.equal(JSON.stringify(envelope.body).includes(CRS_OFFICIAL_CLI_SYSTEM), false)
+}
 
 async function protocolKernelFixture(t, { health, staleHealth, preset = 'official_full', interceptRules, tool }) {
   const kernel = await fakeKernel({ health, tool })
@@ -460,14 +471,27 @@ unixTest('native CRAG receives caller tool names and structured system cache blo
   })
   assert.equal(Object.hasOwn(envelope, 'headers'), false)
   assert.equal(extra.worker_envelope_headers, null)
-  assert.deepEqual(envelope.body.tools, tools)
-  // The structured caller blocks keep their cache markers at the head of the first user turn;
-  // #1731 omits the relocated official identity placeholder from CRAG system.
-  assert.equal(envelope.body.system, undefined)
-  assert.equal(envelope.body.crag_prompt, undefined)
+  // failover.eager_tool_streaming defaults on, so the gateway marks every custom
+  // tool before the hop and the CRAG whitelist passes the key through
+  // (CUSTOM_TOOL_KEYS). Caller tool names and schemas are otherwise untouched.
+  assert.deepEqual(
+    envelope.body.tools,
+    tools.map((tool) => ({ ...tool, eager_input_streaming: true })),
+  )
+  // The structured caller blocks keep their cache markers at the head of the first user turn.
+  // With system_text_cache_v3 the identity line would have ridden in `system` to be
+  // cached; #1731 omits it there too, so neither channel carries it.
+  assertIdentityPlaceholderOmitted(envelope)
+  // Omitted caller TTLs are filled from the request's resolved cache TTL (1h here,
+  // taken from the caller's own system anchors) before the hop renders; explicit
+  // caller values are kept as-is.
+  const fillTtl = (block) =>
+    block.cache_control && block.cache_control.ttl === undefined
+      ? { ...block, cache_control: { ...block.cache_control, ttl: '1h' } }
+      : block
   assert.deepEqual(envelope.body.messages, [
-    { ...messages[0], content: [...system, ...messages[0].content] },
-    ...messages.slice(1),
+    { ...messages[0], content: [...system, ...messages[0].content].map(fillTtl) },
+    ...messages.slice(1).map((message) => ({ ...message, content: message.content.map(fillTtl) })),
   ])
   assert.deepEqual(envelope.body.tool_choice, { type: 'auto' })
   assert.equal(envelope.body.max_tokens, 32000)
@@ -633,13 +657,15 @@ for (const stream of [false, true]) {
           }),
         )
         assert.equal(envelope.caller_cwd, trustedCwd)
-        assert.equal(envelope.body.crag_prompt, undefined)
+        assertIdentityPlaceholderOmitted(envelope)
         assert.deepEqual(envelope.body.messages[0].content[0], { type: 'text', text: 'caller guidance' })
         assert.equal(envelope.body.crag_model.id, 'claude-haiku-4-5-20251001')
-        assert.equal(Object.hasOwn(envelope.body, 'system'), false)
         assert.equal(JSON.stringify(envelope.body).includes(trustedCwd), false)
         assert.equal(JSON.stringify(extra.outbound_body).includes(trustedCwd), false)
         assert.equal(extra.official_cc_inference, 'crag-print')
+        // No prompt override leaves the gateway once the identity placeholder is
+        // dropped, so the hop log records 'default' for both presets rather than
+        // the preset's mode. `preset` still drives the test matrix above.
         assert.equal(extra.crag_print.prompt_mode, 'default')
       },
     )
@@ -659,7 +685,7 @@ for (const stream of [false, true]) {
           }),
         )
         assert.equal(envelope.caller_cwd, trustedCwd)
-        assert.equal(envelope.body.crag_prompt, undefined)
+        assertIdentityPlaceholderOmitted(envelope)
         // The declaration leaves with caller_cwd; the lifted history keeps its own copy.
         assert.deepEqual(
           envelope.body.messages[0].content.slice(0, 2).map((block) => block.text),
@@ -770,11 +796,10 @@ for (const stream of [false, true]) {
         const { envelope, extra } = await fixture.send(cwdRequest(stream, fields))
         assert.equal(extra.official_cc_inference, 'crag-print')
         assert.equal(Object.hasOwn(envelope, 'caller_cwd'), false)
+        assertIdentityPlaceholderOmitted(envelope)
+        // A preserved declaration stays as text in the relocated history either way.
         if (preserved) {
-          assert.equal(envelope.body.crag_prompt, undefined)
           assert.ok(envelope.body.messages[0].content.some((block) => block.text?.includes(preserved)))
-        } else {
-          assert.equal(Object.hasOwn(envelope.body, 'crag_prompt'), false)
         }
       },
     )
@@ -797,7 +822,7 @@ for (const phase of ['before_convert', 'before_upstream']) {
     ]) {
       const { envelope } = await fixture.send(body)
       assert.equal(envelope.caller_cwd, expectedCwd)
-      assert.equal(envelope.body.crag_prompt, undefined)
+      assertIdentityPlaceholderOmitted(envelope)
       assert.equal(envelope.body.messages[0].content[0].text, replacementText)
     }
   })
@@ -845,6 +870,9 @@ for (const stream of [false, true]) {
       assert.match(first.publicBody, /call-issued/)
       assert.match(first.publicBody, /"caller":\{"type":"direct"\}/)
       assert.equal(first.extra.official_cc_inference, 'crag-print')
+      // metadata is in CRAG_SILENT_STRIP_TOP_KEYS since #1731, so the caller's
+      // session_id cannot reach CRAG at all -- stricter than the rewrite this
+      // used to assert. Checking the whole body keeps the leak covered.
       assert.equal(Object.hasOwn(first.envelope.body, 'metadata'), false)
       assert.equal(JSON.stringify(first.envelope.body).includes(session), false)
       const echo = stream

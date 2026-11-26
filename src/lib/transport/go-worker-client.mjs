@@ -2,6 +2,7 @@ import http from 'node:http'
 import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
 import { resolveStreamIdleTimeoutMs } from '../core/config.mjs'
 import { prepareOutboundHeaders } from '../protocol/outbound-attempt.mjs'
 import { alignSamplingWithThinking, sanitizeAnthropicBodyForBetaTokens } from '../protocol/anthropic-policy.mjs'
@@ -53,6 +54,7 @@ import {
 } from '../core/errors.mjs'
 import { extraHeadersFromLimitError } from '../pool/quota-window.mjs'
 import { createStreamTiming } from '../protocol/stream-timing.mjs'
+import { correlationIdForLog } from '../protocol/log-fields.mjs'
 import { mergeUsage } from '../protocol/openai-usage.mjs'
 import { ensureRedaction, maskJson, restoreJsonValue, createSseRestorer } from '../redaction/runtime.mjs'
 import { inferenceCodec } from './inference-codec.mjs'
@@ -241,6 +243,7 @@ async function inferenceRequest(
   {
     envelope,
     requestId,
+    gatewayRequestId = null,
     stream,
     deliveryMode,
     managedCrag,
@@ -256,6 +259,8 @@ async function inferenceRequest(
   },
 ) {
   const headers = stream ? { te: 'trailers' } : {}
+  const safeGatewayRequestId = correlationIdForLog(gatewayRequestId)
+  if (safeGatewayRequestId) headers['x-gateway-request-id'] = safeGatewayRequestId
   const body = { ...envelope, request_id: requestId }
   const authenticatedPolicy = managedCrag && requestPath === '/internal/v1/messages'
   // Managed CRAG serializes synchronously. Check first so the worker receives only the remaining queue budget.
@@ -698,7 +703,7 @@ export function finalizeWorkerPayload(args = {}) {
   return sealPreparedPayload(prepared, prepared.gated)
 }
 
-async function workerEnvelope({
+export async function workerEnvelope({
   requestContext = null,
   body,
   reqHeaders,
@@ -741,7 +746,11 @@ async function workerEnvelope({
   const nativeV3 =
     nativeCragRequest(exec, cragPrint) && exec?.workerStatus?.capabilities?.includes('generation_controls_v3')
   // Resolve execution defaults even when cacheTtl is null for mixed-TTL accounting.
-  const defaultCacheTtl = cacheTtl ?? (nativeV3 && routing != null ? cacheTtlFromRouting(routing) : null)
+  const defaultCacheTtl =
+    cacheTtl ??
+    finalized.body?.cache_ttl ??
+    finalized.body?.crag_options?.cache_ttl ??
+    (nativeV3 && routing != null ? cacheTtlFromRouting(routing) : null)
   const envelope = {
     ...(requestContext ? { request_context: requestContext } : {}),
     ...(typeof outgoingCwd === 'string' ? { caller_cwd: outgoingCwd } : {}),
@@ -779,7 +788,9 @@ async function preparePrebuiltEnvelope(envelope, redaction, messages, exec, crag
     )
     if (out.headers && typeof out.headers === 'object') {
       out.headers = Object.fromEntries(
-        Object.entries(out.headers).filter(([name]) => name.toLowerCase() !== 'x-tenant-id'),
+        Object.entries(out.headers).filter(
+          ([name]) => name.toLowerCase() !== 'x-tenant-id' && name.toLowerCase() !== 'x-gateway-request-id',
+        ),
       )
     }
   }
@@ -867,6 +878,7 @@ function restoreInferenceFailure(result, requestPath = '/internal/v1/messages') 
     status: 502,
     terminalState: 'rejected',
     cragPolicyBlock: true,
+    cragCacheControlBlocked: true,
     body: {
       type: 'error',
       error: {
@@ -923,8 +935,10 @@ async function callGoWorkerRaw({
   onEnvelope = null,
   redactionPrincipal = '',
   redactionSession = '',
+  gatewayRequestId = null,
   beforeInferencePost,
 } = {}) {
+  const requestId = randomUUID()
   if (isCrsMock()) {
     const { body: outboundBody, headers } = finalizeWorkerPayload({
       body,
@@ -950,9 +964,9 @@ async function callGoWorkerRaw({
       usage: mock.body?.usage || null,
       model: mock.body?.model || null,
       stopReason: mock.body?.stop_reason || null,
+      hopRequestId: requestId,
     }
   }
-  const requestId = randomUUID()
   const hopSignal = createHopAbortScope(signal)
   let stopCancel = () => hopSignal.disarm()
   const clusterSlot = requestPath === '/internal/v1/messages' && !!vmNodeId(exec?.vm)
@@ -1014,6 +1028,7 @@ async function callGoWorkerRaw({
       requestPath,
       envelope: prepared.envelope,
       requestId,
+      gatewayRequestId,
       maxRequestBytes,
       inference: true,
       beforeInferencePost,
@@ -1066,15 +1081,17 @@ async function callGoWorkerRaw({
       clusterDeliveryUnconfirmed: clusterSlot && !handoff && ok && !isCompleteAssistantMessage({ body: parsed }),
       transportError: false,
       threadBetas: prepared.thread,
+      hopRequestId: requestId,
       ...nativeMetadata(),
     })
     return classifyManagedQueueRejection(result, managedCrag)
   } catch (error) {
     const blocked = redactionResult(error)
-    if (blocked) return { ...blocked, ...nativeMetadata() }
+    if (blocked) return { ...blocked, hopRequestId: requestId, ...nativeMetadata() }
     if (error.code === 'invalid_kernel_request' || error.code === 'unsupported_capability')
-      return { ...invalidKernelResult(error), ...nativeMetadata() }
-    if (hopSignal.signal?.aborted) return clientCancelledResult({ via: 'go-worker', ...nativeMetadata() })
+      return { ...invalidKernelResult(error), hopRequestId: requestId, ...nativeMetadata() }
+    if (hopSignal.signal?.aborted)
+      return clientCancelledResult({ via: 'go-worker', hopRequestId: requestId, ...nativeMetadata() })
     if (error instanceof InferencePostDenied) return error.result
     return {
       ok: false,
@@ -1098,6 +1115,7 @@ async function callGoWorkerRaw({
       },
       headers: observedHeaders,
       clusterDeliveryUnconfirmed: clusterSlot && requestStarted,
+      hopRequestId: requestId,
       ...nativeMetadata(),
       terminalState:
         nativeHandoff && String(error.code).startsWith('native_handoff_')
@@ -1143,8 +1161,10 @@ async function streamGoWorkerRaw({
   onOutboundHeaders = null,
   redactionPrincipal = '',
   redactionSession = '',
+  gatewayRequestId = null,
   beforeInferencePost,
 } = {}) {
+  const requestId = randomUUID()
   if (isCrsMock()) {
     const { body: outboundBody, headers } = finalizeWorkerPayload({
       body,
@@ -1174,6 +1194,7 @@ async function streamGoWorkerRaw({
           headers: {},
           terminalState: 'incomplete',
           committed: false,
+          hopRequestId: requestId,
         }
       }
       if (typeof onCommit === 'function') onCommit()
@@ -1196,6 +1217,7 @@ async function streamGoWorkerRaw({
         headers: {},
         terminalState: 'incomplete',
         committed: true,
+        hopRequestId: requestId,
       }
     }
     const payload = mockCrsPayload({ scenario })
@@ -1205,6 +1227,7 @@ async function streamGoWorkerRaw({
         via: 'go-worker-mock-stream',
         terminalState: 'rejected',
         committed: false,
+        hopRequestId: requestId,
       }
     }
     const mockTiming = createStreamTiming(mockStartedAt)
@@ -1225,12 +1248,12 @@ async function streamGoWorkerRaw({
       usage: payload.body?.usage || null,
       model: payload.body?.model || null,
       stopReason: payload.body?.stop_reason || null,
+      hopRequestId: requestId,
       ...mockTiming.snapshot(),
     }
   }
   let committed = false
   const timing = createStreamTiming()
-  const requestId = randomUUID()
   const hopSignal = createHopAbortScope(signal)
   let stopCancel = () => hopSignal.disarm()
   const clusterSlot = requestPath === '/internal/v1/messages' && !!vmNodeId(exec?.vm)
@@ -1294,6 +1317,7 @@ async function streamGoWorkerRaw({
       requestPath,
       envelope: prepared.envelope,
       requestId,
+      gatewayRequestId,
       maxRequestBytes,
       inference: true,
       beforeInferencePost,
@@ -1334,6 +1358,7 @@ async function streamGoWorkerRaw({
         terminalState: headers['x-terminal-state'] || 'error',
         transportError: false,
         threadBetas: prepared.thread,
+        hopRequestId: requestId,
         ...nativeMetadata(),
       })
       return classifyManagedQueueRejection(result, managedCrag)
@@ -1391,6 +1416,7 @@ async function streamGoWorkerRaw({
         via: 'go-worker-stream',
         body,
         headers: mergeRateLimitHeaders(publicHeaders({ ...received.headers, ...headers, ...trailers })),
+        hopRequestId: requestId,
         ...nativeMetadata(),
         ...timing.snapshot(),
         sawMessageStop: received.sawMessageStop,
@@ -1513,10 +1539,11 @@ async function streamGoWorkerRaw({
       // message_stop is the protocol terminal event, but the kernel still sends
       // job_done and its trailers afterward. Keep reading until the worker
       // closes the response so a normal completion is not mistaken for cancel.
+      const decoder = new StringDecoder('utf8')
       const sseRestorer = prepared.redaction ? createSseRestorer(prepared.redaction) : null
       for await (const chunk of response) {
         receivedAt = Date.now()
-        buffer += Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk)
+        buffer += decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
         let newline
         while ((newline = buffer.indexOf('\n')) >= 0) {
           let line = buffer.slice(0, newline).replace(/\r$/, '')
@@ -1581,6 +1608,7 @@ async function streamGoWorkerRaw({
         if (sawChunk && !outboundHeadersFrame && buffer) lastChunkAt = Date.now()
       }
       stopCancel()
+      buffer += decoder.end()
       if (buffer && !outboundHeadersFrame) {
         applyClaudeSSELineToMessage(buffer, assembler)
         if (buffer.startsWith('data:')) {
@@ -1665,6 +1693,7 @@ async function streamGoWorkerRaw({
         clusterDeliveryUnconfirmed: clusterSlot && !complete && !sawMessageStop && !lastError,
         transportError: false,
         threadBetas: prepared.thread,
+        hopRequestId: requestId,
         ...nativeMetadata(),
       })
     } finally {
@@ -1672,14 +1701,21 @@ async function streamGoWorkerRaw({
     }
   } catch (error) {
     const blocked = redactionResult(error)
-    if (blocked) return { ...blocked, ...timing.snapshot(), committed, ...nativeMetadata() }
+    if (blocked) return { ...blocked, ...timing.snapshot(), committed, hopRequestId: requestId, ...nativeMetadata() }
     if (error.code === 'invalid_kernel_request' || error.code === 'unsupported_capability')
-      return { ...invalidKernelResult(error), ...timing.snapshot(), committed, ...nativeMetadata() }
+      return {
+        ...invalidKernelResult(error),
+        ...timing.snapshot(),
+        committed,
+        hopRequestId: requestId,
+        ...nativeMetadata(),
+      }
     if (hopSignal.signal?.aborted) {
       return clientCancelledResult({
         via: 'go-worker-stream',
         ...timing.snapshot(),
         committed,
+        hopRequestId: requestId,
         ...nativeMetadata(),
       })
     }
@@ -1706,6 +1742,7 @@ async function streamGoWorkerRaw({
       },
       headers: observedHeaders,
       clusterDeliveryUnconfirmed: clusterSlot && requestStarted,
+      hopRequestId: requestId,
       ...nativeMetadata(),
       ...timing.snapshot(),
       committed,

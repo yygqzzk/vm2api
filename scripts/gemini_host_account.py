@@ -14,8 +14,13 @@ MODEL = re.compile(r"[a-z0-9][a-z0-9._-]{0,99}\Z")
 GOOGLE_USERINFO = "https://www.googleapis.com/oauth2/v2/userinfo"
 CODE_ASSIST = "https://cloudcode-pa.googleapis.com/v1internal:"
 CODE_ASSIST_DAILY = "https://daily-cloudcode-pa.googleapis.com/v1internal:"
-ANTIGRAVITY_USER_AGENT = (
-    "antigravity/hub/2.34.0 (aidev_client; os_type=linux; arch=amd64; cl=1026637980)"
+ANTIGRAVITY_VERSION = "2.35.2"
+ANTIGRAVITY_USER_AGENT = f"antigravity/hub/{ANTIGRAVITY_VERSION} linux/amd64"
+ANTIGRAVITY_API_CLIENT = "gl-node/22.21.1"
+ANTIGRAVITY_FALLBACK_USER_AGENTS = (
+    f"antigravity/{ANTIGRAVITY_VERSION} linux/amd64 google-api-nodejs-client/10.3.0",
+    "antigravity/1.5.18 (aidev_client; os_type=linux; arch=amd64)",
+    f"antigravity/hub/{ANTIGRAVITY_VERSION} (aidev_client; os_type=linux; arch=amd64)",
 )
 GEMINI_API = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_MODELS = GEMINI_API + "/models?pageSize=1000"
@@ -126,6 +131,9 @@ def project_id_of(value):
 _BLOCKING_INELIGIBLE_REASONS = frozenset(
     {"VALIDATION_REQUIRED", "UNSUPPORTED_REGION", "UNSUPPORTED_CLIENT"}
 )
+_ONBOARD_BLOCKING_REASONS = frozenset(
+    {"VALIDATION_REQUIRED", "UNSUPPORTED_REGION"}
+)
 _GOOGLE_VALIDATION_URL = re.compile(
     r"https://accounts\.google\.com/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]{1,2000}\Z"
 )
@@ -159,11 +167,28 @@ def parse_ineligibility(assist_data):
             return "verification_required", safe_google_validation_url(
                 entry.get("validationUrl")
             )
-        if reason == "UNSUPPORTED_REGION" and fallback is None:
+        if reason == "UNSUPPORTED_REGION":
             fallback = ("location_unsupported", None)
+        elif reason == "UNSUPPORTED_CLIENT" and fallback is None:
+            fallback = ("client_unsupported", None)
         elif reason in _BLOCKING_INELIGIBLE_REASONS and fallback is None:
             fallback = ("ineligible", None)
     return fallback if fallback is not None else (None, None)
+
+
+def verification_url(assist_data):
+    """A safe action is independent of whether an alternative tier blocks use."""
+    if not isinstance(assist_data, dict):
+        return None
+    entries = assist_data.get("ineligibleTiers")
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("reasonCode") == "VALIDATION_REQUIRED":
+            url = safe_google_validation_url(entry.get("validationUrl"))
+            if url:
+                return url
+    return None
 
 
 def select_onboard_tier(assist_data):
@@ -176,7 +201,7 @@ def select_onboard_tier(assist_data):
         for entry in ineligible:
             if (
                 isinstance(entry, dict)
-                and entry.get("reasonCode") in _BLOCKING_INELIGIBLE_REASONS
+                and entry.get("reasonCode") in _ONBOARD_BLOCKING_REASONS
             ):
                 return None
     allowed = assist_data.get("allowedTiers")
@@ -352,6 +377,13 @@ def probe_oauth(proxy_url, profile):
     return probe_oauth_token(proxy_url, token)
 
 
+def _code_assist_headers(auth_header, user_agent):
+    headers = [auth_header, f"User-Agent: {user_agent}"]
+    if "google-api-nodejs-client/" in user_agent:
+        headers.append(f"X-Goog-Api-Client: {ANTIGRAVITY_API_CLIENT}")
+    return headers
+
+
 def probe_oauth_token(proxy_url, token, *, imported=False):
     credential = token.get("token")
     if not isinstance(credential, dict):
@@ -362,19 +394,56 @@ def probe_oauth_token(proxy_url, token, *, imported=False):
     ):
         return checked("error")
     auth_header = f"Authorization: Bearer {access_token}"
-    code_assist_headers = [auth_header, f"User-Agent: {ANTIGRAVITY_USER_AGENT}"]
-    metadata = {"metadata": {"ideType": "ANTIGRAVITY"}}
+    assist_base = CODE_ASSIST
+    code_assist_headers = _code_assist_headers(auth_header, ANTIGRAVITY_USER_AGENT)
+    metadata = {
+        "metadata": {
+            "ideName": "antigravity",
+            "ideType": "ANTIGRAVITY",
+            "ideVersion": ANTIGRAVITY_VERSION,
+            "platform": "LINUX_AMD64",
+            "pluginType": "GEMINI",
+        }
+    }
     with ThreadPoolExecutor(max_workers=2) as executor:
         user = executor.submit(get_json, proxy_url, GOOGLE_USERINFO, auth_header)
         assist = executor.submit(
             get_json,
             proxy_url,
-            CODE_ASSIST + "loadCodeAssist",
+            assist_base + "loadCodeAssist",
             code_assist_headers,
             metadata,
         )
         user_status, user_data = user.result()
         assist_status, assist_data = assist.result()
+    if (
+        assist_status == 200
+        and parse_ineligibility(assist_data)[0] == "client_unsupported"
+    ) or assist_status in (0, 400, 404, 429, 500, 502, 503, 504):
+        fallback_candidates = [
+            (CODE_ASSIST, fallback_ua)
+            for fallback_ua in ANTIGRAVITY_FALLBACK_USER_AGENTS
+        ] + [
+            (CODE_ASSIST_DAILY, ANTIGRAVITY_USER_AGENT),
+            (CODE_ASSIST_DAILY, ANTIGRAVITY_FALLBACK_USER_AGENTS[0]),
+        ]
+        for fb_base, fallback_ua in fallback_candidates:
+            fallback_headers = _code_assist_headers(auth_header, fallback_ua)
+            fb_status, fb_data = get_json(
+                proxy_url,
+                fb_base + "loadCodeAssist",
+                fallback_headers,
+                metadata,
+            )
+            if (
+                fb_status == 200
+                and isinstance(fb_data, dict)
+                and parse_ineligibility(fb_data)[0] != "client_unsupported"
+            ):
+                assist_base = fb_base
+                assist_status, assist_data = fb_status, fb_data
+                code_assist_headers = fallback_headers
+                break
     if imported:
         email = user_data.get("email")
         if user_status in (401, 403) or assist_status in (401, 403):
@@ -393,7 +462,7 @@ def probe_oauth_token(proxy_url, token, *, imported=False):
                 onboard_body["cloudaicompanionProject"] = existing_project
             onboard_status, onboard_data = get_json(
                 proxy_url,
-                CODE_ASSIST + "onboardUser",
+                assist_base + "onboardUser",
                 code_assist_headers,
                 onboard_body,
                 timeout=10,
@@ -412,7 +481,7 @@ def probe_oauth_token(proxy_url, token, *, imported=False):
                     time.sleep(0.5)
                 assist_status2, assist_data2 = get_json(
                     proxy_url,
-                    CODE_ASSIST + "loadCodeAssist",
+                    assist_base + "loadCodeAssist",
                     code_assist_headers,
                     metadata,
                 )
@@ -432,6 +501,9 @@ def probe_oauth_token(proxy_url, token, *, imported=False):
         except (ValueError, OverflowError, OSError):
             expiry = None
     eligibility, validation_url = parse_ineligibility(assist_data)
+    # Keep the link even when paid/current-tier metadata correctly suppresses
+    # alternative-tier eligibility failures. A URL alone never blocks scheduling.
+    validation_url = validation_url or verification_url(assist_data)
     account = {
         "email": text(user_data.get("email"), 254)
         or text(token.get("id_token_email"), 254),
@@ -493,6 +565,11 @@ def probe_oauth_token(proxy_url, token, *, imported=False):
             catalog = model_catalog(data)
             if catalog:
                 account["model_catalog"] = catalog
+            if (
+                account.get("eligibility") == "client_unsupported"
+                and account.get("models")
+            ):
+                account.pop("eligibility", None)
     state = "partial"
     if user_status == assist_status == model_status == 200:
         state = "ok"

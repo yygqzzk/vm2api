@@ -12,6 +12,10 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { REPORT_KEY } from '@/features/fork/test-reports/types'
+import {
+  GEMINI_INVENTORY_KEY,
+  geminiResource,
+} from '@/features/import/gemini-operations'
 import { dashboardQueryOptions } from '@/features/overview/queries'
 import { vmQueryOptions, vmsListQueryOptions } from '@/features/vm/queries'
 
@@ -27,6 +31,8 @@ export function vmSchedulableProps(vm: Vm) {
     : vm.schedule_state
   return {
     vmId: vm.id,
+    isGemini: Boolean(vm.gemini),
+    disabled: vm.gemini?.auth_state === 'disabled',
     // 受限（含维护 / 代理暂停）仍是「开」：开关只表达操作员意图和不可调度。
     schedulable:
       scheduleState === 'restricted'
@@ -43,6 +49,8 @@ export function vmSchedulableProps(vm: Vm) {
 
 export function SchedulableSwitch({
   vmId,
+  isGemini = false,
+  disabled = false,
   schedulable,
   scheduleState,
   restrictionUntil,
@@ -50,6 +58,8 @@ export function SchedulableSwitch({
   className,
 }: {
   vmId: string
+  isGemini?: boolean
+  disabled?: boolean
   schedulable: boolean
   scheduleState?: ScheduleState
   restrictionUntil?: number | null
@@ -63,8 +73,10 @@ export function SchedulableSwitch({
   const checked = optimistic ?? schedulable
   const mutation = useMutation({
     mutationFn: (next: boolean) =>
-      api<{ schedulable: boolean }>(
-        `/api/panel/vms/${encodeURIComponent(vmId)}/schedulable`,
+      api<{ schedulable?: boolean }>(
+        isGemini
+          ? `${geminiResource(vmId)}/schedulable`
+          : `/api/panel/vms/${encodeURIComponent(vmId)}/schedulable`,
         {
           method: 'POST',
           body: JSON.stringify({ schedulable: next }),
@@ -74,17 +86,30 @@ export function SchedulableSwitch({
     onSuccess: async (data, next) => {
       toast.success(
         next
-          ? data.schedulable
-            ? '已开启调度'
-            : '已允许调度，当前仍有其他限制'
+          ? data?.schedulable === false
+            ? '已允许调度，当前仍有其他限制'
+            : '已开启调度'
           : '已关闭调度'
       )
-      await Promise.all([
-        qc.invalidateQueries({ queryKey: REPORT_KEY }),
-        qc.invalidateQueries({ queryKey: vmsListQueryOptions().queryKey }),
-        qc.invalidateQueries({ queryKey: dashboardQueryOptions().queryKey }),
-        qc.invalidateQueries({ queryKey: vmQueryOptions(vmId).queryKey }),
-      ])
+      await Promise.all(
+        isGemini
+          ? [
+              qc.invalidateQueries({ queryKey: GEMINI_INVENTORY_KEY }),
+              qc.invalidateQueries({
+                queryKey: dashboardQueryOptions().queryKey,
+              }),
+            ]
+          : [
+              qc.invalidateQueries({ queryKey: REPORT_KEY }),
+              qc.invalidateQueries({
+                queryKey: vmsListQueryOptions().queryKey,
+              }),
+              qc.invalidateQueries({
+                queryKey: dashboardQueryOptions().queryKey,
+              }),
+              qc.invalidateQueries({ queryKey: vmQueryOptions(vmId).queryKey }),
+            ]
+      )
     },
     onError: (error: Error) => {
       setOptimistic(null)
@@ -94,8 +119,9 @@ export function SchedulableSwitch({
   })
 
   const untilText = formatRestrictionUntil(restrictionUntil)
-  const tooltip =
-    scheduleState === 'unschedulable' && !checked
+  const tooltip = disabled
+    ? '环境已停用，请先在详情中重新授权'
+    : scheduleState === 'unschedulable' && !checked
       ? `不可调度：${unschedulableText || '错误'}。处理后点击重新开启调度`
       : restricted && checked
         ? untilText
@@ -115,7 +141,7 @@ export function SchedulableSwitch({
         >
           <Switch
             checked={checked}
-            disabled={mutation.isPending}
+            disabled={disabled || mutation.isPending}
             onCheckedChange={(next) => mutation.mutate(next)}
             aria-label={tooltip}
           />

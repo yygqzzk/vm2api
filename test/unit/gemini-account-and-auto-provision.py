@@ -368,9 +368,182 @@ def test_post_oauth_auto_pulls_models_and_refreshes_expired_token():
             assert host.environments[env_id]["account"]["plan"] == "Google AI Pro"
 
 
+def test_unsupported_client_fallback_and_distinct_classification():
+    # 1. Enriched metadata + automatic fallback User-Agent recovers when primary UA gets UNSUPPORTED_CLIENT.
+    seen_uas = []
+    seen_metadata = []
+
+    def fake_recover(proxy_url, url, header=None, body=None, *, timeout=6):
+        if url.endswith("/userinfo"):
+            return 200, {"email": "recover@example.test"}
+        if url.endswith("loadCodeAssist"):
+            seen_metadata.append(body)
+            ua = next((h for h in header if h.startswith("User-Agent: ")), "")
+            seen_uas.append(ua)
+            if len(seen_uas) == 1:
+                return 200, {
+                    "ineligibleTiers": [
+                        {"reasonCode": "UNSUPPORTED_CLIENT", "reasonMessage": "Client not supported"}
+                    ]
+                }
+            return 200, {
+                "cloudaicompanionProject": "proj-fallback-ok",
+                "currentTier": {"id": "free-tier", "name": "Google AI Standard"},
+            }
+        if url.endswith("fetchAvailableModels"):
+            assert any(h == f"User-Agent: {account_mod.ANTIGRAVITY_FALLBACK_USER_AGENTS[0]}" for h in header)
+            return 200, {"models": {"gemini-3-pro": {}}}
+        if url.endswith("retrieveUserQuotaSummary"):
+            return 200, {"groups": []}
+        raise AssertionError(f"unexpected URL: {url}")
+
+    with patch.object(account_mod, "get_json", side_effect=fake_recover):
+        recovered = account_mod.probe_oauth_token(
+            PROXY,
+            {"token": {"access_token": "ya29.fixture-recover", "expiry": "2030-01-01T00:00:00Z"}},
+        )
+    assert len(seen_uas) == 2
+    assert seen_metadata[0] == {
+        "metadata": {
+            "ideName": "antigravity",
+            "ideType": "ANTIGRAVITY",
+            "ideVersion": account_mod.ANTIGRAVITY_VERSION,
+            "platform": "LINUX_AMD64",
+            "pluginType": "GEMINI",
+        }
+    }
+    assert recovered["state"] == "ok"
+    assert recovered["project_id"] == "proj-fallback-ok"
+    assert "eligibility" not in recovered
+
+    # 1b. Falls back to daily-cloudcode-pa when cloudcode-pa rejects all UAs with UNSUPPORTED_CLIENT.
+    daily_urls = []
+
+    def fake_daily_recover(proxy_url, url, header=None, body=None, *, timeout=6):
+        if url.endswith("/userinfo"):
+            return 200, {"email": "daily@example.test"}
+        if url.endswith("loadCodeAssist"):
+            daily_urls.append(url)
+            if url.startswith(account_mod.CODE_ASSIST_DAILY):
+                return 200, {
+                    "cloudaicompanionProject": "proj-daily-ok",
+                    "currentTier": {"id": "free-tier", "name": "Google AI Standard"},
+                }
+            return 200, {
+                "ineligibleTiers": [
+                    {"reasonCode": "UNSUPPORTED_CLIENT", "reasonMessage": "Client not supported"}
+                ]
+            }
+        if url.endswith("fetchAvailableModels"):
+            return 200, {"models": {"gemini-3-pro": {}}}
+        if url.endswith("retrieveUserQuotaSummary"):
+            return 200, {"groups": []}
+        raise AssertionError(f"unexpected URL: {url}")
+
+    with patch.object(account_mod, "get_json", side_effect=fake_daily_recover):
+        daily_ok = account_mod.probe_oauth_token(
+            PROXY,
+            {"token": {"access_token": "ya29.fixture-daily", "expiry": "2030-01-01T00:00:00Z"}},
+        )
+    assert any(u.startswith(account_mod.CODE_ASSIST_DAILY) for u in daily_urls)
+    assert daily_ok["state"] == "ok"
+    assert daily_ok["project_id"] == "proj-daily-ok"
+    assert "eligibility" not in daily_ok
+
+    # 1c. When loadCodeAssist reports UNSUPPORTED_CLIENT but fetchAvailableModels returns
+    # runnable models, suppress false-positive client_unsupported blocking.
+    def fake_models_override_client_unsupported(proxy_url, url, header=None, body=None, *, timeout=6):
+        if url.endswith("/userinfo"):
+            return 200, {"email": "models-ok@example.test"}
+        if url.endswith("loadCodeAssist"):
+            return 200, {
+                "ineligibleTiers": [
+                    {"reasonCode": "UNSUPPORTED_CLIENT", "reasonMessage": "Client not supported"}
+                ]
+            }
+        if url.endswith("fetchAvailableModels"):
+            return 200, {"models": {"gemini-3-pro": {}}}
+        raise AssertionError(f"unexpected URL: {url}")
+
+    with patch.object(account_mod, "get_json", side_effect=fake_models_override_client_unsupported):
+        models_ok = account_mod.probe_oauth_token(
+            PROXY,
+            {"token": {"access_token": "ya29.fixture-models-ok", "expiry": "2030-01-01T00:00:00Z"}},
+        )
+    assert models_ok["state"] == "ok"
+    assert models_ok["models"] == ["gemini-3-pro"]
+    assert "eligibility" not in models_ok
+
+    # 1d. UNSUPPORTED_CLIENT on an alternative tier does not prevent onboarding an allowed tier.
+    assert (
+        account_mod.select_onboard_tier(
+            {
+                "allowedTiers": [{"id": "free-tier", "isDefault": True}],
+                "ineligibleTiers": [{"reasonCode": "UNSUPPORTED_CLIENT"}],
+            }
+        )
+        == "free-tier"
+    )
+
+    # 2. If all client UAs receive UNSUPPORTED_CLIENT and no models are returned, report 'client_unsupported'.
+    def fake_always_unsupported(proxy_url, url, header=None, body=None, *, timeout=6):
+        if url.endswith("/userinfo"):
+            return 200, {"email": "client-blocked@example.test"}
+        if url.endswith("loadCodeAssist"):
+            return 200, {
+                "ineligibleTiers": [
+                    {"reasonCode": "UNSUPPORTED_CLIENT", "reasonMessage": "Client not supported"}
+                ]
+            }
+        if url.endswith("fetchAvailableModels"):
+            return 200, {"models": {}}
+        raise AssertionError(f"unexpected URL: {url}")
+
+    with patch.object(account_mod, "get_json", side_effect=fake_always_unsupported):
+        blocked = account_mod.probe_oauth_token(
+            PROXY,
+            {"token": {"access_token": "ya29.fixture-blocked", "expiry": "2030-01-01T00:00:00Z"}},
+        )
+    assert blocked["eligibility"] == "client_unsupported"
+
+    # 3. Native EligibilityDiagnostic classifies UNSUPPORTED_CLIENT distinctly and treats it
+    # as advisory for live ready sessions while still surfacing it on final failure.
+    native_mod = load_module("gemini_host_native_test", "scripts/gemini_host_native.py")
+    diag = native_mod.EligibilityDiagnostic.__new__(native_mod.EligibilityDiagnostic)
+    diag.pending = bytearray()
+    diag.discard_line = False
+    diag.code = None
+    diag.descriptor = None
+    diag._lock = __import__("threading").Lock()
+    diag._consume(
+        b"W1126 13:18:02.000000 1234 server_oauth.go:42] Account ineligible: UNSUPPORTED_CLIENT\n"
+    )
+    assert diag.code == "gemini_client_unsupported"
+    assert diag.poll(include_advisory=False) is None
+    assert diag.poll(final=True) == "gemini_client_unsupported"
+    assert host_mod.session_diagnostic(SimpleNamespace(native_diagnostic=diag)) is None
+    assert (
+        host_mod.session_diagnostic(
+            SimpleNamespace(native_diagnostic=diag), final=True, include_advisory=True
+        )
+        == "gemini_client_unsupported"
+    )
+    diag.clear_advisory()
+    assert diag.code is None
+
+    # Blocking region diagnostic is never treated as advisory or cleared by clear_advisory().
+    diag._consume(
+        b"W1126 13:18:03.000000 1234 server_oauth.go:42] Account ineligible: You are not eligible for Antigravity, because it is not currently available in your location.\n"
+    )
+    assert diag.poll(include_advisory=False) == "gemini_location_unsupported"
+    diag.clear_advisory()
+    assert diag.code == "gemini_location_unsupported"
+
+
 if __name__ == "__main__":
     test_account_antigravity_ua_and_auto_onboard()
     test_account_skips_onboard_when_validation_required()
     test_realistic_login_settlement_hostname_and_headless_device_inheritance()
     test_post_oauth_auto_pulls_models_and_refreshes_expired_token()
+    test_unsupported_client_fallback_and_distinct_classification()
     print("OK")

@@ -59,6 +59,7 @@ function addKeyUsage(into, row) {
 }
 
 /** settings key: ISO instant before which usage_logs rows may have been pruned. Monotonic. */
+export const DB_CREATED_AT_KEY = 'usage_logs_db_created_at'
 const PRUNED_THROUGH_KEY = 'usage_logs_pruned_through'
 const BILLING_STATS_CACHE_TTL_MS = 10_000
 const BILLING_BACKFILL_INTERVAL_MS = 60_000
@@ -166,7 +167,20 @@ const SUMMARY_COLUMNS = [
   'image_input_tokens',
   'image_output_tokens',
   'image_cost',
+  'upstream_type',
+  'error_details',
 ]
+
+function parseErrorDetails(value) {
+  if (value == null || value === '') return null
+  if (typeof value === 'object' && !Array.isArray(value)) return value
+  try {
+    const parsed = JSON.parse(String(value))
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null
+  } catch {
+    return null
+  }
+}
 
 function toRow(rec) {
   return SUMMARY_COLUMNS.map((c) => {
@@ -175,6 +189,10 @@ function toRow(rec) {
     if (c === 'ip_address') return rec.ip_address ?? rec.ip ?? null
     if (c === 'stream') return rec.stream ? 1 : 0
     if (c === 'has_tools') return rec.has_tools == null ? null : rec.has_tools ? 1 : 0
+    if (c === 'error_details') {
+      if (rec[c] == null || rec[c] === '') return null
+      return typeof rec[c] === 'string' ? rec[c] : JSON.stringify(rec[c])
+    }
     if (c === 'cache_creation_tokens' && rec[c] == null) return null
     if (
       c === 'input_tokens' ||
@@ -200,6 +218,8 @@ function fromRow(row) {
     ip: row.ip_address,
     stream: !!row.stream,
     has_tools: row.has_tools == null ? null : !!row.has_tools,
+    upstream_type: row.upstream_type ?? null,
+    error_details: parseErrorDetails(row.error_details),
   }
 }
 
@@ -373,6 +393,9 @@ export class UsageLogsRepo {
     this._vmOwner = db.prepare('SELECT owner_user_id FROM vms WHERE id = ?')
     this._listDebug = db.prepare('SELECT record_json FROM request_log_debug ORDER BY ts DESC LIMIT ?')
     this._getByRequestId = db.prepare('SELECT * FROM usage_logs WHERE request_id = ?')
+    this._addDurationByRequestId = db.prepare(
+      'UPDATE usage_logs SET duration_ms = COALESCE(duration_ms, 0) + ? WHERE request_id = ?',
+    )
     // OCTET_LENGTH counts encoded bytes and lets SQLite read TEXT size from metadata without loading each body.
     this._debugBytes = db.prepare('SELECT COALESCE(SUM(OCTET_LENGTH(record_json)), 0) AS n FROM request_log_debug')
     this._debugCount = db.prepare('SELECT COUNT(*) AS n FROM request_log_debug')
@@ -432,6 +455,38 @@ export class UsageLogsRepo {
 
   insertDebugIfAbsent(requestId, ts, record) {
     return this._insertDebugIfAbsent.run(requestId, ts || new Date().toISOString(), JSON.stringify(record)).changes > 0
+  }
+
+  /**
+   * Fold a zero-token local tool-continuation drain turn into its parent
+   * token-bearing request row (adding wall time and, in debug mode, appending
+   * a compact continuation record onto `hop_meta.tool_continuations`).
+   */
+  mergeToolContinuation(parentRequestId, { durationMs = 0, continuation = null } = {}) {
+    if (!parentRequestId) return false
+    const deltaMs = Number.isFinite(Number(durationMs)) && Number(durationMs) > 0 ? Math.trunc(Number(durationMs)) : 0
+    let updated = false
+    if (deltaMs > 0) {
+      updated = this._addDurationByRequestId.run(deltaMs, parentRequestId).changes > 0
+    }
+    if (continuation && typeof continuation === 'object') {
+      const dbgRow = this._getDebug.get(parentRequestId)
+      if (dbgRow?.record_json) {
+        try {
+          const rec = JSON.parse(dbgRow.record_json)
+          if (rec && typeof rec === 'object') {
+            if (deltaMs > 0) rec.duration_ms = (Number(rec.duration_ms) || 0) + deltaMs
+            const hopMeta = rec.hop_meta && typeof rec.hop_meta === 'object' ? rec.hop_meta : {}
+            const list = Array.isArray(hopMeta.tool_continuations) ? [...hopMeta.tool_continuations] : []
+            if (list.length < 64) list.push(continuation)
+            rec.hop_meta = { ...hopMeta, tool_continuations: list }
+            this._insertDebug.run(parentRequestId, rec.ts || new Date().toISOString(), JSON.stringify(rec))
+            updated = true
+          }
+        } catch {}
+      }
+    }
+    return updated
   }
 
   getDebug(requestId) {
@@ -559,9 +614,11 @@ export class UsageLogsRepo {
       params.push(correlation_id)
     }
     if (q) {
-      where.push('(path LIKE ? OR error_code LIKE ? OR error_message LIKE ? OR request_id LIKE ?)')
-      const like = `%${String(q).slice(0, 100)}%`
-      params.push(like, like, like, like)
+      where.push(
+        '(LOWER(path) LIKE ? OR LOWER(error_code) LIKE ? OR LOWER(error_message) LIKE ? OR LOWER(request_id) LIKE ? OR LOWER(upstream_type) LIKE ?)',
+      )
+      const like = `%${String(q).slice(0, 100).toLowerCase()}%`
+      params.push(like, like, like, like, like)
     }
     const cond = where.length ? `WHERE ${where.join(' AND ')}` : ''
     const cap = Math.max(1, Math.min(5000, Number(maxLimit) || 500))
@@ -1443,26 +1500,36 @@ export class UsageLogsRepo {
 
   /**
    * Earliest instant whose traffic is still fully in usage_logs: the later of the DB's
-   * creation (first migration) and the recorded prune boundary. Neither the oldest
-   * surviving row (a quiet hour looks like a gap) nor the current retain_days (raising
-   * it does not bring deleted rows back) can stand in for that boundary.
+   * creation (first migration, or preserved SQLite origin across PG migration) and the
+   * recorded prune boundary. Neither the oldest surviving row (a quiet hour looks like
+   * a gap) nor the current retain_days (raising it does not bring deleted rows back)
+   * can stand in for that boundary.
    */
   logCoverageStart() {
-    const created = Date.parse(
+    const origin = Date.parse(this._settingJson(DB_CREATED_AT_KEY) || '')
+    const schema = Date.parse(
       this.db.prepare("SELECT MIN(applied_at) AS t FROM schema_migrations WHERE version = '001'").get()?.t || '',
     )
+    let created = -Infinity
+    if (Number.isFinite(origin) && Number.isFinite(schema)) created = Math.min(origin, schema)
+    else if (Number.isFinite(origin)) created = origin
+    else if (Number.isFinite(schema)) created = schema
     const pruned = Date.parse(this._prunedThrough() || '')
-    const start = Math.max(Number.isFinite(created) ? created : -Infinity, Number.isFinite(pruned) ? pruned : -Infinity)
+    const start = Math.max(created, Number.isFinite(pruned) ? pruned : -Infinity)
     return Number.isFinite(start) ? new Date(start).toISOString() : null
   }
 
-  _prunedThrough() {
-    const row = this.db.prepare(`SELECT value FROM settings WHERE key = '${PRUNED_THROUGH_KEY}'`).get()
+  _settingJson(key) {
+    const row = this.db.prepare('SELECT value FROM settings WHERE key = ?').get(key)
     try {
       return row ? JSON.parse(row.value) : null
     } catch {
       return null
     }
+  }
+
+  _prunedThrough() {
+    return this._settingJson(PRUNED_THROUGH_KEY)
   }
 
   /**
