@@ -54,7 +54,7 @@
 
 `main` 合入后 CI 的 `ghcr-push` 自动推送 `ghcr.io/yygqzzk/vm2api:fork-<完整SHA>` 与 `vm2api-slot-browser`（离线包另保留 7 天兜底）。`deploy/fork/cutover.py` 固化切换流程：**瘦身一致性备份（~0.8G，排除 `cli-home/.kin` 下可再生内核二进制与 socket，保留最近 `--keep-backups 3` 套）→ `/api/panel/vms/schedule/hold` 暂停调度排空 → 仅替换控制面 → `fleet-update`/`warm` 预热运行中槽位内核 → 逐项验收（失败自动回退，不覆写业务数据库）**。
 
-- **只读与生产切换统一入口（全局技能 `dasixda-ops`，双活部署必须显式 `--node`）：**
+- **只读与生产切换统一入口（全局技能 `dasixda-ops`，部署须显式指定 `--node`）：**
   ```bash
   OPS=~/Code/dasixda-ops/scripts/ops.sh
   $OPS deploy-vm2api --node <node> --release <完整SHA> --dry-run
