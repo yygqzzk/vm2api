@@ -1,4 +1,4 @@
-import { beforeEach, test } from 'node:test'
+import { after, before, beforeEach, test } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -24,6 +24,16 @@ import {
 import { openDatabase, closeDatabase } from '../../src/lib/db/database.mjs'
 import { RequestAttemptsRepo } from '../../src/lib/db/repos/request-attempts-repo.mjs'
 import { UsageLogsRepo } from '../../src/lib/db/repos/usage-logs-repo.mjs'
+
+let keepAlive = null
+before(() => {
+  // waitForOpenAICapacity unrefs its timer so systemd workers can idle-exit;
+  // keep one ref'd handle while this test file runs on Node 22.
+  keepAlive = setInterval(() => {}, 10_000)
+})
+after(() => {
+  if (keepAlive) clearInterval(keepAlive)
+})
 
 beforeEach(() => resetOpenAIAccountRuntime())
 
