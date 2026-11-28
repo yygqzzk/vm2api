@@ -744,3 +744,27 @@ test('persistRoutingPatch merges and normalizes batch_group and loadRoutingConfi
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
+
+test('persistRoutingPatch deep-merges codex.sticky_wait and allows 0ms disable without touching pool', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-routing-codex-sticky-wait-'))
+  const routingFile = path.join(root, 'routing.json')
+  try {
+    const routingConfig = {
+      pool: { sticky_wait_timeout_ms: 4000 },
+      codex: { sticky_wait: { enabled: true, timeout_ms: 4000, min_text_bytes: 393216, sample_pct: 50 } },
+    }
+    fs.writeFileSync(routingFile, JSON.stringify(routingConfig))
+    const runtime = persistHarness(root, routingFile, routingConfig)
+    await runtime.persistRoutingPatch({ codex: { sticky_wait: { enabled: false, timeout_ms: 0 } } })
+    const saved = JSON.parse(fs.readFileSync(routingFile, 'utf8'))
+    assert.deepEqual(saved.codex.sticky_wait, {
+      enabled: false,
+      timeout_ms: 0,
+      min_text_bytes: 393216,
+      sample_pct: 50,
+    })
+    assert.equal(saved.pool.sticky_wait_timeout_ms, 4000)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})

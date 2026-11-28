@@ -1310,6 +1310,10 @@ const { handleProtocol, handleSearch, handleImages } = createHandleProtocol({
   get groupsRepo() {
     return groupsRepo
   },
+  getAttemptsRepo: () => attemptsRepo,
+  get attemptsRepo() {
+    return attemptsRepo
+  },
 })
 
 const responsesWs = createResponsesWsHandler({

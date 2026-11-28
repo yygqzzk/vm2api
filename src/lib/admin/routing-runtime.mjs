@@ -570,6 +570,13 @@ export function createRoutingRuntime(ctx) {
       if (hasCodexQuota) {
         nextCodex.quota = mergeOpenAIQuotaPolicy(routingConfig.codex?.quota, body.codex.quota)
       }
+      if (
+        body.codex.sticky_wait &&
+        typeof body.codex.sticky_wait === 'object' &&
+        !Array.isArray(body.codex.sticky_wait)
+      ) {
+        nextCodex.sticky_wait = { ...(routingConfig.codex?.sticky_wait || {}), ...body.codex.sticky_wait }
+      }
       routingConfig.codex = normalizeCodexRouting(nextCodex)
     }
     if (body.gemini) {

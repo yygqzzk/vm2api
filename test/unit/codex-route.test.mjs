@@ -1,12 +1,14 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
+  DEFAULT_CODEX_STICKY_WAIT,
   computedUpstreamTransport,
   inferenceWebsocketEnabled,
   isCodexProtocolAllowed,
   isCodexVm,
   listCodexVms,
   normalizeCodexRouting,
+  normalizeCodexStickyWait,
   validateInferenceWebsocketPatch,
 } from '../../src/lib/protocol/codex-route.mjs'
 
@@ -122,4 +124,29 @@ test('PUT websocket patch rejects non-booleans and illegal transport', () => {
       analytics: { enabled: false },
     },
   })
+})
+
+test('codex.sticky_wait normalizes defaults, preserves 0ms timeout, and validates PATCH strictly', () => {
+  assert.deepEqual(normalizeCodexRouting().sticky_wait, DEFAULT_CODEX_STICKY_WAIT)
+  assert.deepEqual(
+    normalizeCodexRouting({ sticky_wait: { enabled: false, timeout_ms: 0, sample_pct: 0, min_text_bytes: 524288 } })
+      .sticky_wait,
+    { enabled: false, timeout_ms: 0, sample_pct: 0, min_text_bytes: 524288 },
+  )
+  assert.equal(normalizeCodexStickyWait({ timeout_ms: 999999 }).timeout_ms, 30000)
+
+  validateInferenceWebsocketPatch({
+    codex: { sticky_wait: { enabled: false, timeout_ms: 0, min_text_bytes: 524288, sample_pct: 50 } },
+  })
+  for (const bad of [
+    { codex: { sticky_wait: 'yes' } },
+    { codex: { sticky_wait: { unknown_key: 1 } } },
+    { codex: { sticky_wait: { enabled: 1 } } },
+    { codex: { sticky_wait: { timeout_ms: -1 } } },
+    { codex: { sticky_wait: { timeout_ms: 1.5 } } },
+    { codex: { sticky_wait: { min_text_bytes: 100 } } },
+    { codex: { sticky_wait: { sample_pct: 101 } } },
+  ]) {
+    assert.throws(() => validateInferenceWebsocketPatch(bad), { code: 'invalid_codex_sticky_wait' })
+  }
 })

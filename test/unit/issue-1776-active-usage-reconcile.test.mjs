@@ -18,10 +18,10 @@ import { ACTIVE_CALIBRATION_SETTLE_MS, AccountQuota } from '../../src/lib/pool/a
 import { isNearLimit } from '../../src/lib/pool/quota-tiers.mjs'
 import { listQuotaFromHeaders } from '../../src/lib/pool/quota-window.mjs'
 
-const T0 = Date.parse('2026-11-24T07:04:41.589Z')
-const T1_NEXT_DAY = Date.parse('2026-11-25T00:14:44.649Z')
-const RESET_5H_ELAPSED = String(Math.floor(Date.parse('2026-11-24T09:30:00Z') / 1000))
-const RESET_7D_FUTURE = String(Math.floor(Date.parse('2026-11-26T16:00:00Z') / 1000))
+const T1_NEXT_DAY = Math.floor(Date.now() / 1000) * 1000
+const T0 = T1_NEXT_DAY - (17 * 3600_000 + 10 * 60_000)
+const RESET_5H_ELAPSED = String(Math.floor((T0 + 145 * 60_000) / 1000))
+const RESET_7D_FUTURE = String(Math.floor((T1_NEXT_DAY + 40 * 3600_000) / 1000))
 const RESET_7D_FUTURE_ISO = new Date(Number(RESET_7D_FUTURE) * 1000).toISOString()
 
 function makeEnv(t, { vmId = 'vm-01', accountId = 'acc-1', schedulable = true, scheduleOff = false } = {}) {

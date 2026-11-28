@@ -98,7 +98,11 @@ export function firstUserFingerprint(body = {}) {
     else if (Array.isArray(c)) {
       text = firstUserIdentityText(
         c.map((part) =>
-          typeof part === 'string' ? part : part?.type === 'text' && typeof part.text === 'string' ? part.text : '',
+          typeof part === 'string'
+            ? part
+            : (part?.type === 'text' || part?.type === 'input_text') && typeof part.text === 'string'
+              ? part.text
+              : '',
         ),
       )
     }

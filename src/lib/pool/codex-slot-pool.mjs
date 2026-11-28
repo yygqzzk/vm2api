@@ -13,7 +13,7 @@ import {
 } from '../protocol/codex-usage.mjs'
 import { isLeftoverQuotaScheduleOff, isQuotaWindowReason } from './availability.mjs'
 import { resolveCredentialScheduleLevel } from './credential-weight.mjs'
-import { orderOpenAIAccounts } from './openai-account-selector.mjs'
+import { orderOpenAIAccounts, schedulingBlocker } from './openai-account-selector.mjs'
 import { expiresAtToMs } from '../oauth/oauth-credentials.mjs'
 import {
   bumpOpenAICursor,
@@ -372,10 +372,26 @@ export function orderCodexSessionSlots(
   }
   const ids = pool.filter(accepts)
   if (!ids.length) {
-    return { error: 'session_window_full', ids: [], ready: [], parked: [], sticky: false, boundState, candidates: [] }
+    return {
+      error: 'session_window_full',
+      ids: [],
+      ready: [],
+      parked: [],
+      sticky: false,
+      boundState,
+      home,
+      preferredBlocker: home ? 'session_limit' : null,
+      candidates: [],
+    }
   }
   const cursor = roundRobinCursor == null ? readOpenAICursor() : roundRobinCursor
   const candidates = ids.map((id) => codexAccountCandidate(byId.get(id), now, null, policy))
+  const homeCandidate = home ? candidates.find((candidate) => candidate.id === home) || null : null
+  const preferredBlocker = home
+    ? homeCandidate
+      ? schedulingBlocker(homeCandidate, { strategy, now, requestIntervalMs })
+      : 'session_limit'
+    : null
   const ordered = orderOpenAIAccounts(candidates, {
     strategy,
     now,
@@ -398,6 +414,8 @@ export function orderCodexSessionSlots(
       sticky: false,
       boundState,
       home,
+      preferred: homeCandidate ? 'blocked' : boundVmId ? 'missing' : 'not_requested',
+      preferredBlocker,
       candidates: [],
     }
   }
@@ -412,6 +430,8 @@ export function orderCodexSessionSlots(
     strategy,
     boundState,
     home,
+    preferred: ordered.preferred,
+    preferredBlocker,
     candidates: ordered.ids.map((id) => candidates.find((candidate) => candidate.id === id)),
   }
 }
