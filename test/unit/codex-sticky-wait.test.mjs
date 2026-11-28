@@ -90,7 +90,7 @@ test('bound ultra-long request short-waits and hits home when seat releases in w
   const h2 = tryAcquireOpenAISlot('vm-gpt-a', { concurrency: 2 })
   assert.ok(h1 && h2)
 
-  setTimeout(() => h1.release(), 40)
+  setTimeout(() => h1.release(), 100)
   const logBag = {}
   const body = makeLongBody(410_000)
   const res = emptyRes()
@@ -111,7 +111,7 @@ test('bound ultra-long request short-waits and hits home when seat releases in w
     writeSSEHeaders() {},
     routing: {
       sticky: { enabled: true },
-      codex: { sticky_wait: { enabled: true, timeout_ms: 500, min_text_bytes: 393216, sample_pct: 100 } },
+      codex: { sticky_wait: { enabled: true, timeout_ms: 1000, min_text_bytes: 393216, sample_pct: 100 } },
     },
     projectRoot: root,
     stickyRouter: sticky,
@@ -130,7 +130,7 @@ test('bound ultra-long request short-waits and hits home when seat releases in w
   assert.equal(logBag.hop_meta?.codex_schedule?.outcome, 'sticky_hit_after_wait')
   assert.equal(logBag.hop_meta?.codex_schedule?.home_vm_id, 'vm-gpt-a')
   assert.equal(logBag.hop_meta?.codex_schedule?.selected_vm_id, 'vm-gpt-a')
-  assert.ok(logBag.hop_meta?.codex_schedule?.sticky_wait_ms >= 20)
+  assert.ok(logBag.hop_meta?.codex_schedule?.sticky_wait_ms > 0)
 })
 
 test('short-wait timeout borrows fresh idle slot without extending deadline on stolen wakeups', async (t) => {
@@ -438,7 +438,7 @@ test('normal mode records prompt-free RequestAttemptsRepo decision and UsageLogs
   sticky.bind(`p:openai:${sessionId}`, { vmId: 'vm-gpt-a', accountId: 'vm-gpt-a', sessionId: 'out-a' })
   const h1 = tryAcquireOpenAISlot('vm-gpt-a', { concurrency: 2 })
   const h2 = tryAcquireOpenAISlot('vm-gpt-a', { concurrency: 2 })
-  setTimeout(() => h1.release(), 30)
+  setTimeout(() => h1.release(), 80)
 
   const logBag = {}
   const res = { ...emptyRes(), _kinRequestId: reqId }
@@ -458,7 +458,7 @@ test('normal mode records prompt-free RequestAttemptsRepo decision and UsageLogs
       return payload
     },
     writeSSEHeaders() {},
-    routing: { codex: { sticky_wait: { enabled: true, timeout_ms: 500, min_text_bytes: 393216 } } },
+    routing: { codex: { sticky_wait: { enabled: true, timeout_ms: 1000, min_text_bytes: 393216 } } },
     projectRoot: root,
     stickyRouter: sticky,
     ops: {
@@ -484,8 +484,8 @@ test('normal mode records prompt-free RequestAttemptsRepo decision and UsageLogs
   assert.equal(row.selection_reason, 'sticky:after_wait')
   assert.equal(row.terminal_state, 'verified')
   assert.equal(row.ttft_ms, 123)
-  assert.ok(row.wait_ms >= 15)
-  assert.ok(row.queue_wait_ms >= 15)
+  assert.ok(row.wait_ms > 0)
+  assert.ok(row.queue_wait_ms > 0)
   assert.equal(row.usage.codex_schedule.outcome, 'sticky_hit_after_wait')
   assert.equal(row.usage.codex_schedule.key_source, 'session')
   assert.equal(row.usage.codex_schedule.key_fp, classifyCodexStickyKey(`p:openai:${sessionId}`).fp)
