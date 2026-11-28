@@ -1402,6 +1402,8 @@ export function createHandleProtocol(deps) {
       const codexSticky = {
         cfg,
         requestStartedAt: logCtx.t0,
+        requestId: logCtx.request_id,
+        attemptsRepo: (typeof deps.getAttemptsRepo === 'function' ? deps.getAttemptsRepo() : deps.attemptsRepo) || null,
         stickyRouter,
         sessions: accountQuota?.sessions || null,
         body: ctx.body,

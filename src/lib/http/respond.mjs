@@ -187,6 +187,7 @@ function collectBody(req, maxBytes) {
 
 export function readBody(req, maxBytes) {
   return collectBody(req, maxBytes).then((buf) => {
+    if (req && typeof req === 'object') req._kinBodyBytes = buf.length
     const raw = buf.toString('utf8')
     if (!raw) return {}
     try {

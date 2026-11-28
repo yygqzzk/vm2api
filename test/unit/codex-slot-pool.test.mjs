@@ -582,3 +582,51 @@ test('24h window + 0-minute record: local 5h/7d gate stays open while 100% 24h c
   assert.deepEqual(picked.ready, ['vm-24h-low', 'vm-24h-high'])
   assert.deepEqual(picked.parked, ['vm-24h-capped'])
 })
+
+test('orderCodexSessionSlots reports preferredBlocker for busy home even when full pool is unavailable', async () => {
+  const { tryAcquireOpenAISlot, resetOpenAIAccountRuntime } = await import(
+    '../../src/lib/pool/openai-account-runtime.mjs'
+  )
+  resetOpenAIAccountRuntime()
+  const now = Date.parse('2026-10-18T00:00:00.000Z')
+  try {
+    const vms = [gpt('vm-a', { policy: { maxConcurrency: 2 } }), gpt('vm-b', { policy: { maxConcurrency: 2 } })]
+    const h1 = tryAcquireOpenAISlot('vm-a', { concurrency: 2, now })
+    const h2 = tryAcquireOpenAISlot('vm-a', { concurrency: 2, now })
+    assert.ok(h1 && h2)
+
+    const borrowable = orderCodexSessionSlots(vms, { boundVmId: 'vm-a', now })
+    assert.equal(borrowable.sticky, false)
+    assert.equal(borrowable.boundState, 'live')
+    assert.equal(borrowable.home, 'vm-a')
+    assert.equal(borrowable.preferred, 'blocked')
+    assert.equal(borrowable.preferredBlocker, 'concurrency_limit')
+    assert.deepEqual(borrowable.ids, ['vm-b'])
+
+    const b1 = tryAcquireOpenAISlot('vm-b', { concurrency: 2, now })
+    const b2 = tryAcquireOpenAISlot('vm-b', { concurrency: 2, now })
+    assert.ok(b1 && b2)
+    const full = orderCodexSessionSlots(vms, { boundVmId: 'vm-a', now })
+    assert.equal(full.error, 'capacity_unavailable')
+    assert.equal(full.boundState, 'live')
+    assert.equal(full.home, 'vm-a')
+    assert.equal(full.preferred, 'blocked')
+    assert.equal(full.preferredBlocker, 'concurrency_limit')
+
+    h1.release()
+    h2.release()
+    b1.release()
+    b2.release()
+
+    resetOpenAIAccountRuntime()
+    tryAcquireOpenAISlot('vm-a', { concurrency: 2, maxRpm: 1, now }).release()
+    const rpmBlocked = orderCodexSessionSlots([gpt('vm-a', { max_rpm: 1 }), gpt('vm-b')], {
+      boundVmId: 'vm-a',
+      now: now + 1000,
+    })
+    assert.equal(rpmBlocked.preferredBlocker, 'rpm_limit')
+    assert.deepEqual(rpmBlocked.ids, ['vm-b'])
+  } finally {
+    resetOpenAIAccountRuntime()
+  }
+})

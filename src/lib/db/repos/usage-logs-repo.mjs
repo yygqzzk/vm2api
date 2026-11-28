@@ -1877,7 +1877,8 @@ export class UsageLogsRepo {
       for (const row of rows) {
         const n = Number(row.n || 0)
         selections += n
-        if (String(row.selection_reason || '') === 'sticky') hits += n
+        const reason = String(row.selection_reason || '')
+        if (reason === 'sticky' || reason.startsWith('sticky:')) hits += n
       }
       return {
         selections,

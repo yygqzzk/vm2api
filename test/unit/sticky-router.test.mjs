@@ -7,6 +7,7 @@ import {
   StickyRouter,
   childDeclaredWithoutParent,
   explicitParentSessionId,
+  firstUserFingerprint,
   isShortProbeRequest,
   mergeStickyConfig,
 } from '../../src/lib/pool/sticky-router.mjs'
@@ -877,4 +878,36 @@ test('clearing a finished dialog slot keeps the VM and the original sticky expir
   assert.equal(after.bound_at, before.bound_at)
   assert.equal(r.resolve('sess:a').slotIndex, null)
   r.db?.close?.()
+})
+
+test('firstUserFingerprint extracts OpenAI Responses input_text blocks and ignores system-reminder', () => {
+  const opener = (q) => ({
+    input: [
+      {
+        type: 'message',
+        role: 'user',
+        content: [
+          { type: 'input_text', text: '<system-reminder>Date: 2026-11-27</system-reminder>' },
+          { type: 'input_text', text: q },
+        ],
+      },
+    ],
+  })
+  const h1 = firstUserFingerprint(opener('first prompt'))
+  const h2 = firstUserFingerprint({
+    input: [
+      {
+        type: 'message',
+        role: 'user',
+        content: [
+          { type: 'input_text', text: '<system-reminder>Date: 2026-11-28</system-reminder>' },
+          { type: 'input_text', text: 'first prompt' },
+        ],
+      },
+    ],
+  })
+  const h3 = firstUserFingerprint(opener('second prompt'))
+  assert.ok(h1.length > 0)
+  assert.equal(h1, h2)
+  assert.notEqual(h1, h3)
 })

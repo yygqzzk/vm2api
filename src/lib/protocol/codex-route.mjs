@@ -11,6 +11,15 @@ export { isCodexVm, normalizeVmKind } from '../vm/vm-kind.mjs'
 export const DEFAULT_CODEX_USER_AGENT = CODEX_USER_AGENT
 export const CODEX_UPSTREAM_TRANSPORTS = Object.freeze(['prefer_websocket', 'http'])
 
+export const DEFAULT_CODEX_STICKY_WAIT = Object.freeze({
+  enabled: true,
+  timeout_ms: 4000,
+  min_text_bytes: 384 * 1024,
+  sample_pct: 100,
+})
+
+const CODEX_STICKY_WAIT_KEYS = new Set(['enabled', 'timeout_ms', 'min_text_bytes', 'sample_pct'])
+
 export const DEFAULT_CODEX_ROUTING = Object.freeze({
   enabled: true,
   official_passthrough: true,
@@ -40,6 +49,7 @@ export const DEFAULT_CODEX_ROUTING = Object.freeze({
     unknown: 'allow',
   },
   quota: normalizeOpenAIQuotaPolicy(),
+  sticky_wait: DEFAULT_CODEX_STICKY_WAIT,
 })
 
 function typedError(message, code) {
@@ -69,6 +79,53 @@ function normalizeUserAgent(raw) {
 
 function normalizeUpstreamTransport(raw) {
   return CODEX_UPSTREAM_TRANSPORTS.includes(raw) ? raw : 'prefer_websocket'
+}
+
+function normalizeStickyWaitInt(raw, fallback, min, max) {
+  if (raw == null || raw === '') return fallback
+  const n = Number(raw)
+  if (!Number.isFinite(n)) return fallback
+  return Math.min(max, Math.max(min, Math.trunc(n)))
+}
+
+export function normalizeCodexStickyWait(raw = {}) {
+  const src = asObject(raw) || {}
+  return {
+    enabled: src.enabled !== false,
+    timeout_ms: normalizeStickyWaitInt(src.timeout_ms, DEFAULT_CODEX_STICKY_WAIT.timeout_ms, 0, 30000),
+    min_text_bytes: normalizeStickyWaitInt(
+      src.min_text_bytes,
+      DEFAULT_CODEX_STICKY_WAIT.min_text_bytes,
+      1024,
+      16777216,
+    ),
+    sample_pct: normalizeStickyWaitInt(src.sample_pct, DEFAULT_CODEX_STICKY_WAIT.sample_pct, 0, 100),
+  }
+}
+
+function validateCodexStickyWaitPatch(raw) {
+  const sw = asObject(raw)
+  if (!sw) throw typedError('codex.sticky_wait 必须是对象', 'invalid_codex_sticky_wait')
+  for (const key of Object.keys(sw)) {
+    if (!CODEX_STICKY_WAIT_KEYS.has(key)) {
+      throw typedError(`codex.sticky_wait 包含不支持的字段: ${key}`, 'invalid_codex_sticky_wait')
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(sw, 'enabled') && typeof sw.enabled !== 'boolean') {
+    throw typedError('codex.sticky_wait.enabled 必须是布尔', 'invalid_codex_sticky_wait')
+  }
+  const intRanges = [
+    ['timeout_ms', 0, 30000],
+    ['min_text_bytes', 1024, 16777216],
+    ['sample_pct', 0, 100],
+  ]
+  for (const [key, min, max] of intRanges) {
+    if (!Object.prototype.hasOwnProperty.call(sw, key)) continue
+    const val = sw[key]
+    if (typeof val !== 'number' || !Number.isFinite(val) || !Number.isInteger(val) || val < min || val > max) {
+      throw typedError(`codex.sticky_wait.${key} 必须是 ${min}..${max} 的整数`, 'invalid_codex_sticky_wait')
+    }
+  }
 }
 
 function validateEnabledToggle(raw, path, code) {
@@ -127,6 +184,9 @@ export function validateInferenceWebsocketPatch(body = {}) {
   if (Object.prototype.hasOwnProperty.call(codex, 'model_mappings')) {
     validateCodexModelMappingsPatch(codex.model_mappings)
   }
+  if (Object.prototype.hasOwnProperty.call(codex, 'sticky_wait')) {
+    validateCodexStickyWaitPatch(codex.sticky_wait)
+  }
 }
 
 export function inferenceWebsocketEnabled(routing = {}) {
@@ -169,6 +229,7 @@ export function normalizeCodexRouting(raw = {}) {
     },
     clients,
     quota: normalizeOpenAIQuotaPolicy(src.quota),
+    sticky_wait: normalizeCodexStickyWait(src.sticky_wait),
     model_mappings: normalizeCodexModelMappings(src.model_mappings),
   }
 }

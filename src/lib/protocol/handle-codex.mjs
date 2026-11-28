@@ -1,6 +1,7 @@
 /**
  * Codex hop from handle-protocol. Claude convert/pool/CRS never runs here.
  */
+import crypto from 'node:crypto'
 import path from 'node:path'
 import { gatewayRetryDecision, poolAdmissionRetry } from '../fork/gateway-retry.mjs'
 import { resolveStreamIdleTimeoutMs } from '../core/config.mjs'
@@ -61,9 +62,16 @@ import {
   makeProxyFetch,
   refreshCodexAccessToken,
 } from './codex-models.mjs'
-import { orderCodexSessionSlots, codexSlotAllowsModel, isCodexFailoverError } from '../pool/codex-slot-pool.mjs'
+import {
+  codexAccountCandidate,
+  orderCodexSessionSlots,
+  codexSlotAllowsModel,
+  isCodexFailoverError,
+} from '../pool/codex-slot-pool.mjs'
+import { schedulingBlocker } from '../pool/openai-account-selector.mjs'
 import {
   holdOpenAIAccount,
+  openAIAccountHold,
   reportOpenAIAttempt,
   tryAcquireOpenAISlot,
   waitForOpenAICapacity,
@@ -513,6 +521,97 @@ function resolveBoundCodexVmId(req, opts = {}) {
   return bound?.vmId || null
 }
 
+const NON_TEXT_MEDIA_TYPES = new Set([
+  'image',
+  'image_url',
+  'input_image',
+  'input_audio',
+  'audio',
+  'input_file',
+  'file',
+  'computer_screenshot',
+])
+const NON_TEXT_KEYS = new Set(['image_url', 'b64_json', 'file_data', 'encrypted_content', 'audio'])
+const INLINE_DATA_URI_BASE64_RE = /data:[^;,\s]{1,128};base64,[A-Za-z0-9+/=\r\n]+/gi
+const TEXT_ESTIMATE_FIELDS = ['instructions', 'system', 'prompt', 'input', 'messages', 'tools']
+
+export function classifyCodexStickyKey(sessionKey) {
+  if (!sessionKey || typeof sessionKey !== 'string') return { source: 'none', fp: null }
+  let inner = sessionKey
+  inner = inner.replace(/^p:[a-z0-9_-]+:/i, '')
+  inner = inner.replace(/^k\d+:/, '')
+  let source = 'session'
+  if (inner === 'envelope') source = 'envelope'
+  else if (inner === 'login' || inner.startsWith('login:')) source = 'login'
+  else if (inner.startsWith('ip:')) source = 'ip'
+  else if (inner.startsWith('ch:')) source = 'fingerprint'
+  const fp = crypto.createHash('sha256').update(sessionKey).digest('hex').slice(0, 8)
+  return { source, fp }
+}
+
+export function codexStickyCanaryBucket(sessionKey) {
+  return (
+    crypto
+      .createHash('sha256')
+      .update(`codex-sticky-wait:${String(sessionKey || '')}`)
+      .digest()
+      .readUInt32BE(0) % 100
+  )
+}
+
+function textBytesOfString(value) {
+  if (!value) return 0
+  if (/^\s*data:[^,]{0,128};base64,/i.test(value)) return 0
+  if (value.length >= 1024 && value.includes(';base64,')) {
+    const stripped = value.replace(INLINE_DATA_URI_BASE64_RE, '')
+    return stripped ? Buffer.byteLength(stripped, 'utf8') : 0
+  }
+  return Buffer.byteLength(value, 'utf8')
+}
+
+export function estimateCodexNonImageTextBytes(body, stopAtBytes = Number.POSITIVE_INFINITY) {
+  if (!body || typeof body !== 'object') return 0
+  const cap = Number.isFinite(stopAtBytes) && stopAtBytes > 0 ? stopAtBytes : Number.POSITIVE_INFINITY
+  let total = 0
+  const walk = (node, depth) => {
+    if (total >= cap || depth > 12 || node == null) return
+    if (typeof node === 'string') {
+      total += textBytesOfString(node)
+      return
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        walk(item, depth + 1)
+        if (total >= cap) return
+      }
+      return
+    }
+    if (typeof node !== 'object') return
+    const type = typeof node.type === 'string' ? node.type.trim().toLowerCase() : ''
+    if (NON_TEXT_MEDIA_TYPES.has(type)) return
+    if (node.source && typeof node.source === 'object' && node.source.type === 'base64') return
+    for (const [k, v] of Object.entries(node)) {
+      if (NON_TEXT_KEYS.has(k)) continue
+      walk(v, depth + 1)
+      if (total >= cap) return
+    }
+  }
+  for (const field of TEXT_ESTIMATE_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(body, field)) {
+      walk(body[field], 0)
+      if (total >= cap) break
+    }
+  }
+  return total
+}
+
+export function formatCodexAttemptSelectionReason(decision = {}) {
+  const outcome = decision?.outcome || 'unknown'
+  if (outcome === 'sticky_hit') return 'sticky'
+  if (outcome === 'sticky_hit_after_wait') return 'sticky:after_wait'
+  return `${outcome}|key=${decision?.key_source || 'none'}|blk=${decision?.blocker || 'none'}`
+}
+
 /**
  * Admission = fresh candidates + one synchronous seat claim.
  * - Refreshes a sticky-bound slot with expired prior credits before selection
@@ -521,6 +620,9 @@ function resolveBoundCodexVmId(req, opts = {}) {
  *   yields no `normal` candidate (`quota_exhausted` / `capacity_unavailable`).
  * - Triggers non-blocking background refresh for other idle stale-credit slots
  *   when a healthy slot claims a seat immediately.
+ * - Optionally short-waits for a live sticky home blocked solely by
+ *   `concurrency_limit` when ultra-long text history would otherwise cold-miss
+ *   and another borrowable slot is available; never rejects on queue full.
  * - When all eligible accounts are at concurrency/RPM capacity, waits FIFO up
  *   to `deadline`.
  */
@@ -532,13 +634,95 @@ export async function admitCodexCandidate(
 ) {
   let woken = null
   const evalNow = () => (Number.isFinite(fixedNow) ? Number(fixedNow) : Date.now())
+  const startedAt = evalNow()
+  const rawBodyBytes = Number.isInteger(req?._kinBodyBytes) && req._kinBodyBytes >= 0 ? req._kinBodyBytes : null
+  let initialBoundVmId = null
+  let stickyDeadline = null
+  let stickyWaitEnded = false
+  let stickyWaited = false
+  let stickyWaitMs = 0
+  let poolWaitMs = 0
+  let borrowReason = null
+  let textGate = null
+  let canaryBucket = null
+
+  const isWakeAccountUsable = (accountId, poolVmsList, livePolicy, triedFailedIds, model) => {
+    if (!accountId) return false
+    if (triedFailedIds?.has(accountId)) return false
+    const now = evalNow()
+    if (Array.isArray(poolVmsList)) {
+      const wokeVm = poolVmsList.find((v) => v.id === accountId)
+      if (!wokeVm || !codexSlotAllowsModel(wokeVm, model)) return false
+      return schedulingBlocker(codexAccountCandidate(wokeVm, now, null, livePolicy), { now }) === null
+    }
+    return !openAIAccountHold(accountId, now)
+  }
+
+  const releaseUnusedWakeup = (poolVmsList, livePolicy, triedFailedIds, consumedAccountId = null) => {
+    const wokeId = woken?.accountId ?? null
+    woken = null
+    if (!wokeId || wokeId === consumedAccountId) return
+    if (isWakeAccountUsable(wokeId, poolVmsList, livePolicy, triedFailedIds, opts.body?.model || null)) {
+      wakeOpenAIWaiter(wokeId)
+    }
+  }
+
+  const buildDecision = (pickedState, selectedVmId, pin) => {
+    const keyInfo = classifyCodexStickyKey(pickedState?.sessionKey)
+    let outcome
+    if (!selectedVmId) {
+      outcome = pickedState?.error === 'client_cancelled' ? 'cancelled' : 'rejected'
+    } else if (pin) {
+      outcome = 'pinned'
+    } else if (opts.body?.previous_response_id && pickedState?.boundState === 'live') {
+      outcome = 'continued_response'
+    } else if (opts.excluded?.size > 0) {
+      outcome = 'failover'
+    } else if (pickedState?.sticky && selectedVmId === pickedState?.home) {
+      outcome = stickyWaited ? 'sticky_hit_after_wait' : 'sticky_hit'
+    } else if (pickedState?.boundState === 'live' && pickedState?.home && selectedVmId !== pickedState.home) {
+      outcome =
+        borrowReason ||
+        (pickedState.preferredBlocker && pickedState.preferredBlocker !== 'concurrency_limit'
+          ? 'borrowed_non_concurrency'
+          : 'borrowed')
+    } else if (pickedState?.boundState === 'gone' || pickedState?.boundState === 'resting') {
+      outcome = 'migrated_home'
+    } else {
+      outcome = 'placed_new'
+    }
+    return {
+      key_source: keyInfo.source,
+      key_fp: keyInfo.fp,
+      home_vm_id: pickedState?.home || pickedState?.boundVmId || initialBoundVmId || null,
+      selected_vm_id: selectedVmId || null,
+      bound_state: pickedState?.boundState || null,
+      blocker: pickedState?.preferredBlocker || null,
+      body_bytes: rawBodyBytes,
+      text_bytes: textGate?.textBytes ?? null,
+      canary_bucket: canaryBucket,
+      sticky_wait_ms: stickyWaitMs,
+      pool_wait_ms: poolWaitMs,
+      scheduling_ms: Math.max(0, evalNow() - startedAt),
+      outcome,
+    }
+  }
+
   for (;;) {
-    const livePolicy = normalizeCodexRouting(opts.routing?.codex || opts.routing).quota
+    const codexCfg = normalizeCodexRouting(opts.routing?.codex || opts.routing)
+    const livePolicy = codexCfg.quota
+    const stickyWaitCfg = codexCfg.sticky_wait
     const pin = opts.pinVmId === undefined ? pinnedVmIdFromRequest(req) : opts.pinVmId
     const model = opts.body?.model || null
+    if (signal?.aborted) {
+      releaseUnusedWakeup(null, livePolicy, null)
+      const pickedErr = { error: 'client_cancelled', ids: [] }
+      return { picked: pickedErr, decision: buildDecision(pickedErr, null, pin) }
+    }
 
     if (!pin) {
       const boundVmId = resolveBoundCodexVmId(req, opts)
+      if (!initialBoundVmId && boundVmId) initialBoundVmId = boundVmId
       if (boundVmId && !opts.excluded?.has(boundVmId)) {
         const boundVm = inspectCodexVmForRefresh(projectRoot, boundVmId, req, opts, livePolicy)
         if (
@@ -546,7 +730,11 @@ export async function admitCodexCandidate(
           codexSlotAllowsModel(boundVm, model) &&
           needsStaleCodexCreditsRefresh(boundVm, livePolicy, evalNow())
         ) {
-          if (signal?.aborted) return { picked: { error: 'client_cancelled', ids: [] } }
+          if (signal?.aborted) {
+            releaseUnusedWakeup(null, livePolicy, null)
+            const pickedErr = { error: 'client_cancelled', ids: [] }
+            return { picked: pickedErr, decision: buildDecision(pickedErr, null, pin) }
+          }
           if (!Number.isFinite(deadline) || evalNow() < deadline) {
             const refreshed = await refreshStaleCodexCreditsForVm(projectRoot, boundVm.id, {
               policy: livePolicy,
@@ -555,7 +743,11 @@ export async function admitCodexCandidate(
               signal,
               deadline,
             })
-            if (signal?.aborted || refreshed?.aborted) return { picked: { error: 'client_cancelled', ids: [] } }
+            if (signal?.aborted || refreshed?.aborted) {
+              releaseUnusedWakeup(null, livePolicy, null)
+              const pickedErr = { error: 'client_cancelled', ids: [] }
+              return { picked: pickedErr, decision: buildDecision(pickedErr, null, pin) }
+            }
           }
         }
       }
@@ -574,7 +766,11 @@ export async function admitCodexCandidate(
         .map((vm) => enrichPoolVmWithRawCodex(projectRoot, vm))
         .filter((vm) => needsStaleCodexCreditsRefresh(vm, livePolicy, checkNow))
       if (staleVms.length > 0) {
-        if (signal?.aborted) return { picked: { error: 'client_cancelled', ids: [] } }
+        if (signal?.aborted) {
+          releaseUnusedWakeup(poolVms, livePolicy, null)
+          const pickedErr = { ...picked, error: 'client_cancelled', ids: [] }
+          return { picked: pickedErr, decision: buildDecision(pickedErr, null, pin) }
+        }
         if (!Number.isFinite(deadline) || checkNow < deadline) {
           const results = await Promise.all(
             staleVms.map((vm) =>
@@ -588,7 +784,9 @@ export async function admitCodexCandidate(
             ),
           )
           if (signal?.aborted || results.some((item) => item?.aborted)) {
-            return { picked: { error: 'client_cancelled', ids: [] } }
+            releaseUnusedWakeup(poolVms, livePolicy, null)
+            const pickedErr = { ...picked, error: 'client_cancelled', ids: [] }
+            return { picked: pickedErr, decision: buildDecision(pickedErr, null, pin) }
           }
           if (results.some((item) => item?.refreshed)) {
             ;({ picked, poolVms } = pickCodexCandidatesWithPool(projectRoot, req, opts))
@@ -597,7 +795,115 @@ export async function admitCodexCandidate(
       }
     }
 
-    if (picked.error && picked.error !== 'capacity_unavailable') return { picked }
+    if (picked.error && picked.error !== 'capacity_unavailable') {
+      releaseUnusedWakeup(poolVms, livePolicy, null)
+      return { picked, decision: buildDecision(picked, null, pin) }
+    }
+
+    const canConsiderStickyWait =
+      !pin &&
+      !opts.body?.previous_response_id &&
+      !(opts.excluded?.size > 0) &&
+      picked.candidates?.length > 0 &&
+      picked.boundState === 'live' &&
+      Boolean(picked.home) &&
+      !picked.sticky
+
+    if (canConsiderStickyWait) {
+      const keyInfo = classifyCodexStickyKey(picked.sessionKey)
+      const routerCfg = opts.stickyRouter?.config
+      const credibleSticky =
+        Boolean(opts.stickyRouter) &&
+        routerCfg?.enabled !== false &&
+        (routerCfg?.mode || 'conversation') === 'conversation' &&
+        (keyInfo.source === 'session' || keyInfo.source === 'fingerprint')
+      if (!credibleSticky) {
+        borrowReason ||= 'borrowed_wait_disabled'
+      } else if (picked.preferredBlocker !== 'concurrency_limit') {
+        borrowReason ||= 'borrowed_non_concurrency'
+      } else if (!stickyWaitCfg.enabled || stickyWaitCfg.timeout_ms <= 0) {
+        borrowReason ||= 'borrowed_wait_disabled'
+      } else {
+        if (textGate === null) {
+          if (rawBodyBytes !== null && rawBodyBytes < stickyWaitCfg.min_text_bytes) {
+            textGate = { ok: false, bodyBytes: rawBodyBytes, textBytes: null }
+          } else {
+            const textBytes = estimateCodexNonImageTextBytes(
+              opts.inboundBody || opts.body,
+              stickyWaitCfg.min_text_bytes,
+            )
+            textGate = { ok: textBytes >= stickyWaitCfg.min_text_bytes, bodyBytes: rawBodyBytes, textBytes }
+          }
+        }
+        if (!textGate.ok) {
+          borrowReason ||= 'borrowed_short_context'
+        } else {
+          if (canaryBucket === null) canaryBucket = codexStickyCanaryBucket(picked.sessionKey)
+          if (
+            stickyWaitCfg.sample_pct <= 0 ||
+            (stickyWaitCfg.sample_pct < 100 && canaryBucket >= stickyWaitCfg.sample_pct)
+          ) {
+            borrowReason ||= 'borrowed_canary_control'
+          } else if (!stickyWaitEnded) {
+            if (stickyDeadline === null) {
+              const firstWaitNow = evalNow()
+              stickyDeadline = Number.isFinite(deadline)
+                ? Math.min(deadline, firstWaitNow + stickyWaitCfg.timeout_ms)
+                : firstWaitNow + stickyWaitCfg.timeout_ms
+            }
+            const waitNow = evalNow()
+            if (waitNow >= stickyDeadline) {
+              stickyWaitEnded = true
+              borrowReason ||= 'borrowed_after_wait'
+            } else {
+              if (signal?.aborted) {
+                releaseUnusedWakeup(poolVms, livePolicy, null)
+                const pickedErr = { ...picked, error: 'client_cancelled', ids: [] }
+                return { picked: pickedErr, decision: buildDecision(pickedErr, null, pin) }
+              }
+              if (woken && woken.accountId != null && woken.accountId !== picked.home) {
+                releaseUnusedWakeup(poolVms, livePolicy, null)
+              }
+              const sliceStart = evalNow()
+              let waited
+              try {
+                waited = await waitForOpenAICapacity({
+                  deadline: stickyDeadline,
+                  signal,
+                  accounts: [picked.home],
+                  front: !!woken,
+                })
+              } catch (error) {
+                stickyWaitMs += Math.max(0, evalNow() - sliceStart)
+                if (error?.code === 'pool_wait_queue_full') {
+                  stickyWaitEnded = true
+                  borrowReason = 'borrowed_queue_full'
+                  woken = null
+                  continue
+                }
+                releaseUnusedWakeup(poolVms, livePolicy, null)
+                throw error
+              }
+              stickyWaitMs += Math.max(0, evalNow() - sliceStart)
+              stickyWaited = true
+              if (waited.aborted) {
+                releaseUnusedWakeup(poolVms, livePolicy, null)
+                const pickedErr = { ...picked, error: 'client_cancelled', ids: [] }
+                return { picked: pickedErr, decision: buildDecision(pickedErr, null, pin) }
+              }
+              woken = waited.woken ? { accountId: waited.accountId ?? null } : null
+              if (!waited.woken || evalNow() >= stickyDeadline) {
+                stickyWaitEnded = true
+                borrowReason ||= 'borrowed_after_wait'
+              }
+              continue
+            }
+          }
+        }
+      }
+    }
+
+    const triedFailedIds = new Set()
     for (const candidate of picked.candidates || []) {
       const lease = tryAcquireOpenAISlot(candidate.id, {
         concurrency: candidate.concurrency,
@@ -605,6 +911,7 @@ export async function admitCodexCandidate(
         quotaPolicy: livePolicy,
       })
       if (lease) {
+        releaseUnusedWakeup(poolVms, livePolicy, triedFailedIds, candidate.id)
         if (!pin) {
           const bgNow = evalNow()
           for (const vm of poolVms) {
@@ -618,20 +925,27 @@ export async function admitCodexCandidate(
             }).catch(() => {})
           }
         }
-        return { picked, vmId: candidate.id, lease }
+        return { picked, vmId: candidate.id, lease, decision: buildDecision(picked, candidate.id, pin) }
       }
+      triedFailedIds.add(candidate.id)
     }
+
     const waitIds = picked.candidates?.length ? picked.candidates.map((candidate) => candidate.id) : picked.waitIds
     // A woken waiter that missed a seat it can use lost it to a newer request;
     // passing the wake on would only re-run selection for every waiter behind
     // it. Hand it on only when the freed account is not one this request takes.
     if (woken && (woken.accountId == null || !waitIds?.includes(woken.accountId))) {
-      wakeOpenAIWaiter(woken.accountId)
+      releaseUnusedWakeup(poolVms, livePolicy, triedFailedIds)
     }
     const now = evalNow()
-    if (now >= deadline) return { picked: { ...picked, error: 'capacity_unavailable', ids: [] } }
+    if (now >= deadline) {
+      releaseUnusedWakeup(poolVms, livePolicy, triedFailedIds)
+      const pickedErr = { ...picked, error: 'capacity_unavailable', ids: [] }
+      return { picked: pickedErr, decision: buildDecision(pickedErr, null, pin) }
+    }
     const retryAt = Number(picked.retryAt)
     const sliceDeadline = Number.isFinite(retryAt) && retryAt > now ? Math.min(deadline, retryAt) : deadline
+    const poolSliceStart = evalNow()
     let waited
     try {
       waited = await waitForOpenAICapacity({
@@ -641,10 +955,21 @@ export async function admitCodexCandidate(
         front: !!woken,
       })
     } catch (error) {
-      if (error?.code === 'pool_wait_queue_full') return { picked: { error: 'pool_wait_queue_full', ids: [] } }
+      poolWaitMs += Math.max(0, evalNow() - poolSliceStart)
+      if (error?.code === 'pool_wait_queue_full') {
+        releaseUnusedWakeup(poolVms, livePolicy, triedFailedIds)
+        const pickedErr = { ...picked, error: 'pool_wait_queue_full', ids: [] }
+        return { picked: pickedErr, decision: buildDecision(pickedErr, null, pin) }
+      }
+      releaseUnusedWakeup(poolVms, livePolicy, triedFailedIds)
       throw error
     }
-    if (waited.aborted) return { picked: { error: 'client_cancelled', ids: [] } }
+    poolWaitMs += Math.max(0, evalNow() - poolSliceStart)
+    if (waited.aborted) {
+      releaseUnusedWakeup(poolVms, livePolicy, triedFailedIds)
+      const pickedErr = { ...picked, error: 'client_cancelled', ids: [] }
+      return { picked: pickedErr, decision: buildDecision(pickedErr, null, pin) }
+    }
     woken = waited.woken ? { accountId: waited.accountId ?? null } : null
   }
 }
@@ -739,6 +1064,8 @@ export async function handleCodexProtocol({
   ownerScope = null,
   pinVmId = undefined,
   cfg = null,
+  requestId = null,
+  attemptsRepo = null,
 }) {
   const pfMode = protoFrontMode()
   const codex = normalizeCodexRouting(routing.codex)
@@ -914,12 +1241,16 @@ export async function handleCodexProtocol({
     stickyRouter,
     sessions,
     body: body || converted.body || inbound,
+    inboundBody: inbound || ctx.body,
     keyScope,
     excluded: new Set(),
     routing,
     ownerScope,
     pinVmId,
   }
+  const effectiveRequestId = requestId || res?._kinRequestId || null
+  const attemptsRepoRef = attemptsRepo || ops.attemptsRepo || null
+  let repoAttemptNo = 0
   const deadline = Date.now() + codexWaitTimeoutMs(routing)
   const gone = clientGoneSignal(req, res)
   const failoverBudget = codexFailoverBudget(routing)
@@ -944,7 +1275,48 @@ export async function handleCodexProtocol({
         now: ops.now,
       })
       const picked = admitted.picked
+      if (admitted.decision) {
+        const prevSched = logBag.hop_meta?.codex_schedule
+        logBag.hop_meta = {
+          ...logBag.hop_meta,
+          codex_schedule: prevSched
+            ? {
+                ...prevSched,
+                final_selected_vm_id: admitted.vmId || prevSched.selected_vm_id,
+                failover_outcome: admitted.decision.outcome || null,
+              }
+            : admitted.decision,
+        }
+      }
       if (!admitted.lease) {
+        if (!last && effectiveRequestId && attemptsRepoRef) {
+          const rejAttemptNo = ++repoAttemptNo
+          const rejDecision = admitted.decision || null
+          const rejWaitMs = (rejDecision?.sticky_wait_ms || 0) + (rejDecision?.pool_wait_ms || 0)
+          try {
+            attemptsRepoRef.begin?.({
+              requestId: effectiveRequestId,
+              attemptNo: rejAttemptNo,
+              vmId: rejDecision?.home_vm_id || null,
+              accountId: rejDecision?.home_vm_id || null,
+              model: converted.body?.model || null,
+              selectionReason: formatCodexAttemptSelectionReason(rejDecision),
+              waitMs: rejWaitMs,
+              queueWaitMs: rejDecision?.sticky_wait_ms || 0,
+              schedulingMs: rejDecision?.scheduling_ms ?? 0,
+            })
+            attemptsRepoRef.complete?.(effectiveRequestId, rejAttemptNo, {
+              upstreamStatus: null,
+              errorScope: 'pool',
+              action: 'reject_admission',
+              downstreamCommitted: false,
+              terminalState: picked.error === 'client_cancelled' ? 'cancelled' : 'rejected',
+              errorCode: picked.error || 'no_codex_vm',
+              latencyMs: rejDecision?.scheduling_ms ?? 0,
+              usage: rejDecision ? { codex_schedule: rejDecision } : null,
+            })
+          } catch {}
+        }
         if (picked.error === 'client_cancelled') {
           logBag.final_state = 'cancelled'
           return
@@ -979,6 +1351,36 @@ export async function handleCodexProtocol({
           lease.release()
           return
         }
+      }
+      const thisAttemptNo = ++repoAttemptNo
+      const seatStartedAt = Date.now()
+      let seatAttemptCompleted = false
+      const decision = admitted.decision || null
+      const totalWaitMs = (decision?.sticky_wait_ms || 0) + (decision?.pool_wait_ms || 0)
+      const completeSeatAttempt = (fields = {}) => {
+        if (seatAttemptCompleted || !effectiveRequestId || !attemptsRepoRef) return
+        seatAttemptCompleted = true
+        try {
+          attemptsRepoRef.complete?.(effectiveRequestId, thisAttemptNo, {
+            latencyMs: Math.max(0, Date.now() - seatStartedAt),
+            ...fields,
+          })
+        } catch {}
+      }
+      if (effectiveRequestId && attemptsRepoRef) {
+        try {
+          attemptsRepoRef.begin?.({
+            requestId: effectiveRequestId,
+            attemptNo: thisAttemptNo,
+            vmId: vm.id,
+            accountId: vm.id,
+            model: converted.body?.model || null,
+            selectionReason: formatCodexAttemptSelectionReason(decision),
+            waitMs: totalWaitMs,
+            queueWaitMs: decision?.sticky_wait_ms || 0,
+            schedulingMs: decision?.scheduling_ms ?? 0,
+          })
+        } catch {}
       }
       const stickyKeys = picked.stickyKeys?.length ? picked.stickyKeys : picked.sessionKey ? [picked.sessionKey] : []
       const stickyBound = picked.sessionKey ? stickyRouter?.resolve?.(picked.sessionKey) : null
@@ -1032,6 +1434,17 @@ export async function handleCodexProtocol({
           }
           pickOpts.excluded.add(vm.id)
           switches += 1
+          const willSwitch =
+            !res.headersSent && switches <= failoverBudget.maxSwitches && attempts < failoverBudget.maxAttempts
+          completeSeatAttempt({
+            upstreamStatus: 503,
+            errorScope: 'local',
+            action: willSwitch ? 'switch_account' : 'return_error',
+            downstreamCommitted: false,
+            terminalState: 'error',
+            errorCode: 'codex_kernel_unavailable',
+            usage: decision ? { codex_schedule: decision } : null,
+          })
           if (!res.headersSent) {
             if (switches > failoverBudget.maxSwitches || attempts >= failoverBudget.maxAttempts) break
             continue
@@ -1263,6 +1676,23 @@ export async function handleCodexProtocol({
           logBag.stop_reason = result.body?.incomplete_details?.reason || null
           logBag.upstream_model = converted.body.model
           if (hops > 1) logBag.codex_failed_over = true
+          const attemptUsage = logged
+            ? { ...logged, ...(decision ? { codex_schedule: decision } : {}) }
+            : decision
+              ? { codex_schedule: decision }
+              : null
+          const completeOk = (status = result?.status ?? 200, terminalState = logBag.final_state) =>
+            completeSeatAttempt({
+              upstreamStatus: status,
+              errorScope: null,
+              action: 'ok',
+              cooldownUntil: null,
+              downstreamCommitted: true,
+              terminalState,
+              usage: attemptUsage,
+              ttftMs: result?.ttftMs ?? null,
+              hopRequestId: result?.hopRequestId ?? null,
+            })
           if (!stream) {
             if (useGoEgress) {
               const tc = await transcodeWithProtoFront({
@@ -1273,10 +1703,15 @@ export async function handleCodexProtocol({
                 stream: false,
                 payload: chunks.join(''),
               })
-              if (tc?.ok && tc.body) return json(res, 200, JSON.parse(tc.body))
+              if (tc?.ok && tc.body) {
+                completeOk()
+                return json(res, 200, JSON.parse(tc.body))
+              }
             }
-            if (protocol === 'openai.responses' && result.body?.status === 'incomplete')
+            if (protocol === 'openai.responses' && result.body?.status === 'incomplete') {
+              completeOk()
               return json(res, 200, result.body)
+            }
             let body
             try {
               const assembled = assembleCodexBodyFromSse(chunks, result.body || {})
@@ -1295,10 +1730,22 @@ export async function handleCodexProtocol({
               stats.errors++
               logBag.error_code = error.code
               logBag.final_state = 'incomplete'
+              completeSeatAttempt({
+                upstreamStatus: 502,
+                errorScope: 'upstream',
+                action: 'return_error',
+                downstreamCommitted: false,
+                terminalState: 'incomplete',
+                errorCode: error.code,
+                ttftMs: result?.ttftMs ?? null,
+                hopRequestId: result?.hopRequestId ?? null,
+                usage: attemptUsage,
+              })
               return json(res, 502, {
                 error: { type: 'upstream_protocol_error', code: error.code, message: error.message },
               })
             }
+            completeOk()
             return json(res, 200, body)
           }
           if (useGoEgress) {
@@ -1312,9 +1759,11 @@ export async function handleCodexProtocol({
             })
             if (!res.headersSent) writeSSEHeaders(res)
             if (tc?.ok && tc.body) res.write(tc.body)
+            completeOk()
             return res.end()
           }
           if (!res.headersSent) writeSSEHeaders(res)
+          completeOk()
           return res.end()
         }
         reportOpenAIAttempt(vm.id, attemptKind, result?.ttftMs ?? null)
@@ -1333,11 +1782,24 @@ export async function handleCodexProtocol({
             /* 写盘 best-effort；内存 hold 已在 */
           }
         }
+        const failUsage = decision ? { codex_schedule: decision } : null
         if (policyRefusal && policyRefusal !== 'upstream:billing_refusal') {
           stats.errors++
           const error = upstreamRiskClientError(policyRefusal, res._kinRequestId)
           logBag.error_code = error.body.error.code
           logBag.upstream_status = result?.status ?? null
+          completeSeatAttempt({
+            upstreamStatus: result?.status ?? null,
+            errorScope: 'policy',
+            action: 'return_error',
+            cooldownUntil: null,
+            downstreamCommitted: Boolean(res.headersSent || hopEmitted || result?.committed),
+            terminalState: result?.terminalState || 'error',
+            errorCode: error.body.error.code,
+            ttftMs: result?.ttftMs ?? null,
+            hopRequestId: result?.hopRequestId ?? null,
+            usage: failUsage,
+          })
           if (!res.headersSent && !hopEmitted) return json(res, error.status, error.body)
           if (protocol === 'anthropic.messages') res.write(buildAnthropicSseError(error.body.error))
           else if (protocol !== 'openai.responses') res.write(`data: ${JSON.stringify(error.body)}\n\n`)
@@ -1348,6 +1810,18 @@ export async function handleCodexProtocol({
           logBag.error_code = result?.body?.error?.code || 'codex_upstream'
           logBag.upstream_status = result?.status || 0
           logBag.final_state = result?.terminalState || 'incomplete'
+          completeSeatAttempt({
+            upstreamStatus: result?.status ?? null,
+            errorScope: 'upstream',
+            action: 'return_error',
+            cooldownUntil: failureHold?.until ?? null,
+            downstreamCommitted: true,
+            terminalState: logBag.final_state,
+            errorCode: logBag.error_code,
+            ttftMs: result?.ttftMs ?? null,
+            hopRequestId: result?.hopRequestId ?? null,
+            usage: failUsage,
+          })
           if (stream) return res.end()
           return json(res, result?.status >= 400 ? result.status : 502, result?.body)
         }
@@ -1355,11 +1829,45 @@ export async function handleCodexProtocol({
           pickOpts.excluded.add(vm.id)
           leaveSticky()
           switches += 1
-          if (switches > failoverBudget.maxSwitches || attempts >= failoverBudget.maxAttempts) break
+          const willSwitch = switches <= failoverBudget.maxSwitches && attempts < failoverBudget.maxAttempts
+          completeSeatAttempt({
+            upstreamStatus: result?.status ?? null,
+            errorScope: 'upstream',
+            action: willSwitch ? 'switch_account' : 'return_error',
+            cooldownUntil: failureHold?.until ?? null,
+            downstreamCommitted: false,
+            terminalState: result?.terminalState || 'error',
+            errorCode: result?.body?.error?.code || result?.error_code || 'codex_upstream',
+            ttftMs: result?.ttftMs ?? null,
+            hopRequestId: result?.hopRequestId ?? null,
+            usage: failUsage,
+          })
+          if (!willSwitch) break
           continue
         }
+        completeSeatAttempt({
+          upstreamStatus: result?.status ?? null,
+          errorScope: policyRefusal ? 'policy' : 'upstream',
+          action: 'return_error',
+          cooldownUntil: failureHold?.until ?? null,
+          downstreamCommitted: Boolean(result?.committed),
+          terminalState: result?.terminalState || (gone.signal.aborted ? 'cancelled' : 'error'),
+          errorCode: result?.body?.error?.code || result?.error_code || 'codex_upstream',
+          ttftMs: result?.ttftMs ?? null,
+          hopRequestId: result?.hopRequestId ?? null,
+          usage: failUsage,
+        })
         break
       } finally {
+        if (!seatAttemptCompleted) {
+          completeSeatAttempt({
+            errorScope: 'local',
+            action: 'abort',
+            downstreamCommitted: Boolean(res.headersSent),
+            terminalState: gone.signal.aborted ? 'cancelled' : 'error',
+            usage: decision ? { codex_schedule: decision } : null,
+          })
+        }
         lease.release()
         if (claimsWindow) {
           try {
